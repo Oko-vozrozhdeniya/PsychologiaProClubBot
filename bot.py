@@ -17,6 +17,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.environ["BOT_TOKEN"]
+
 DATA_DIR = Path("/app/data")
 TEXT_FILE = DATA_DIR / "messages.txt"
 JSON_FILE = DATA_DIR / "messages.jsonl"
@@ -25,7 +26,8 @@ JSON_FILE = DATA_DIR / "messages.jsonl"
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Здравствуйте! Я помощник клуба «Психология Pro». "
-        "Подключение работает успешно!"
+        "Подключение работает успешно!\n\n"
+        "Команда /analyze проверяет архив сообщений."
     )
 
 
@@ -67,10 +69,48 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info("GROUP_MESSAGE_SAVED message_id=%s", message.id)
 
 
+async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not JSON_FILE.exists():
+        await update.message.reply_text(
+            "Архив сообщений пока не найден."
+        )
+        return
+
+    records = []
+
+    try:
+        with JSON_FILE.open("r", encoding="utf-8") as file:
+            for line in file:
+                if line.strip():
+                    records.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        logging.exception("Archive reading failed")
+        await update.message.reply_text(
+            "Не удалось прочитать архив сообщений."
+        )
+        return
+
+    if not records:
+        await update.message.reply_text(
+            "Архив существует, но сообщений пока нет."
+        )
+        return
+
+    last_message = records[-1]
+
+    await update.message.reply_text(
+        "Проверка архива успешна!\n\n"
+        f"Всего сохранённых сообщений: {len(records)}\n"
+        f"Последнее сообщение:\n{last_message['text']}\n\n"
+        "Следующий этап: подключение искусственного интеллекта."
+    )
+
+
 def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("analyze", analyze))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, save_message)
     )
