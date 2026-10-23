@@ -154,12 +154,16 @@ def request_gemini(question, archive_context):
             result = json.loads(
                 response.read().decode("utf-8")
             )
-    except urllib.error.HTTPError as error:
+        except urllib.error.HTTPError as error:
+        details = error.read().decode("utf-8", errors="replace")
         logger.error(
-            "Gemini API HTTP error: %s", error.code
+            "Gemini API HTTP error %s: %s",
+            error.code,
+            details
         )
         raise RuntimeError(
-            f"Gemini API вернул ошибку HTTP {error.code}."
+            f"Gemini API вернул ошибку HTTP {error.code}.\n"
+            f"Подробности: {details[:1500]}"
         ) from error
 
     answer_parts = []
