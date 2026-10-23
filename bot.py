@@ -148,9 +148,11 @@ def request_gemini(question, archive_context):
     )
 
     try:
+        logger.warning("GEMINI DIAGNOSTIC: starting API request")
         with urllib.request.urlopen(
             request, timeout=90
         ) as response:
+            logger.warning("GEMINI DIAGNOSTIC: response received")
             result = json.loads(
                 response.read().decode("utf-8")
             )
