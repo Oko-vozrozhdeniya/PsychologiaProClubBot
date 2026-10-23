@@ -21,13 +21,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ["BOT_TOKEN"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL", "gemini-2.5-flash"
+)
 
-# Telegram ID владельца бота
 OWNER_ID = 885005330
-
-# ID группы «Психология Pro»
 CLUB_CHAT_ID = -1003994062695
 
 DATA_DIR = Path("/app/data")
@@ -70,7 +69,6 @@ def build_archive_context(records):
     parts = []
     total_chars = 0
 
-    # Берём последние записи, пока не достигнут лимит.
     for record in reversed(records):
         text = str(record.get("text", ""))
         timestamp = str(record.get("timestamp", ""))
@@ -92,10 +90,10 @@ def build_archive_context(records):
     return "\n\n".join(parts)
 
 
-def request_openai(question, archive_context):
-    if not OPENAI_API_KEY:
+def request_gemini(question, archive_context):
+    if not GEMINI_API_KEY:
         raise RuntimeError(
-            "Переменная OPENAI_API_KEY не настроена."
+            "Переменная GEMINI_API_KEY не настроена."
         )
 
     instructions = (
@@ -120,18 +118,30 @@ def request_openai(question, archive_context):
     )
 
     payload = {
-        "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": prompt,
-        "max_output_tokens": 1200,
-        "store": False,
+        "system_instruction": {
+            "parts": [{"text": instructions}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 1200
+        },
     }
 
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+    )
+
     request = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
+        url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "x-goog-api-key": GEMINI_API_KEY,
             "Content-Type": "application/json",
         },
         method="POST",
@@ -146,27 +156,25 @@ def request_openai(question, archive_context):
             )
     except urllib.error.HTTPError as error:
         logger.error(
-            "OpenAI API HTTP error: %s", error.code
+            "Gemini API HTTP error: %s", error.code
         )
         raise RuntimeError(
-            f"OpenAI API вернул ошибку HTTP {error.code}."
+            f"Gemini API вернул ошибку HTTP {error.code}."
         ) from error
 
     answer_parts = []
 
-    for item in result.get("output", []):
-        if item.get("type") != "message":
-            continue
-
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                answer_parts.append(content.get("text", ""))
+    for candidate in result.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            if "text" in part:
+                answer_parts.append(part["text"])
 
     answer = "\n".join(answer_parts).strip()
 
     if not answer:
         raise RuntimeError(
-            "OpenAI не вернул текстовый ответ."
+            "Gemini не вернул текстовый ответ."
         )
 
     return answer
@@ -210,7 +218,6 @@ async def save_message(
     if not message or not chat:
         return
 
-    # Архивируем только сообщения нашего клуба.
     if chat.id != CLUB_CHAT_ID:
         return
 
@@ -290,7 +297,7 @@ async def answer_question(
         )
 
         answer = await asyncio.to_thread(
-            request_openai,
+            request_gemini,
             question,
             archive_context,
         )
@@ -355,7 +362,8 @@ def main():
     )
 
     print(
-        "AI-помощник «Психология Pro» запущен",
+        "AI-помощник «Психология Pro» "
+        "запущен с Gemini",
         flush=True,
     )
 
