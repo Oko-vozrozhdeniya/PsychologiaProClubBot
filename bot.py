@@ -73,10 +73,17 @@ def build_archive_context(records):
         text = str(record.get("text", ""))
         timestamp = str(record.get("timestamp", ""))
         topic_id = record.get("topic_id", 0)
+        topic_names = {
+            0: "General",
+            2: "Общение и обсуждения",
+        }
+        topic_name = topic_names.get(
+            topic_id, f"Неизвестная тема (ID: {topic_id})"
+        )
 
         entry = (
             f"Дата: {timestamp}\n"
-            f"Тема Telegram: {topic_id}\n"
+            f"Тема Telegram: {topic_name}\n"
             f"Сообщение: {text}\n"
         )
 
