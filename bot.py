@@ -118,7 +118,7 @@ def build_archive_context(records):
         topic_name = topic_names.get(str(topic_id), f"Неизвестная тема (ID: {topic_id})")
         entry = (
             f"Дата: {timestamp}\n"
-            f"Тема Telegram: {topic_name}\n"
+            f"Тема Telegram: {topic_name} (ID: {topic_id})\n"
             f"Сообщение: {text}\n"
         )
         if total_chars + len(entry) > MAX_ARCHIVE_CHARS:
