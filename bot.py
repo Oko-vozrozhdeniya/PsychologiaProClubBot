@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -6,7 +5,6 @@ import asyncio
 import socket
 import urllib.request
 import urllib.error
-
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +17,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 
 # ============================================================
 # НАСТРОЙКИ
@@ -41,7 +38,6 @@ GEMINI_MODEL = os.environ.get(
 OWNER_ID = 885005330
 TEST_USER_IDS = {7563789785}
 CLUB_CHAT_ID = -1003994062695
-
 TECH_ADMIN_IDS = set()
 
 DATA_DIR = Path("/app/data")
@@ -230,7 +226,6 @@ def create_error_record(error, operation):
         "reason": reason
     }
 
-    # НОВОЕ: добавляем только технические размеры запроса.
     if isinstance(error, GeminiRequestError):
         record.update(error.request_stats)
 
@@ -363,7 +358,6 @@ def format_diagnostic(record):
             f"\nЗначение HTTP: {http_description}"
         )
 
-    # НОВОЕ: статистика запроса при ошибке Gemini.
     if "request_bytes" in record:
         result += (
             f"\nРазмер запроса: "
@@ -1094,7 +1088,7 @@ def request_gemini(
     )
 
     # ========================================================
-    # НОВОЕ: ИЗМЕРЕНИЕ РАЗМЕРА ЗАПРОСА
+    # ИЗМЕРЕНИЕ РАЗМЕРА ЗАПРОСА
     # ========================================================
 
     payload_bytes = json.dumps(
@@ -1338,7 +1332,9 @@ async def start(
         "/diagnostics "
         "— последняя техническая ошибка.\n"
         "/diagnostics 5 "
-        "— последние пять ошибок."
+        "— последние пять ошибок.\n"
+        "/testai "
+        "— проверка Gemini без истории."
     )
 
 
@@ -1585,6 +1581,74 @@ async def private_message(
 
 
 # ============================================================
+# НОВАЯ ДИАГНОСТИЧЕСКАЯ КОМАНДА /testai
+# ============================================================
+
+async def testai(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    # Только владелец, только личный чат.
+    if (
+        not is_owner(update)
+        or update.effective_chat.type != "private"
+    ):
+        await update.effective_message.reply_text(
+            "Команда недоступна."
+        )
+        return
+
+    message = update.effective_message
+
+    await message.reply_text(
+        "Проверяю Gemini без истории "
+        "личного диалога..."
+    )
+
+    try:
+
+        # Используем тот же request_gemini,
+        # что и в обычном личном диалоге.
+        #
+        # archive_context=None:
+        # выбирается режим личного общения.
+        #
+        # history=[]:
+        # история полностью исключена.
+        #
+        # Никакие файлы памяти не изменяются.
+
+        answer = await asyncio.to_thread(
+            request_gemini,
+            "Сколько будет два плюс два? "
+            "Ответь одним словом.",
+            None,
+            []
+        )
+
+        await send_long_message(
+            message,
+            "Результат /testai "
+            "(без истории):\n"
+            + answer
+        )
+
+    except Exception as error:
+
+        logger.error(
+            "Gemini test failed: %s",
+            type(error).__name__
+        )
+
+        await send_error_response(
+            update,
+            error,
+            "Диагностика /testai без истории"
+        )
+
+
+# ============================================================
 # КОМАНДА /reset
 # ============================================================
 
@@ -1680,6 +1744,14 @@ def main():
         CommandHandler(
             "diagnostics",
             diagnostics
+        )
+    )
+
+    # Новая команда диагностики.
+    app.add_handler(
+        CommandHandler(
+            "testai",
+            testai
         )
     )
 
