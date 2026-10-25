@@ -1,4 +1,3 @@
-
 import os
 import json
 import logging
@@ -1592,12 +1591,13 @@ async def reset_dialog(
 ):
 
     if (
-        not is_owner(update)
+        not has_personal_ai_access(update)
         or update.effective_chat.type != "private"
     ):
 
         await update.effective_message.reply_text(
-            "Команда доступна владельцу "
+            "Команда доступна только "
+            "пользователям с разрешённым доступом "
             "в личном чате."
         )
         return
