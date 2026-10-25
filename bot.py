@@ -18,6 +18,7 @@ from telegram.ext import (
     filters,
 )
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -49,6 +50,7 @@ DEFAULT_TOPIC_NAMES = {
     "1": "General",
     "2": "Общение и обсуждения"
 }
+
 
 MAX_ARCHIVE_CHARS = 45000
 MAX_ANSWER_CHARS = 3800
@@ -970,7 +972,70 @@ def request_gemini(
             )
 
     except urllib.error.HTTPError as error:
-        error.read()
+        # ВОССТАНОВЛЕНА ДИАГНОСТИКА ОТВЕТА GOOGLE.
+        # Извлекаем объяснение из тела HTTP-ошибки.
+        # Не сохраняем полный ответ, запрос или API-ключ.
+
+        google_reason = (
+            "Дополнительное объяснение "
+            "от Google не получено"
+        )
+
+        try:
+            error_body = error.read().decode(
+                "utf-8",
+                errors="replace"
+            )
+
+            if error_body.strip():
+                try:
+                    error_data = json.loads(error_body)
+
+                    if isinstance(error_data, dict):
+                        google_error = error_data.get(
+                            "error",
+                            {}
+                        )
+
+                        if isinstance(google_error, dict):
+                            google_message = google_error.get(
+                                "message"
+                            )
+                            google_status = google_error.get(
+                                "status"
+                            )
+
+                            if (
+                                isinstance(google_message, str)
+                                and google_message.strip()
+                            ):
+                                google_reason = (
+                                    google_message.strip()
+                                )
+
+                            if (
+                                isinstance(google_status, str)
+                                and google_status.strip()
+                            ):
+                                google_reason += (
+                                    f" | Google status: "
+                                    f"{google_status.strip()}"
+                                )
+
+                except json.JSONDecodeError:
+                    google_reason = (
+                        "Google вернул ответ "
+                        "без корректного JSON-описания ошибки"
+                    )
+
+        except OSError:
+            google_reason = (
+                "Не удалось прочитать "
+                "объяснение ошибки от Google"
+            )
+
+        # Ограничиваем длину технического описания.
+        google_reason = google_reason[:1500]
 
         logger.error(
             "Gemini HTTP error: %s",
@@ -983,7 +1048,7 @@ def request_gemini(
             raise GeminiRequestError(
                 "rate_limit",
                 http_code=http_code,
-                reason="Лимит запросов Gemini API",
+                reason=google_reason,
                 request_stats=request_stats
             ) from error
 
@@ -991,14 +1056,14 @@ def request_gemini(
             raise GeminiRequestError(
                 "unavailable",
                 http_code=http_code,
-                reason="Сервис Gemini временно недоступен",
+                reason=google_reason,
                 request_stats=request_stats
             ) from error
 
         raise GeminiRequestError(
             "general",
             http_code=http_code,
-            reason="Gemini API отклонил запрос",
+            reason=google_reason,
             request_stats=request_stats
         ) from error
 
