@@ -28,7 +28,6 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Убираем подробные URL Telegram API из журнала.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
@@ -40,10 +39,11 @@ GEMINI_MODEL = os.environ.get(
 )
 
 OWNER_ID = 885005330
+TEST_USER_IDS = {7563789785}
 CLUB_CHAT_ID = -1003994062695
 
-# Только специально назначенные технические специалисты.
-# Владелец получает доступ автоматически.
+# Технические администраторы назначаются отдельно.
+# Тестовые пользователи не получают этих прав.
 TECH_ADMIN_IDS = set()
 
 DATA_DIR = Path("/app/data")
@@ -67,7 +67,6 @@ MAX_ARCHIVE_CHARS = 45000
 MAX_ANSWER_CHARS = 3800
 MAX_DIALOG_PAIRS = 30
 MAX_DIALOG_CHARS = 30000
-
 GEMINI_TIMEOUT = 90
 
 dialog_lock = asyncio.Lock()
@@ -91,6 +90,18 @@ def has_diagnostic_access(update):
     return (
         user.id == OWNER_ID
         or user.id in TECH_ADMIN_IDS
+    )
+
+
+def has_personal_ai_access(update):
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    return (
+        user.id == OWNER_ID
+        or user.id in TEST_USER_IDS
     )
 
 
@@ -176,18 +187,10 @@ def get_user_error_message(error):
 # ============================================================
 
 ERROR_DESCRIPTIONS = {
-    "timeout": (
-        "Превышено время ожидания ответа"
-    ),
-    "rate_limit": (
-        "Превышен лимит запросов"
-    ),
-    "unavailable": (
-        "Сервис временно недоступен"
-    ),
-    "general": (
-        "Другая техническая ошибка"
-    ),
+    "timeout": "Превышено время ожидания ответа",
+    "rate_limit": "Превышен лимит запросов",
+    "unavailable": "Сервис временно недоступен",
+    "general": "Другая техническая ошибка",
 }
 
 HTTP_DESCRIPTIONS = {
@@ -207,14 +210,12 @@ HTTP_DESCRIPTIONS = {
 def create_error_record(error, operation):
 
     if isinstance(error, GeminiRequestError):
-
         error_type = error.error_type
         http_code = error.http_code
         reason = error.reason
         service = "Gemini API"
 
     else:
-
         error_type = "general"
         http_code = None
         reason = "Ошибка выполнения операции"
@@ -267,9 +268,6 @@ def save_diagnostic_record(record):
 
 
 def read_diagnostic_records(limit=5):
-    """
-    Читает последние записи без обращения к Gemini.
-    """
 
     if not DIAGNOSTICS_FILE.exists():
         return []
@@ -369,16 +367,6 @@ async def send_error_response(
     error,
     operation
 ):
-    """
-    Обычный пользователь:
-    только понятное сообщение.
-
-    Владелец / технический администратор:
-    то же сообщение плюс диагностика.
-
-    Если запись в журнал не удалась,
-    уведомление всё равно отправляется.
-    """
 
     message = update.effective_message
 
@@ -416,12 +404,6 @@ async def diagnostics(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    """
-    /diagnostics
-    /diagnostics 5
-
-    Команда работает без Gemini.
-    """
 
     message = update.effective_message
     chat = update.effective_chat
@@ -457,9 +439,7 @@ async def diagnostics(
         return
 
     try:
-        records = read_diagnostic_records(
-            limit
-        )
+        records = read_diagnostic_records(limit)
 
         if not records:
             await message.reply_text(
@@ -1178,8 +1158,6 @@ def request_gemini(
 
     except urllib.error.HTTPError as error:
 
-        # Читаем тело ответа, но не публикуем его:
-        # оно может содержать лишние технические данные.
         error.read()
 
         logger.error(
@@ -1447,6 +1425,8 @@ async def answer_archive_question(
 
     message = update.effective_message
 
+    # Доступ только владельцу.
+    # TEST_USER_IDS здесь не используются.
     if not is_owner(update):
 
         await message.reply_text(
@@ -1527,7 +1507,9 @@ async def private_message(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not is_owner(update):
+    # Личное общение разрешено владельцу
+    # и специально указанным тестовым пользователям.
+    if not has_personal_ai_access(update):
 
         await update.message.reply_text(
             "Функция AI пока доступна "
@@ -1554,7 +1536,8 @@ async def private_message(
                 user_id
             )
 
-            # Только история текущего пользователя.
+            # История выбирается только
+            # по ID текущего пользователя.
             history = read_recent_dialog(
                 user_id,
                 session_id
