@@ -18,7 +18,6 @@ from telegram.ext import (
     filters,
 )
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -50,7 +49,6 @@ DEFAULT_TOPIC_NAMES = {
     "1": "General",
     "2": "Общение и обсуждения"
 }
-
 
 MAX_ARCHIVE_CHARS = 45000
 MAX_ANSWER_CHARS = 3800
@@ -763,7 +761,8 @@ def read_recent_dialog(
 def request_gemini(
     question,
     archive_context=None,
-    history=None
+    history=None,
+    request_stats_sink=None
 ):
     if not GEMINI_API_KEY:
         logger.error(
@@ -938,6 +937,9 @@ def request_gemini(
         )
     }
 
+    if request_stats_sink is not None:
+        request_stats_sink.update(request_stats)
+
     logger.info(
         "GEMINI_REQUEST_STATS "
         "mode=%s bytes=%s "
@@ -972,10 +974,7 @@ def request_gemini(
             )
 
     except urllib.error.HTTPError as error:
-        # ВОССТАНОВЛЕНА ДИАГНОСТИКА ОТВЕТА GOOGLE.
-        # Извлекаем объяснение из тела HTTP-ошибки.
-        # Не сохраняем полный ответ, запрос или API-ключ.
-
+        # Сохраняем объяснение Google для технической диагностики.
         google_reason = (
             "Дополнительное объяснение "
             "от Google не получено"
@@ -1034,7 +1033,6 @@ def request_gemini(
                 "объяснение ошибки от Google"
             )
 
-        # Ограничиваем длину технического описания.
         google_reason = google_reason[:1500]
 
         logger.error(
@@ -1406,39 +1404,78 @@ async def testai(
         return
 
     message = update.effective_message
+    question = "Запомни: мой любимый фрукт — манго."
 
-    await message.reply_text(
-        "Проверяю Gemini без истории "
-        "личного диалога..."
-    )
-
+    # Читаем текущую сессию, ничего в ней не меняя.
     try:
-        answer = await asyncio.to_thread(
-            request_gemini,
-            "Сколько будет два плюс два? "
-            "Ответь одним словом.",
-            None,
-            []
-        )
-
-        await send_long_message(
-            message,
-            "Результат /testai "
-            "(без истории):\n"
-            + answer
-        )
-
+        async with dialog_lock:
+            user_id = update.effective_user.id
+            state = read_dialog_state()
+            session_id = get_session_id(state, user_id)
+            history = read_recent_dialog(user_id, session_id)
     except Exception as error:
-        logger.error(
-            "Gemini test failed: %s",
-            type(error).__name__
-        )
-
         await send_error_response(
             update,
             error,
-            "Диагностика /testai без истории"
+            "Чтение истории для /testai"
         )
+        return
+
+    await message.reply_text(
+        "Сравниваю одинаковый запрос без истории "
+        "и с историей. Переписка не изменится."
+    )
+
+    results = []
+    for label, test_history in (
+        ("БЕЗ ИСТОРИИ", []),
+        ("С ИСТОРИЕЙ", history),
+    ):
+        stats = {}
+        try:
+            answer = await asyncio.to_thread(
+                request_gemini,
+                question,
+                None,
+                test_history,
+                stats
+            )
+            outcome = (
+                "Успешно (HTTP 200)\n"
+                f"Ответ: {answer[:500]}"
+            )
+        except Exception as error:
+            record = create_error_record(
+                error,
+                f"/testai: {label}"
+            )
+            try:
+                save_diagnostic_record(record)
+            except Exception:
+                logger.exception(
+                    "Cannot save test diagnostic record"
+                )
+            code = record.get("http_code")
+            outcome = (
+                f"Ошибка HTTP: {code if code is not None else 'не получен'}\n"
+                f"Причина: {record['reason']}"
+            )
+
+        results.append(
+            f"{label}\n"
+            f"{outcome}\n"
+            f"Размер запроса: {stats.get('request_bytes', 'неизвестен')} байт\n"
+            f"История: {stats.get('history_messages', 'неизвестно')} сообщений\n"
+            f"Символов истории: {stats.get('history_chars', 'неизвестно')}"
+        )
+
+    await send_long_message(
+        message,
+        "Сравнение /testai\n"
+        "Вопрос в обоих случаях: " + question + "\n\n"
+        + "\n\n".join(results)
+        + "\n\nТестовые сообщения в историю не записаны."
+    )
 
 
 async def reset_dialog(
