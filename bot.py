@@ -7,6 +7,7 @@ import socket
 import urllib.request
 import urllib.error
 
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,6 +28,10 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Убираем подробные URL Telegram API из журнала.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get(
@@ -37,6 +42,10 @@ GEMINI_MODEL = os.environ.get(
 OWNER_ID = 885005330
 CLUB_CHAT_ID = -1003994062695
 
+# Только специально назначенные технические специалисты.
+# Владелец получает доступ автоматически.
+TECH_ADMIN_IDS = set()
+
 DATA_DIR = Path("/app/data")
 
 TEXT_FILE = DATA_DIR / "messages.txt"
@@ -45,6 +54,8 @@ TOPICS_FILE = DATA_DIR / "topics.json"
 
 DIALOG_HISTORY_FILE = DATA_DIR / "private_history.jsonl"
 DIALOG_STATE_FILE = DATA_DIR / "private_dialog_state.json"
+
+DIAGNOSTICS_FILE = DATA_DIR / "diagnostics.jsonl"
 
 DEFAULT_TOPIC_NAMES = {
     "0": "General",
@@ -60,6 +71,27 @@ MAX_DIALOG_CHARS = 30000
 GEMINI_TIMEOUT = 90
 
 dialog_lock = asyncio.Lock()
+
+
+# ============================================================
+# ПРАВА ДОСТУПА
+# ============================================================
+
+def is_owner(update):
+    user = update.effective_user
+    return bool(user and user.id == OWNER_ID)
+
+
+def has_diagnostic_access(update):
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    return (
+        user.id == OWNER_ID
+        or user.id in TECH_ADMIN_IDS
+    )
 
 
 # ============================================================
@@ -104,14 +136,29 @@ GENERAL_ERROR_MESSAGE = (
 )
 
 
+# ============================================================
+# ТИПИЗИРОВАННЫЕ ОШИБКИ GEMINI
+# ============================================================
+
 class GeminiRequestError(Exception):
-    def __init__(self, error_type="general"):
+
+    def __init__(
+        self,
+        error_type="general",
+        http_code=None,
+        reason=None
+    ):
         self.error_type = error_type
+        self.http_code = http_code
+        self.reason = reason or "Неизвестная ошибка"
+
         super().__init__(error_type)
 
 
 def get_user_error_message(error):
+
     if isinstance(error, GeminiRequestError):
+
         if error.error_type == "timeout":
             return TIMEOUT_MESSAGE
 
@@ -125,12 +172,325 @@ def get_user_error_message(error):
 
 
 # ============================================================
-# ПРОВЕРКА ВЛАДЕЛЬЦА
+# ТЕХНИЧЕСКАЯ ДИАГНОСТИКА
 # ============================================================
 
-def is_owner(update):
-    user = update.effective_user
-    return bool(user and user.id == OWNER_ID)
+ERROR_DESCRIPTIONS = {
+    "timeout": (
+        "Превышено время ожидания ответа"
+    ),
+    "rate_limit": (
+        "Превышен лимит запросов"
+    ),
+    "unavailable": (
+        "Сервис временно недоступен"
+    ),
+    "general": (
+        "Другая техническая ошибка"
+    ),
+}
+
+HTTP_DESCRIPTIONS = {
+    400: "Некорректный запрос",
+    401: "Ошибка авторизации",
+    403: "Доступ запрещён",
+    404: "Ресурс или модель не найдены",
+    408: "Превышено время ожидания",
+    429: "Превышен лимит запросов",
+    500: "Внутренняя ошибка сервера",
+    502: "Ошибка промежуточного сервера",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+}
+
+
+def create_error_record(error, operation):
+
+    if isinstance(error, GeminiRequestError):
+
+        error_type = error.error_type
+        http_code = error.http_code
+        reason = error.reason
+        service = "Gemini API"
+
+    else:
+
+        error_type = "general"
+        http_code = None
+        reason = "Ошибка выполнения операции"
+        service = "Telegram-бот"
+
+    return {
+        "timestamp": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "service": service,
+        "operation": operation,
+        "error_type": error_type,
+        "http_code": http_code,
+        "reason": reason,
+    }
+
+
+def save_diagnostic_record(record):
+    """
+    Сохраняет техническую ошибку.
+
+    Не сохраняет:
+    - тексты пользовательских запросов;
+    - ответы Gemini;
+    - Telegram-токены;
+    - API-ключи;
+    - полные URL;
+    - личные идентификаторы участников.
+    """
+
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with DIAGNOSTICS_FILE.open(
+        "a",
+        encoding="utf-8"
+    ) as file:
+
+        file.write(
+            json.dumps(
+                record,
+                ensure_ascii=False
+            ) + "\n"
+        )
+
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def read_diagnostic_records(limit=5):
+    """
+    Читает последние записи без обращения к Gemini.
+    """
+
+    if not DIAGNOSTICS_FILE.exists():
+        return []
+
+    records = deque(maxlen=limit)
+
+    with DIAGNOSTICS_FILE.open(
+        "r",
+        encoding="utf-8"
+    ) as file:
+
+        for line in file:
+
+            if not line.strip():
+                continue
+
+            try:
+                record = json.loads(line)
+
+                if isinstance(record, dict):
+                    records.append(record)
+
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid diagnostics record"
+                )
+
+    return list(reversed(records))
+
+
+def format_diagnostic(record):
+
+    timestamp = record.get(
+        "timestamp",
+        "Неизвестно"
+    )
+
+    service = record.get(
+        "service",
+        "Неизвестно"
+    )
+
+    operation = record.get(
+        "operation",
+        "Неизвестно"
+    )
+
+    error_type = record.get(
+        "error_type",
+        "general"
+    )
+
+    http_code = record.get("http_code")
+
+    reason = record.get(
+        "reason",
+        "Неизвестно"
+    )
+
+    description = ERROR_DESCRIPTIONS.get(
+        error_type,
+        ERROR_DESCRIPTIONS["general"]
+    )
+
+    if http_code is None:
+        http_text = "Не получен"
+        http_description = ""
+    else:
+        http_text = str(http_code)
+
+        http_description = HTTP_DESCRIPTIONS.get(
+            http_code,
+            "Нет дополнительного описания"
+        )
+
+    result = (
+        "🔧 Техническая диагностика\n\n"
+        f"Время (UTC): {timestamp}\n"
+        f"Сервис: {service}\n"
+        f"Операция: {operation}\n"
+        f"Код HTTP: {http_text}\n"
+        f"Тип ошибки: {error_type}\n"
+        f"Описание: {description}\n"
+        f"Причина: {reason}"
+    )
+
+    if http_description:
+        result += (
+            f"\nЗначение HTTP: {http_description}"
+        )
+
+    return result
+
+
+async def send_error_response(
+    update,
+    error,
+    operation
+):
+    """
+    Обычный пользователь:
+    только понятное сообщение.
+
+    Владелец / технический администратор:
+    то же сообщение плюс диагностика.
+
+    Если запись в журнал не удалась,
+    уведомление всё равно отправляется.
+    """
+
+    message = update.effective_message
+
+    record = create_error_record(
+        error,
+        operation
+    )
+
+    try:
+        save_diagnostic_record(record)
+
+    except Exception:
+        logger.exception(
+            "Cannot save diagnostic record"
+        )
+
+    response = get_user_error_message(error)
+
+    if (
+        has_diagnostic_access(update)
+        and update.effective_chat.type == "private"
+    ):
+        response += (
+            "\n\n━━━━━━━━━━━━━━\n\n"
+            + format_diagnostic(record)
+        )
+
+    await send_long_message(
+        message,
+        response
+    )
+
+
+async def diagnostics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    """
+    /diagnostics
+    /diagnostics 5
+
+    Команда работает без Gemini.
+    """
+
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if (
+        not has_diagnostic_access(update)
+        or not chat
+        or chat.type != "private"
+    ):
+        await message.reply_text(
+            "Команда недоступна."
+        )
+        return
+
+    limit = 1
+
+    if context.args:
+
+        try:
+            limit = int(context.args[0])
+
+        except ValueError:
+            await message.reply_text(
+                "Укажите число от 1 до 10.\n"
+                "Например: /diagnostics 5"
+            )
+            return
+
+    if not 1 <= limit <= 10:
+        await message.reply_text(
+            "Можно запросить от 1 до 10 ошибок."
+        )
+        return
+
+    try:
+        records = read_diagnostic_records(
+            limit
+        )
+
+        if not records:
+            await message.reply_text(
+                "В журнале пока нет "
+                "зарегистрированных ошибок."
+            )
+            return
+
+        for index, record in enumerate(
+            records,
+            start=1
+        ):
+            text = (
+                f"Запись {index} из "
+                f"{len(records)}\n\n"
+                + format_diagnostic(record)
+            )
+
+            await send_long_message(
+                message,
+                text
+            )
+
+    except Exception:
+        logger.exception(
+            "Diagnostics command failed"
+        )
+
+        await message.reply_text(
+            GENERAL_ERROR_MESSAGE
+        )
 
 
 # ============================================================
@@ -138,17 +498,21 @@ def is_owner(update):
 # ============================================================
 
 def read_topic_names():
+
     names = DEFAULT_TOPIC_NAMES.copy()
 
     if TOPICS_FILE.exists():
+
         try:
             with TOPICS_FILE.open(
                 "r",
                 encoding="utf-8"
             ) as file:
+
                 stored = json.load(file)
 
             if isinstance(stored, dict):
+
                 names.update({
                     str(k): v
                     for k, v in stored.items()
@@ -164,6 +528,7 @@ def read_topic_names():
 
 
 def save_topic_name(topic_id, name):
+
     if not name or not name.strip():
         return
 
@@ -188,6 +553,7 @@ def save_topic_name(topic_id, name):
         "w",
         encoding="utf-8"
     ) as file:
+
         json.dump(
             names,
             file,
@@ -208,6 +574,7 @@ async def track_topic_changes(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     message = update.effective_message
     chat = update.effective_chat
 
@@ -219,6 +586,7 @@ async def track_topic_changes(
         return
 
     if message.forum_topic_created:
+
         save_topic_name(
             message.message_thread_id,
             message.forum_topic_created.name
@@ -228,6 +596,7 @@ async def track_topic_changes(
         message.forum_topic_edited
         and message.forum_topic_edited.name is not None
     ):
+
         save_topic_name(
             message.message_thread_id,
             message.forum_topic_edited.name
@@ -237,7 +606,11 @@ async def track_topic_changes(
         message.general_forum_topic_unhidden
         or message.general_forum_topic_hidden
     ):
-        save_topic_name(0, "General")
+
+        save_topic_name(
+            0,
+            "General"
+        )
 
 
 # ============================================================
@@ -245,6 +618,7 @@ async def track_topic_changes(
 # ============================================================
 
 def read_archive():
+
     records = []
 
     if not JSON_FILE.exists():
@@ -254,7 +628,9 @@ def read_archive():
         "r",
         encoding="utf-8"
     ) as file:
+
         for line in file:
+
             if not line.strip():
                 continue
 
@@ -274,17 +650,24 @@ def read_archive():
 
 
 def build_archive_context(records):
+
     parts = []
     total_chars = 0
 
     topic_names = read_topic_names()
 
     for record in reversed(records):
+
         text = str(record.get("text", ""))
+
         timestamp = str(
             record.get("timestamp", "")
         )
-        topic_id = record.get("topic_id", 0)
+
+        topic_id = record.get(
+            "topic_id",
+            0
+        )
 
         topic_name = topic_names.get(
             str(topic_id),
@@ -317,6 +700,7 @@ def build_archive_context(records):
 # ============================================================
 
 def read_dialog_state():
+
     if not DIALOG_STATE_FILE.exists():
         return {}
 
@@ -325,6 +709,7 @@ def read_dialog_state():
             "r",
             encoding="utf-8"
         ) as file:
+
             state = json.load(file)
 
         if not isinstance(state, dict):
@@ -339,6 +724,7 @@ def read_dialog_state():
         json.JSONDecodeError,
         ValueError
     ) as error:
+
         logger.exception(
             "Cannot read dialog state"
         )
@@ -350,6 +736,7 @@ def read_dialog_state():
 
 
 def save_dialog_state(state):
+
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -363,6 +750,7 @@ def save_dialog_state(state):
         "w",
         encoding="utf-8"
     ) as file:
+
         json.dump(
             state,
             file,
@@ -374,19 +762,24 @@ def save_dialog_state(state):
 
 
 def get_session_id(state, user_id):
-    value = state.get(str(user_id), 0)
+
+    value = state.get(
+        str(user_id),
+        0
+    )
 
     try:
         return int(value)
 
     except (ValueError, TypeError):
+
         raise RuntimeError(
             "Некорректный номер сессии диалога."
         )
 
 
 # ============================================================
-# ПОЛНАЯ ИСТОРИЯ ЛИЧНОЙ ПЕРЕПИСКИ
+# ИСТОРИЯ ЛИЧНОЙ ПЕРЕПИСКИ
 # ============================================================
 
 def append_dialog_record(
@@ -395,6 +788,7 @@ def append_dialog_record(
     question,
     answer
 ):
+
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True
@@ -414,6 +808,7 @@ def append_dialog_record(
         "a",
         encoding="utf-8"
     ) as file:
+
         file.write(
             json.dumps(
                 record,
@@ -433,13 +828,6 @@ def read_recent_dialog(
     user_id,
     session_id
 ):
-    """
-    Возвращает только сообщения указанного
-    пользователя и указанной сессии.
-
-    Истории других пользователей
-    не передаются Gemini.
-    """
 
     if not DIALOG_HISTORY_FILE.exists():
         return []
@@ -453,6 +841,7 @@ def read_recent_dialog(
         ) as file:
 
             for line in file:
+
                 if not line.strip():
                     continue
 
@@ -461,11 +850,11 @@ def read_recent_dialog(
                 if not isinstance(record, dict):
                     continue
 
-                # Проверка владельца истории.
+                # История только текущего пользователя.
                 if record.get("user_id") != user_id:
                     continue
 
-                # Проверка текущей сессии.
+                # История только текущей сессии.
                 if (
                     record.get("session_id")
                     != session_id
@@ -495,6 +884,7 @@ def read_recent_dialog(
         OSError,
         json.JSONDecodeError
     ) as error:
+
         logger.exception(
             "Cannot read private dialog history"
         )
@@ -510,6 +900,7 @@ def read_recent_dialog(
     for question, answer in reversed(
         recent_pairs
     ):
+
         pair_size = (
             len(question) + len(answer)
         )
@@ -531,6 +922,7 @@ def read_recent_dialog(
     contents = []
 
     for question, answer in selected:
+
         contents.append({
             "role": "user",
             "parts": [
@@ -557,11 +949,17 @@ def request_gemini(
     archive_context=None,
     history=None
 ):
+
     if not GEMINI_API_KEY:
+
         logger.error(
             "GEMINI_API_KEY is not configured"
         )
-        raise GeminiRequestError("general")
+
+        raise GeminiRequestError(
+            "general",
+            reason="Не настроен ключ Gemini API"
+        )
 
     base_instructions = (
         "Ты ИИ-помощник клуба «Психология Pro». "
@@ -601,7 +999,7 @@ def request_gemini(
 
     if archive_context is not None:
 
-        # Административный анализ.
+        # Отдельный административный режим.
         # Личная переписка сюда не передаётся.
 
         instructions = (
@@ -653,8 +1051,7 @@ def request_gemini(
     else:
 
         # Свободный личный разговор.
-        # Используется только история
-        # текущего пользователя.
+        # Архив клуба не передаётся.
 
         instructions = (
             base_instructions
@@ -765,6 +1162,7 @@ def request_gemini(
     )
 
     try:
+
         logger.info(
             "Starting Gemini API request"
         )
@@ -779,62 +1177,77 @@ def request_gemini(
             )
 
     except urllib.error.HTTPError as error:
-        details = error.read().decode(
-            "utf-8",
-            errors="replace"
-        )
+
+        # Читаем тело ответа, но не публикуем его:
+        # оно может содержать лишние технические данные.
+        error.read()
 
         logger.error(
-            "Gemini HTTP error %s: %s",
-            error.code,
-            details
+            "Gemini HTTP error: %s",
+            error.code
         )
 
-        if error.code == 429:
+        http_code = error.code
+
+        if http_code == 429:
+
             raise GeminiRequestError(
-                "rate_limit"
+                "rate_limit",
+                http_code=http_code,
+                reason="Лимит запросов Gemini API"
             ) from error
 
-        if error.code in (500, 502, 503, 504):
+        if http_code in (500, 502, 503, 504):
+
             raise GeminiRequestError(
-                "unavailable"
+                "unavailable",
+                http_code=http_code,
+                reason="Сервис Gemini временно недоступен"
             ) from error
 
         raise GeminiRequestError(
-            "general"
+            "general",
+            http_code=http_code,
+            reason="Gemini API отклонил запрос"
         ) from error
 
     except (
         TimeoutError,
         socket.timeout
     ) as error:
-        logger.exception(
+
+        logger.warning(
             "Gemini request timed out"
         )
 
         raise GeminiRequestError(
-            "timeout"
+            "timeout",
+            reason="Истекло время ожидания Gemini"
         ) from error
 
     except urllib.error.URLError as error:
-        logger.exception(
+
+        logger.warning(
             "Gemini connection error"
         )
 
         raise GeminiRequestError(
-            "unavailable"
+            "unavailable",
+            reason="Ошибка соединения с Gemini"
         ) from error
 
     except (
         OSError,
         ValueError
     ) as error:
-        logger.exception(
+
+        logger.warning(
             "Gemini transport or response error"
         )
 
         raise GeminiRequestError(
-            "general"
+            "general",
+            reason="Ошибка передачи или чтения ответа"
         ) from error
 
     answer_parts = []
@@ -843,6 +1256,7 @@ def request_gemini(
         "candidates",
         []
     ):
+
         content = candidate.get(
             "content",
             {}
@@ -852,6 +1266,7 @@ def request_gemini(
             "parts",
             []
         ):
+
             if "text" in part:
                 answer_parts.append(
                     part["text"]
@@ -862,13 +1277,14 @@ def request_gemini(
     ).strip()
 
     if not answer:
-        logger.error(
-            "Gemini returned no text: %s",
-            str(result)[:2000]
+
+        logger.warning(
+            "Gemini returned no text"
         )
 
         raise GeminiRequestError(
-            "general"
+            "general",
+            reason="Gemini не вернул текстовый ответ"
         )
 
     return answer
@@ -882,7 +1298,9 @@ async def send_long_message(
     message,
     text
 ):
+
     while text:
+
         chunk = text[:MAX_ANSWER_CHARS]
 
         text = text[MAX_ANSWER_CHARS:]
@@ -900,6 +1318,7 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not is_owner(update):
 
         await update.message.reply_text(
@@ -922,15 +1341,19 @@ async def start(
         "историю переписки."
         "\n\n"
 
-        "Команды:"
-        "\n"
+        "Команды:\n"
 
         "/analyze ваш вопрос "
-        "— анализ архива клуба."
-        "\n"
+        "— анализ архива клуба.\n"
 
         "/reset "
-        "— начать новый личный разговор."
+        "— начать новый личный разговор.\n"
+
+        "/diagnostics "
+        "— последняя техническая ошибка.\n"
+
+        "/diagnostics 5 "
+        "— последние пять ошибок."
     )
 
 
@@ -942,6 +1365,7 @@ async def save_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     message = update.effective_message
     chat = update.effective_chat
 
@@ -1020,9 +1444,11 @@ async def answer_archive_question(
     update: Update,
     question: str
 ):
+
     message = update.effective_message
 
     if not is_owner(update):
+
         await message.reply_text(
             "Эта функция доступна "
             "только администратору."
@@ -1041,6 +1467,7 @@ async def answer_archive_question(
         return
 
     try:
+
         records = read_archive()
 
         archive_context = build_archive_context(
@@ -1063,12 +1490,16 @@ async def answer_archive_question(
         )
 
     except Exception as error:
-        logger.exception(
-            "Archive analysis failed"
+
+        logger.error(
+            "Archive analysis failed: %s",
+            type(error).__name__
         )
 
-        await message.reply_text(
-            get_user_error_message(error)
+        await send_error_response(
+            update,
+            error,
+            "Анализ архива клуба"
         )
 
 
@@ -1076,6 +1507,7 @@ async def analyze(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     question = " ".join(
         context.args or []
     )
@@ -1094,6 +1526,7 @@ async def private_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not is_owner(update):
 
         await update.message.reply_text(
@@ -1111,6 +1544,7 @@ async def private_message(
     async with dialog_lock:
 
         try:
+
             user_id = update.effective_user.id
 
             state = read_dialog_state()
@@ -1120,8 +1554,7 @@ async def private_message(
                 user_id
             )
 
-            # Загружается только личная история
-            # текущего пользователя.
+            # Только история текущего пользователя.
             history = read_recent_dialog(
                 user_id,
                 session_id
@@ -1139,8 +1572,7 @@ async def private_message(
                 history
             )
 
-            # Сохраняем только успешную пару
-            # вопрос-ответ.
+            # Записываем только успешную пару.
             append_dialog_record(
                 user_id,
                 session_id,
@@ -1154,12 +1586,16 @@ async def private_message(
             )
 
         except Exception as error:
-            logger.exception(
-                "Private conversation failed"
+
+            logger.error(
+                "Private conversation failed: %s",
+                type(error).__name__
             )
 
-            await message.reply_text(
-                get_user_error_message(error)
+            await send_error_response(
+                update,
+                error,
+                "Личный диалог с ИИ"
             )
 
 
@@ -1171,6 +1607,7 @@ async def reset_dialog(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if (
         not is_owner(update)
         or update.effective_chat.type != "private"
@@ -1185,6 +1622,7 @@ async def reset_dialog(
     async with dialog_lock:
 
         try:
+
             state = read_dialog_state()
 
             user_id = update.effective_user.id
@@ -1207,13 +1645,17 @@ async def reset_dialog(
                 "как текущий контекст."
             )
 
-        except Exception:
-            logger.exception(
-                "Cannot reset dialog"
+        except Exception as error:
+
+            logger.error(
+                "Cannot reset dialog: %s",
+                type(error).__name__
             )
 
-            await update.effective_message.reply_text(
-                GENERAL_ERROR_MESSAGE
+            await send_error_response(
+                update,
+                error,
+                "Сброс личного диалога"
             )
 
 
@@ -1245,6 +1687,13 @@ def main():
         CommandHandler(
             "reset",
             reset_dialog
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "diagnostics",
+            diagnostics
         )
     )
 
@@ -1296,7 +1745,7 @@ def main():
 
     print(
         "ИИ-помощник «Психология Pro» "
-        "запущен с Gemini",
+        "запущен с Gemini и диагностикой",
         flush=True
     )
 
