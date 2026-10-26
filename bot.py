@@ -37,6 +37,9 @@ CLUB_CHAT_ID = -1003994062695
 TECH_ADMIN_IDS = set()
 
 DATA_DIR = Path("/app/data")
+# Эксперимент: проверка сохранения файла после пересборки.
+# Не создаём файл, не записываем и не изменяем его содержимое.
+STORAGE_TEST_FILE = DATA_DIR / "storage_test.txt"
 TEXT_FILE = DATA_DIR / "messages.txt"
 JSON_FILE = DATA_DIR / "messages.jsonl"
 TOPICS_FILE = DATA_DIR / "topics.json"
