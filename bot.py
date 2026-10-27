@@ -1372,12 +1372,6 @@ async def private_message(
                 question,
                 answer
             )
-
-            try:
-                from module_test import record_gemini_response
-                record_gemini_response()
-            except Exception as error:
-                logger.warning("Module test failed: %s", error)
                 
             await send_long_message(
                 message,
