@@ -76,15 +76,10 @@ def _score_memory(memory, query_tokens):
     content = memory.get("content", "")
     memory_tokens = _tokens(content)
 
-    overlap = query_tokens.intersection(memory_tokens)
-
-    if not overlap:
+    if not query_tokens.issubset(memory_tokens):
         return 0
 
-    score = len(overlap) * 10
-
-    if query_tokens.issubset(memory_tokens):
-        score += 10
+    score = len(query_tokens) * 10 + 10
 
     kind = memory.get("kind")
 
@@ -92,8 +87,6 @@ def _score_memory(memory, query_tokens):
         score += 3
     elif kind == "preference":
         score += 2
-    elif kind == "hypothesis":
-        score += 0
 
     return score
 
