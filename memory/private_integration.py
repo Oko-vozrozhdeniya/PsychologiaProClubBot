@@ -5,9 +5,9 @@
 Не изменяет обработчики действующего bot.py.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from memory import storage
+from memory import lifecycle, storage
 from memory.coordinator import AccessPolicy, SourcePermission
 from memory.dialog_bridge import (
     authorized_context,
@@ -57,12 +57,30 @@ def prepare_private_memory(
     ):
         raise PermissionError("Verified source permissions required")
 
-    # Создаём таблицы памяти перед первым чтением.
-    storage.initialize_database(
-        db_path=db_path if db_path is not None else storage.DATABASE_PATH
+    # Проверяем срок действия разрешения до создания базы данных.
+    now = timestamp.astimezone(timezone.utc)
+
+    try:
+        expiry = datetime.fromisoformat(
+            policy.expires_at.replace("Z", "+00:00")
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise PermissionError("Invalid permission expiry") from exc
+
+    if expiry.tzinfo is None or expiry <= now:
+        raise PermissionError("Permission expired")
+
+    # Инициализируем обе части базы памяти.
+    database = (
+        db_path
+        if db_path is not None
+        else storage.DATABASE_PATH
     )
 
-    # Проверяем разрешения до сохранения сообщения.
+    storage.initialize_database(db_path=database)
+    lifecycle.initialize_lifecycle(db_path=database)
+
+    # Проверяем доступ к памяти до сохранения сообщения.
     authorized_context(
         user_id,
         text,
