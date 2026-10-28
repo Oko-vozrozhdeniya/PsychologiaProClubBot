@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from memory.extraction import extract_candidates, candidate_to_storage_record
 from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
-from memory.retrieval import retrieve_memories
+from memory.retrieval import rank_memories
 from memory.updating import make_update_decision
 from memory import storage
 
@@ -101,11 +101,13 @@ def read_context(user_id, query, policy, source_permissions, now, *,
         raise ValueError("Query required")
     if not allowed_sources:
         return {"memories": [], "personalization": None, "progress": None}
-    # Retrieval is user-scoped but its ranking is limited to 500 candidates.
-    # Filter source and expiry again before returning anything to the caller.
-    records = retrieve_memories(user_id, query, limit=limit,
-                                db_path=db_path)
-    safe = [record for record in records if record["source"] in allowed_sources]
+    # Filter at the database boundary, before ranking or result limits.
+    # The source permissions must have been independently verified.
+    records = storage.list_authorized_memories(
+        user_id, allowed_sources,
+        **({"db_path": db_path} if db_path is not None else {})
+    )
+    safe = rank_memories(query, records, limit=limit)
     # These modules do not persist their own provenance/expiry. Therefore
     # callers may pass only source-verified items; reject mixed inputs.
     for item in personalization_items:
