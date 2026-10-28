@@ -11,7 +11,7 @@ from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
 from memory.updating import make_update_decision
-from memory import storage
+from memory import storage, lifecycle
 
 
 def _utc(value):
@@ -89,7 +89,7 @@ def _sources(permissions, now):
 
 def read_context(user_id, query, policy, source_permissions, now, *,
                  db_path=None, limit=5, personalization_items=(),
-                 checkpoint=None, topic_invited=False):
+                 checkpoint=None, topic_invited=False, enforce_lifecycle=False):
     """Return only explicitly authorized, unexpired source-backed context.
 
     The source list must be independently verified by the caller; a memory's
@@ -107,6 +107,11 @@ def read_context(user_id, query, policy, source_permissions, now, *,
         user_id, allowed_sources,
         **({"db_path": db_path} if db_path is not None else {})
     )
+    if enforce_lifecycle:
+        kwargs = {"db_path": db_path} if db_path is not None else {}
+        live = lifecycle.list_live_memories(user_id, moment, **kwargs)
+        live_ids = {item["id"] for item in live}
+        records = [item for item in records if item["id"] in live_ids]
     safe = rank_memories(query, records, limit=limit)
     # These modules do not persist their own provenance/expiry. Therefore
     # callers may pass only source-verified items; reject mixed inputs.
