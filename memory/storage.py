@@ -148,3 +148,29 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
             WHERE user_id = ? AND id = ?
         """, (user_id, memory_id))
         return cursor.rowcount == 1
+
+
+def list_authorized_memories(user_id, allowed_sources, db_path=DATABASE_PATH):
+    """Read only one user's memories whose sources were verified upstream.
+
+    An empty source set denies access. No candidate-count truncation occurs
+    before relevance ranking. This is a scoped read, not an authorization
+    decision: callers must independently verify source ownership and expiry.
+    """
+    _validate_user_id(user_id)
+    if not isinstance(allowed_sources, (set, frozenset, list, tuple)):
+        raise ValueError("allowed_sources must be a collection")
+    if any(not isinstance(s, str) or not s.strip() for s in allowed_sources):
+        raise ValueError("allowed_sources contains an invalid source")
+    sources = sorted(set(allowed_sources))
+    if not sources:
+        return []
+    placeholders = ",".join("?" for _ in sources)
+    with _connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, user_id, content, kind, source, created_at, updated_at "
+            "FROM memories WHERE user_id = ? AND source IN (" + placeholders + ") "
+            "ORDER BY id DESC",
+            (user_id, *sources),
+        ).fetchall()
+        return [dict(row) for row in rows]
