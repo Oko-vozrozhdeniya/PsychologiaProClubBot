@@ -40,6 +40,26 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(len(result["memories"]), 1)
         self.assertEqual(result["memories"][0]["source"], "message:1")
 
+    def test_authorized_source_not_crowded_out_by_disallowed_matches(self):
+        for index in range(30):
+            storage.add_memory(
+                1, "Любит читать книги", "fact",
+                f"message:blocked:{index}", self.db
+            )
+        result = self.read()
+        self.assertEqual(len(result["memories"]), 1)
+        self.assertEqual(result["memories"][0]["source"], "message:1")
+
+    def test_authorized_source_survives_over_500_newer_records(self):
+        for index in range(510):
+            storage.add_memory(
+                1, "Любит читать книги", "fact",
+                f"message:blocked:{index}", self.db
+            )
+        result = self.read()
+        self.assertEqual(len(result["memories"]), 1)
+        self.assertEqual(result["memories"][0]["source"], "message:1")
+
     def test_cross_user_policy_rejected(self):
         with self.assertRaises(PermissionError):
             self.read(policy(2))
