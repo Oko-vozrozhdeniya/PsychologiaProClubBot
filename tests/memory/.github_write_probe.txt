@@ -1,2 +1,0 @@
-Temporary write-access diagnostic for feature/memory-dialog-bridge.
-No application code changes.
