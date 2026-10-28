@@ -7,6 +7,7 @@
 
 from datetime import datetime
 
+from memory import storage
 from memory.coordinator import AccessPolicy, SourcePermission
 from memory.dialog_bridge import (
     authorized_context,
@@ -55,6 +56,11 @@ def prepare_private_memory(
         for item in source_permissions
     ):
         raise PermissionError("Verified source permissions required")
+
+    # Создаём таблицы памяти перед первым чтением.
+    storage.initialize_database(
+        db_path=db_path if db_path is not None else storage.DATABASE_PATH
+    )
 
     # Проверяем разрешения до сохранения сообщения.
     authorized_context(
