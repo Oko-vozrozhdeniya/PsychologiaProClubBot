@@ -223,6 +223,65 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.assertIn("расположение", result)
                 self.assertNotIn(key, result)
 
+    def test_gemini_ping_minimal_post_and_safe_status(self):
+        import io
+        import json
+        import socket
+        import time
+        import urllib
+        import urllib.error
+        import urllib.request
+
+        tree = ast.parse((ROOT / "test_bot.py").read_text(encoding="utf-8"))
+        funcs = {node.name: node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertIn("gemini_ping", funcs)
+        build = ast.unparse(funcs["create_test_application"])
+        self.assertIn("'gemini_ping': gemini_ping", build)
+        self.assertIn("filters.ChatType.PRIVATE", build)
+        self.assertIn("filters.User", build)
+        ns = {"os": os, "urllib": urllib, "socket": socket,
+              "json": json, "time": time}
+        exec(compile(ast.Module(
+            body=[funcs["probe_gemini_generation"]], type_ignores=[]
+        ), "test_bot.py", "exec"), ns)
+        probe = ns["probe_gemini_generation"]
+        fake_key = "DO_NOT_EXPOSE_THIS_FAKE_KEY"
+        with patch.dict(os.environ, {
+                "GEMINI_MODEL": "gemini-3.8-flash",
+                "GEMINI_API_KEY": fake_key,
+        }, clear=True):
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(
+                b'{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}'
+            )) as http:
+                result = probe()
+                self.assertIn("HTTP 200", result)
+                self.assertNotIn(fake_key, result)
+                req = http.call_args.args[0]
+                self.assertEqual(req.get_method(), "POST")
+                self.assertIn("gemini-3.8-flash:generateContent", req.full_url)
+                self.assertEqual(http.call_args.kwargs["timeout"], 25)
+                self.assertEqual(req.get_header("X-goog-api-key"), fake_key)
+                body = json.loads(req.data.decode("utf-8"))
+                self.assertEqual(body["generationConfig"]["maxOutputTokens"], 64)
+                self.assertNotIn("синие кактусы", req.data.decode("utf-8"))
+
+            with patch("urllib.request.urlopen", side_effect=socket.timeout()):
+                result = probe()
+                self.assertIn("Тайм-аут POST", result)
+                self.assertNotIn(fake_key, result)
+
+            err = urllib.error.HTTPError(
+                "https://generativelanguage.googleapis.com/",
+                404, "Not Found", {},
+                io.BytesIO(b'{"error":{"status":"NOT_FOUND","message":"bad"}}')
+            )
+            with patch("urllib.request.urlopen", side_effect=err):
+                result = probe()
+                self.assertIn("HTTP 404", result)
+                self.assertIn("NOT_FOUND", result)
+                self.assertNotIn(fake_key, result)
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)

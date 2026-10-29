@@ -10,6 +10,8 @@ Never commit Telegram or AI tokens.
 import asyncio
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -81,6 +83,7 @@ async def start_test(update, context):
         "Проверка извлечения: /check_memory <слова из факта>.\n"
         "Диагностика страны сервера: /network_check.\n"
         "Проверка доступности Gemini API: /gemini_check.\n"
+        "Короткая пробная генерация Gemini: /gemini_ping.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -196,6 +199,67 @@ async def gemini_check(update, context):
     )
 
 
+def probe_gemini_generation():
+    """Send one minimal nonpersonal POST; return only status and duration.
+
+    No memory, private messages, or full Google response body are exposed.
+    This distinguishes the GET model list from generateContent reliability.
+    """
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip()
+    if not key:
+        return "Нет GEMINI_API_KEY в Bothost"
+    if not model or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789._-" for c in model):
+        return "Некорректное имя GEMINI_MODEL"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": "Ответь одним словом: OK"}]}],
+        "generationConfig": {"maxOutputTokens": 64}
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        data=payload,
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            data = json.loads(response.read(32768).decode("utf-8"))
+        elapsed = round(time.monotonic() - start, 1)
+        if not isinstance(data, dict) or not isinstance(data.get("candidates"), list):
+            return f"HTTP 200, но неожиданный формат ответа; {elapsed} с"
+        return f"HTTP 200: generateContent ответил; модель {model}; {elapsed} с"
+    except urllib.error.HTTPError as error:
+        status = "UNKNOWN"
+        try:
+            data = json.loads(error.read(4096).decode("utf-8"))
+            info = data.get("error", {}) if isinstance(data, dict) else {}
+            value = info.get("status") if isinstance(info, dict) else None
+            if (isinstance(value, str) and 0 < len(value) <= 40
+                    and all(c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_" for c in value)):
+                status = value
+        except (ValueError, UnicodeError, OSError):
+            pass
+        elapsed = round(time.monotonic() - start, 1)
+        return f"HTTP {error.code}; Google: {status}; модель {model}; {elapsed} с"
+    except (socket.timeout, TimeoutError):
+        elapsed = round(time.monotonic() - start, 1)
+        return f"Тайм-аут POST generateContent через {elapsed} с; модель {model}"
+    except (urllib.error.URLError, OSError, UnicodeError, ValueError) as error:
+        elapsed = round(time.monotonic() - start, 1)
+        # Never interpolate exception strings: URLs could contain credentials.
+        return f"Сетевая ошибка ({type(error).__name__}); {elapsed} с"
+
+
+async def gemini_ping(update, context):
+    """Owner-only diagnostic for minimal text-generation request."""
+    result = await asyncio.to_thread(probe_gemini_generation)
+    await update.effective_message.reply_text(
+        "Минимальная проверка генерации Gemini (без памяти и истории):\n"
+        + result
+    )
+
+
 def create_test_application(bot, allowed_ids, expected_username):
     """Private-only routes; group/archive/topic handlers do not exist here."""
     from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -225,6 +289,7 @@ def create_test_application(bot, allowed_ids, expected_username):
         "check_memory": check_memory,
         "network_check": network_check,
         "gemini_check": gemini_check,
+        "gemini_ping": gemini_ping,
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(
