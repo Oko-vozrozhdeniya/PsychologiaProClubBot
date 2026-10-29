@@ -8,7 +8,9 @@ Its application registers private handlers only and uses isolated storage.
 Never commit Telegram or AI tokens.
 """
 import asyncio
+import json
 import os
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -78,6 +80,7 @@ async def start_test(update, context):
         "/change <номер> <новый текст>, /history <номер>.\n"
         "Проверка извлечения: /check_memory <слова из факта>.\n"
         "Диагностика страны сервера: /network_check.\n"
+        "Проверка доступности Gemini API: /gemini_check.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -135,6 +138,64 @@ async def network_check(update, context):
     )
 
 
+def probe_gemini_models():
+    """Check Gemini model-list endpoint with existing key; never expose secrets.
+
+    No generateContent request is made and no private conversation is sent.
+    Only HTTP code and sanitized Google status are returned.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return "Ошибка конфигурации: GEMINI_API_KEY отсутствует"
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1",
+        headers={"x-goog-api-key": api_key},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            data = json.loads(response.read(8192).decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            return "HTTP 200: неожиданный формат ответа Google"
+        return "HTTP 200 OK: Gemini API принимает ключ и возвращает список моделей"
+    except urllib.error.HTTPError as error:
+        google_status = "UNKNOWN"
+        google_message = ""
+        try:
+            info = json.loads(error.read(4096).decode("utf-8"))
+            details = info.get("error", {}) if isinstance(info, dict) else {}
+            if isinstance(details, dict):
+                value = details.get("status")
+                if (isinstance(value, str) and len(value) <= 50
+                        and value.replace("_", "").isupper()
+                        and value.replace("_", "").isalpha()):
+                    google_status = value
+                google_message = str(details.get("message", ""))[:250]
+        except (ValueError, UnicodeError, OSError):
+            pass
+        if ("location" in google_message.lower() and
+                "not supported" in google_message.lower()):
+            category = "Google отклоняет расположение запроса"
+        elif error.code in (401, 403):
+            category = "Google отклоняет доступ по ключу или проекту"
+        elif error.code == 429:
+            category = "Достигнут лимит запросов Google"
+        else:
+            category = "Требуется дальнейшая диагностика Google API"
+        return f"HTTP {error.code}; Google: {google_status}; {category}"
+    except (OSError, UnicodeError, ValueError, TimeoutError):
+        return "Сетевая ошибка или нераспознанный ответ Google"
+
+
+async def gemini_check(update, context):
+    """Only preapproved private tester may initiate this no-cost metadata call."""
+    result = await asyncio.to_thread(probe_gemini_models)
+    await update.effective_message.reply_text(
+        "Проверка доступа к списку моделей Gemini (без генерации текста):\\n"
+        + result
+    )
+
+
 def create_test_application(bot, allowed_ids, expected_username):
     """Private-only routes; group/archive/topic handlers do not exist here."""
     from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -163,6 +224,7 @@ def create_test_application(bot, allowed_ids, expected_username):
         "history": bot.history_command,
         "check_memory": check_memory,
         "network_check": network_check,
+        "gemini_check": gemini_check,
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(

@@ -170,6 +170,59 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         detect()
 
+    def test_gemini_check_only_in_private_tester_command_set(self):
+        code = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        funcs = {node.name: node for node in ast.parse(code).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertIn("probe_gemini_models", funcs)
+        builder = ast.unparse(funcs["create_test_application"])
+        self.assertIn("'gemini_check': gemini_check", builder)
+        self.assertIn("filters.ChatType.PRIVATE", builder)
+        self.assertIn("filters.User", builder)
+
+    def test_gemini_probe_is_metadata_only_and_keeps_key_out_of_result(self):
+        import io
+        import json
+        import urllib
+        import urllib.error
+        import urllib.request
+        code = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        fn = next(x for x in ast.parse(code).body
+                  if isinstance(x, ast.FunctionDef)
+                  and x.name == "probe_gemini_models")
+        ns = {"os": os, "urllib": urllib, "json": json}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "test_bot.py", "exec"), ns)
+        probe = ns["probe_gemini_models"]
+        key = "NO_REAL_SECRET_UNIT_TEST_KEY"
+        with patch.dict(os.environ, {"GEMINI_API_KEY": key}, clear=True):
+            with patch("urllib.request.urlopen",
+                       return_value=io.BytesIO(b'{"models":[]}')) as http:
+                result = probe()
+                self.assertIn("200 OK", result)
+                self.assertNotIn(key, result)
+                req = http.call_args.args[0]
+                self.assertEqual(req.get_method(), "GET")
+                self.assertEqual(
+                    req.full_url,
+                    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"
+                )
+                self.assertEqual(req.get_header("X-goog-api-key"), key)
+
+            payload = json.dumps({"error": {
+                "status": "FAILED_PRECONDITION",
+                "message": "User location is not supported for the API use"
+            }}).encode("utf-8")
+            err = urllib.error.HTTPError(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                400, "Bad Request", {}, io.BytesIO(payload)
+            )
+            with patch("urllib.request.urlopen", side_effect=err):
+                result = probe()
+                self.assertIn("HTTP 400", result)
+                self.assertIn("FAILED_PRECONDITION", result)
+                self.assertIn("расположение", result)
+                self.assertNotIn(key, result)
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)
