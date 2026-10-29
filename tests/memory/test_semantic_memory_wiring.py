@@ -4,12 +4,13 @@ import io
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from memory import storage, lifecycle
+from memory.coordinator import AccessPolicy, SourcePermission, prepare_candidates
 from memory.extraction import extract_candidates
 
 
@@ -18,6 +19,8 @@ class SemanticMemoryWiringTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = Path(self.tmp.name) / "memory.db"
+        self.consented = True
+        self.gemini_calls = 0
         storage.initialize_database(self.db)
         lifecycle.initialize_lifecycle(self.db)
         source = (Path(__file__).resolve().parents[2] / "bot.py").read_text(
@@ -38,6 +41,10 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             "json": json,
             "datetime": datetime,
             "timezone": timezone,
+            "timedelta": timedelta,
+            "AccessPolicy": AccessPolicy,
+            "SourcePermission": SourcePermission,
+            "prepare_candidates": prepare_candidates,
             "extract_candidates": extract_candidates,
             "personal_storage": SimpleNamespace(
                 initialize_database=lambda: storage.initialize_database(self.db),
@@ -47,7 +54,13 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             ),
             "personal_lifecycle": SimpleNamespace(
                 initialize_lifecycle=lambda: lifecycle.initialize_lifecycle(self.db),
-                has_memory_consent=lambda user: user == 101,
+                has_memory_consent=lambda user: user == 101 and self.consented,
+                list_live_sources=lambda user, now: lifecycle.list_live_sources(
+                    user, now, db_path=self.db
+                ),
+                delete_message=lambda user, m: lifecycle.delete_message(
+                    user, m, db_path=self.db
+                ),
                 register_message=lambda u, m, c, t: lifecycle.register_message(
                     u, m, c, t, db_path=self.db
                 ),
@@ -69,6 +82,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
              self.ns)
 
     def fake_urlopen(self, request, timeout):
+        self.gemini_calls += 1
         self.assertEqual(request.get_header("X-goog-api-key"), "test-key")
         response = {
             "candidates": [{
@@ -93,6 +107,57 @@ class SemanticMemoryWiringTests(unittest.TestCase):
         self.assertEqual(lifecycle.list_live_memories(
             202, datetime.now(timezone.utc), db_path=self.db
         ), [])
+
+    def test_consent_missing_skips_gemini_and_storage(self):
+        self.consented = False
+        self.assertEqual(
+            self.ns["remember_dialog_facts"](101, 10, "Я изучаю биологию"), 0
+        )
+        self.assertEqual(self.gemini_calls, 0)
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+
+    def test_revoke_during_gemini_skips_all_writes(self):
+        self.model_result = [
+            {"content": "Пользователь изучает биологию",
+             "kind": "fact", "confidence": 0.98}
+        ]
+        orig = self.ns["urllib"].request.urlopen
+
+        def revoke_on_response(request, timeout):
+            response = orig(request, timeout)
+            self.consented = False
+            return response
+
+        self.ns["urllib"].request.urlopen = revoke_on_response
+        self.assertEqual(
+            self.ns["remember_dialog_facts"](101, 11, "Я изучаю биологию"), 0
+        )
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_sources(
+            101, datetime.now(timezone.utc), db_path=self.db
+        ), [])
+
+    def test_unverified_source_cannot_be_saved(self):
+        self.model_result = [
+            {"content": "Пользователь изучает биологию",
+             "kind": "fact", "confidence": 0.98}
+        ]
+        self.ns["personal_lifecycle"].list_live_sources = lambda user, now: []
+        with self.assertRaises(PermissionError):
+            self.ns["remember_dialog_facts"](101, 12, "Я изучаю биологию")
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+
+    def test_existing_source_is_not_reregistered(self):
+        self.model_result = [
+            {"content": "Пользователь изучает биологию",
+             "kind": "fact", "confidence": 0.98}
+        ]
+        fn = self.ns["remember_dialog_facts"]
+        self.assertEqual(fn(101, 13, "Я изучаю биологию"), 1)
+        self.assertEqual(fn(101, 13, "Я изучаю биологию"), 0)
+        self.assertEqual(len(lifecycle.list_live_sources(
+            101, datetime.now(timezone.utc), db_path=self.db
+        )), 1)
 
     def test_no_facts_writes_nothing(self):
         self.model_result = []

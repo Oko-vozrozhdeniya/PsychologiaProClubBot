@@ -7,7 +7,9 @@ import urllib.request
 import urllib.error
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from memory.coordinator import AccessPolicy, SourcePermission, read_context
+from memory.coordinator import (
+    AccessPolicy, SourcePermission, read_context, prepare_candidates,
+)
 from pathlib import Path
 
 from memory.gemini_prompt_adapter import append_private_memory
@@ -1627,22 +1629,63 @@ def remember_dialog_facts(user_id, message_id, question):
     )
     if not validated:
         return 0
+    # Consent may have been revoked while Gemini was extracting candidates.
+    if not personal_lifecycle.has_memory_consent(user_id):
+        return 0
+
     personal_storage.initialize_database()
     personal_lifecycle.initialize_lifecycle()
     now = datetime.now(timezone.utc)
     existing = personal_lifecycle.list_live_memories(user_id, now)
-    # A retry must not re-register a source with a new timestamp.
-    if any(item["source"] == source for item in existing):
+    registered_sources = personal_lifecycle.list_live_sources(user_id, now)
+    # A retry cannot extend the 365-day expiry or duplicate linked memories.
+    if any(item["source"] == source for item in registered_sources):
         return 0
-    personal_lifecycle.register_message(user_id, source, question, now)
+
+    expires_at = personal_lifecycle.register_message(
+        user_id, source, question, now
+    )
+    verified = [
+        item for item in personal_lifecycle.list_live_sources(user_id, now)
+        if item["source"] == source and item["expires_at"] == expires_at
+    ]
+    if len(verified) != 1:
+        raise PermissionError("New memory source was not independently verified")
+
+    # Prepare only under the coordinator's verified policy and source boundary.
+    policy = AccessPolicy(
+        user_id=user_id, consent=True, entitled=True, verified=True,
+        expires_at=(now + timedelta(minutes=2)).isoformat(),
+    )
+    permissions = [
+        SourcePermission(source=source, expires_at=expires_at)
+    ]
+    approved = prepare_candidates(
+        user_id,
+        [
+            {
+                "content": item.content,
+                "kind": item.kind,
+                "confidence": item.confidence,
+                "source": item.source,
+            }
+            for item in validated
+        ],
+        policy, permissions, now.isoformat(), min_confidence=0.85,
+    )
+    # No new records after a concurrent opt-out.
+    if not personal_lifecycle.has_memory_consent(user_id):
+        personal_lifecycle.delete_message(user_id, source)
+        return 0
+
     known = {item["content"].casefold().strip() for item in existing}
     saved = 0
-    for candidate in validated:
-        key = candidate.content.casefold().strip()
+    for candidate in approved:
+        key = candidate["content"].casefold().strip()
         if key in known:
             continue
         memory_id = personal_storage.add_memory(
-            user_id, candidate.content, candidate.kind, source
+            user_id, candidate["content"], candidate["kind"], source
         )
         personal_lifecycle.link_memory_sources(
             user_id, memory_id, [source], now
