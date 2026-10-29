@@ -8,6 +8,7 @@ Its application registers private handlers only and uses isolated storage.
 Never commit Telegram or AI tokens.
 """
 import asyncio
+import ipaddress
 import json
 import os
 import socket
@@ -86,6 +87,7 @@ async def start_test(update, context):
         "Короткая пробная генерация Gemini: /gemini_ping.\n"
         "Режим ИИ: /ai_gemini, /ai_groq, /ai_auto, /ai_mode.\n"
         "Проверка доступности Groq API: /groq_check.\n"
+        "Показать исходящий IPv4 контейнера: /ip_check.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -124,6 +126,40 @@ def detect_server_country():
     if len(raw) != 2 or not raw.isalpha() or not raw.isupper():
         raise ValueError("Unexpected country lookup response")
     return raw
+
+
+def get_public_egress_ip():
+    """Get container's public outbound IPv4 without Telegram/AI credentials."""
+    request = urllib.request.Request(
+        "https://api.ipify.org?format=json",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        data = json.loads(response.read(256).decode("utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("ip"), str):
+        raise ValueError("No IP in echo response")
+    ip = ipaddress.ip_address(data["ip"])
+    if not isinstance(ip, ipaddress.IPv4Address) or not ip.is_global:
+        raise ValueError("Nonpublic or non-IPv4 address returned")
+    return str(ip)
+
+
+async def ip_check(update, context):
+    """Restricted to the owner via the private-only command handlers."""
+    try:
+        ip = await asyncio.to_thread(get_public_egress_ip)
+    except (OSError, ValueError, TimeoutError, UnicodeError):
+        await update.effective_message.reply_text(
+            "Не удалось определить исходящий IP через api.ipify.org; "
+            "проверка не затрагивает Gemini, Groq или память."
+        )
+        return
+    await update.effective_message.reply_text(
+        f"Внешний исходящий IPv4 контейнера: {ip}\n"
+        "Источник: api.ipify.org; IP для других API может отличаться "
+        "при отдельной маршрутизации."
+    )
 
 
 async def network_check(update, context):
@@ -420,6 +456,7 @@ def create_test_application(bot, allowed_ids, expected_username):
         "history": bot.history_command,
         "check_memory": check_memory,
         "network_check": network_check,
+        "ip_check": ip_check,
         "gemini_check": gemini_check,
         "gemini_ping": gemini_ping,
         "groq_check": groq_check,

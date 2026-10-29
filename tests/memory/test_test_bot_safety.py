@@ -387,6 +387,41 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.assertIn(expected, output)
                 self.assertNotIn(key, output)
 
+    def test_ip_check_private_owner_only_and_echo_response_validated(self):
+        import io
+        import ipaddress
+        import json
+        import urllib
+        import urllib.request
+        source = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        funcs = {node.name: node for node in ast.parse(source).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        build = ast.unparse(funcs["create_test_application"])
+        self.assertIn("'ip_check': ip_check", build)
+        self.assertIn("filters.ChatType.PRIVATE", build)
+        self.assertIn("filters.User", build)
+        self.assertIn("get_public_egress_ip", funcs)
+        namespace = {"urllib": urllib, "json": json, "ipaddress": ipaddress}
+        exec(compile(ast.Module(body=[funcs["get_public_egress_ip"]],
+                                type_ignores=[]), "test_bot.py", "exec"), namespace)
+        fetch = namespace["get_public_egress_ip"]
+        with patch("urllib.request.urlopen",
+                   return_value=io.BytesIO(b'{"ip":"8.8.8.8"}')) as request:
+            self.assertEqual(fetch(), "8.8.8.8")
+            outbound = request.call_args.args[0]
+            self.assertEqual(outbound.full_url, "https://api.ipify.org?format=json")
+            self.assertEqual(outbound.get_method(), "GET")
+            self.assertIsNone(outbound.data)
+            self.assertEqual(request.call_args.kwargs["timeout"], 10)
+            self.assertFalse(outbound.has_header("Authorization"))
+        for raw in (b'{"ip":"127.0.0.1"}', b'{"ip":"10.0.0.1"}',
+                    b'{"ip":"not_an_ip"}', b'{"other":"8.8.8.8"}'):
+            with self.subTest(raw=raw), patch(
+                "urllib.request.urlopen", return_value=io.BytesIO(raw)
+            ):
+                with self.assertRaises(ValueError):
+                    fetch()
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)
