@@ -9,6 +9,8 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+from memory.gemini_prompt_adapter import append_private_memory, optional_private_memory
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -763,7 +765,8 @@ def request_gemini(
     question,
     archive_context=None,
     history=None,
-    request_stats_sink=None
+    request_stats_sink=None,
+    personal_memory_context=None
 ):
     if not GEMINI_API_KEY:
         logger.error(
@@ -799,6 +802,9 @@ def request_gemini(
         "действия, для которых нет "
         "реализованных инструментов. "
     )
+
+    if archive_context is None and personal_memory_context:
+        question = append_private_memory(question, personal_memory_context)
 
     if archive_context is not None:
         instructions = (
@@ -1359,11 +1365,20 @@ async def private_message(
                 "Думаю над ответом..."
             )
 
+            memory_prompt = await asyncio.to_thread(
+                optional_private_memory,
+                user_id,
+                message.message_id,
+                question,
+                datetime.now(timezone.utc),
+            )
             answer = await asyncio.to_thread(
                 request_gemini,
                 question,
                 None,
-                history
+                history,
+                None,
+                memory_prompt,
             )
 
             append_dialog_record(
