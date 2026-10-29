@@ -51,6 +51,11 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
             ON private_messages(expires_at)""")
         db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_sources_message
             ON memory_sources(user_id, message_id)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS memory_consents (
+            user_id INTEGER PRIMARY KEY CHECK(user_id > 0),
+            enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+            updated_at TEXT NOT NULL
+        )""")
 
 
 def register_message(user_id, message_id, content, created_at, *,
@@ -170,3 +175,51 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
                 removed += db.execute("DELETE FROM memories WHERE user_id=? AND id=?",
                                       (user_id, row["memory_id"])).rowcount
     return {"deleted_messages": deleted, "deleted_memories": removed}
+
+    
+
+def set_memory_consent(user_id, enabled, now, *, db_path=storage.DATABASE_PATH):
+    """Record an explicit opt-in or opt-out. Never infer consent from identity."""
+    storage._validate_user_id(user_id)
+    if type(enabled) is not bool:
+        raise ValueError("enabled must be boolean")
+    moment = _iso(now)
+    initialize_lifecycle(db_path)
+    with storage._connection(db_path) as db:
+        db.execute("""INSERT INTO memory_consents (user_id, enabled, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE
+                SET enabled=excluded.enabled, updated_at=excluded.updated_at
+        """, (user_id, int(enabled), moment))
+    return enabled
+
+
+def has_memory_consent(user_id, *, db_path=storage.DATABASE_PATH):
+    """Return True only for an explicit, persistently stored opt-in."""
+    storage._validate_user_id(user_id)
+    initialize_lifecycle(db_path)
+    with storage._connection(db_path) as db:
+        row = db.execute(
+            "SELECT enabled FROM memory_consents WHERE user_id=?", (user_id,)
+        ).fetchone()
+    return bool(row and row["enabled"] == 1)
+
+
+def list_live_sources(user_id, now, *, db_path=storage.DATABASE_PATH):
+    """Verify source ownership and expiry from independent source records.
+
+    Derived memory rows alone are never proof of source authorization.
+    """
+    storage._validate_user_id(user_id)
+    moment = _iso(now)
+    prefix = f"telegram:private:{user_id}:"
+    with storage._connection(db_path) as db:
+        rows = db.execute(
+            """SELECT message_id, expires_at FROM private_messages
+               WHERE user_id=? AND expires_at>? ORDER BY message_id""",
+            (user_id, moment),
+        ).fetchall()
+    return [
+        {"source": row["message_id"], "expires_at": row["expires_at"]}
+        for row in rows if row["message_id"].startswith(prefix)
+    ]

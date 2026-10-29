@@ -6,7 +6,8 @@ import socket
 import urllib.request
 import urllib.error
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from memory.coordinator import AccessPolicy, SourcePermission, read_context
 from pathlib import Path
 
 from memory.gemini_prompt_adapter import append_private_memory
@@ -797,8 +798,8 @@ def request_gemini(
         "Ты работаешь через Telegram-бота. "
         "Голосовые сообщения пока "
         "не распознаются. "
-        "Долгосрочная память включает только явно сохранённые "
-        "пользователем записи. "
+        "Долгосрочная память используется только при явно предоставленном "
+        "согласии пользователя. "
         "Материалы курса «Психосоматика PRO» "
         "пока не загружены в твою базу знаний. "
         "Не утверждай, что можешь выполнять "
@@ -1368,11 +1369,15 @@ async def private_message(
                 "Думаю над ответом..."
             )
 
-            memory_prompt = await asyncio.to_thread(
-                read_explicit_memory_prompt,
-                user_id,
-                question,
-            )
+            try:
+                memory_prompt = await asyncio.to_thread(
+                    read_explicit_memory_prompt,
+                    user_id,
+                    question,
+                )
+            except Exception:
+                logger.exception("Private memory lookup unavailable")
+                memory_prompt = ""
             answer = await asyncio.to_thread(
                 request_gemini,
                 question,
@@ -1561,6 +1566,11 @@ def remember_dialog_facts(user_id, message_id, question):
     """Extract durable facts from a private message using Gemini."""
     if not GEMINI_API_KEY or not isinstance(question, str) or not question.strip():
         return 0
+    # Fail closed: membership and admin status are not user consent.
+    if user_id != OWNER_ID and user_id not in TEST_USER_IDS:
+        return 0
+    if not personal_lifecycle.has_memory_consent(user_id):
+        return 0
     source = f"telegram:private:{user_id}:{message_id}"
     instruction = (
         "Выдели из сообщения устойчивые факты о самом пользователе, "
@@ -1643,20 +1653,35 @@ def remember_dialog_facts(user_id, message_id, question):
 
 
 def read_explicit_memory_prompt(user_id, query):
-    """Recall only live, user-owned memories explicitly saved with /remember."""
+    """Read source-verified, consented memory through the existing coordinator."""
     personal_storage.initialize_database()
     personal_lifecycle.initialize_lifecycle()
+    if not personal_lifecycle.has_memory_consent(user_id):
+        return ""
+    if user_id != OWNER_ID and user_id not in TEST_USER_IDS:
+        return ""
     now = datetime.now(timezone.utc)
     personal_lifecycle.purge_expired(now)
     live = personal_lifecycle.list_live_memories(user_id, now)
-    allowed = [
-        item for item in live
+    allowed_sources = {
+        item["source"] for item in live
         if item["source"].startswith(f"telegram:private:{user_id}:")
+    }
+    independently_verified = personal_lifecycle.list_live_sources(user_id, now)
+    permissions = [
+        SourcePermission(source=item["source"], expires_at=item["expires_at"])
+        for item in independently_verified
+        if item["source"] in allowed_sources
     ]
-    return build_memory_context({
-        "memories": rank_memories(query, allowed, limit=5)
-    })
-
+    policy = AccessPolicy(
+        user_id=user_id, consent=True, entitled=True, verified=True,
+        expires_at=(now + timedelta(minutes=2)).isoformat(),
+    )
+    context = read_context(
+        user_id, query, policy, permissions, now.isoformat(),
+        enforce_lifecycle=True,
+    )
+    return build_memory_context(context)
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not has_personal_ai_access(update):
@@ -1668,6 +1693,12 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     user_id = update.effective_user.id
+    if not personal_lifecycle.has_memory_consent(user_id):
+        await update.effective_message.reply_text(
+            "Сначала включи личную память командой /memory_on. "
+            "Без согласия сведения не сохраняются."
+        )
+        return
     source = f"telegram:private:{user_id}:{update.effective_message.message_id}"
     async with dialog_lock:
         personal_storage.initialize_database()
@@ -1720,6 +1751,35 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def memory_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explicit, durable consent for the optional long-term memory feature."""
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    user_id = update.effective_user.id
+    async with dialog_lock:
+        personal_lifecycle.set_memory_consent(user_id, True, datetime.now(timezone.utc))
+    await update.effective_message.reply_text(
+        "Личная долговременная память включена по твоему согласию. "
+        "Значимые факты из личных сообщений могут сохраняться на срок "
+        "действия исходных сообщений (до 365 дней). "
+        "Отключить: /memory_off. Просмотреть: /memories."
+    )
+
+
+async def memory_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop future use and collection; do not silently destroy old records."""
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    user_id = update.effective_user.id
+    async with dialog_lock:
+        personal_lifecycle.set_memory_consent(user_id, False, datetime.now(timezone.utc))
+    await update.effective_message.reply_text(
+        "Личная долговременная память отключена: новые факты не сохраняются, "
+        "старые не используются в ответах. Ранее сохранённые записи "
+        "не удалены. Посмотреть их: /memories; удалить запись: /forget номер."
+    )
+
+
 def main():
     app = Application.builder().token(
         TOKEN
@@ -1739,6 +1799,8 @@ def main():
     app.add_handler(CommandHandler("remember", remember_command))
     app.add_handler(CommandHandler("memories", memories_command))
     app.add_handler(CommandHandler("forget", forget_command))
+    app.add_handler(CommandHandler("memory_on", memory_on_command))
+    app.add_handler(CommandHandler("memory_off", memory_off_command))
 
     app.add_handler(
         CommandHandler("diagnostics", diagnostics)

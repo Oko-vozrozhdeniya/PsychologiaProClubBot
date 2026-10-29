@@ -31,6 +31,8 @@ class SemanticMemoryWiringTests(unittest.TestCase):
         )
         self.ns = {
             "GEMINI_API_KEY": "test-key",
+            "OWNER_ID": 101,
+            "TEST_USER_IDS": set(),
             "GEMINI_MODEL": "test-model",
             "GEMINI_TIMEOUT": 2,
             "json": json,
@@ -45,6 +47,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             ),
             "personal_lifecycle": SimpleNamespace(
                 initialize_lifecycle=lambda: lifecycle.initialize_lifecycle(self.db),
+                has_memory_consent=lambda user: user == 101,
                 register_message=lambda u, m, c, t: lifecycle.register_message(
                     u, m, c, t, db_path=self.db
                 ),
