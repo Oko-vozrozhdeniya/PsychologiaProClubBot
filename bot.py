@@ -1546,6 +1546,89 @@ async def reset_dialog(
 
 
 
+
+def remember_dialog_facts(user_id, message_id, question):
+    """Extract durable facts from a private message using Gemini."""
+    if not GEMINI_API_KEY or not isinstance(question, str) or not question.strip():
+        return 0
+    source = f"telegram:private:{user_id}:{message_id}"
+    instruction = (
+        "Выдели из сообщения устойчивые факты о самом пользователе, "
+        "его предпочтениях, проектах и долгосрочных целях. "
+        "Не сохраняй чужие данные, секреты, медицинские подробности, "
+        "предположения или разовые вопросы. Ничего не придумывай. "
+        "Ответ — только JSON-массив до пяти объектов: "
+        "content (факт на русском), kind (fact или preference), "
+        "confidence (число от 0 до 1). Если фактов нет, верни []."
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": question[:6000]}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 700,
+            "responseMimeType": "application/json",
+        },
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "x-goog-api-key": GEMINI_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=GEMINI_TIMEOUT) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    candidates = result.get("candidates", [])
+    if not candidates:
+        return 0
+    parts = candidates[0].get("content", {}).get("parts", [])
+    raw_text = "".join(part.get("text", "") for part in parts)
+    raw = json.loads(raw_text)
+    if not isinstance(raw, list) or len(raw) > 5:
+        raise ValueError("Invalid memory extraction response")
+    validated = extract_candidates(
+        [
+            {
+                "content": item["content"],
+                "kind": item["kind"],
+                "confidence": item["confidence"],
+                "source": source,
+            }
+            for item in raw
+        ],
+        min_confidence=0.85,
+    )
+    if not validated:
+        return 0
+    personal_storage.initialize_database()
+    personal_lifecycle.initialize_lifecycle()
+    now = datetime.now(timezone.utc)
+    personal_lifecycle.register_message(user_id, source, question, now)
+    existing = personal_lifecycle.list_live_memories(user_id, now)
+    known = {item["content"].casefold().strip() for item in existing}
+    saved = 0
+    for candidate in validated:
+        key = candidate.content.casefold().strip()
+        if key in known:
+            continue
+        memory_id = personal_storage.add_memory(
+            user_id, candidate.content, candidate.kind, source
+        )
+        personal_lifecycle.link_memory_sources(
+            user_id, memory_id, [source], now
+        )
+        known.add(key)
+        saved += 1
+    return saved
+
+
 def read_explicit_memory_prompt(user_id, query):
     """Recall only live, user-owned memories explicitly saved with /remember."""
     personal_storage.initialize_database()
