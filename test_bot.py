@@ -84,6 +84,7 @@ async def start_test(update, context):
         "Диагностика страны сервера: /network_check.\n"
         "Проверка доступности Gemini API: /gemini_check.\n"
         "Короткая пробная генерация Gemini: /gemini_ping.\n"
+        "Режим ИИ: /ai_gemini, /ai_groq, /ai_auto, /ai_mode.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -260,6 +261,32 @@ async def gemini_ping(update, context):
     )
 
 
+async def choose_ai_mode(update, context):
+    """Owner-only session-local model choice; resets on service restart."""
+    command = update.effective_message.text.split()[0].split("@")[0].lstrip("/")
+    mode = command.removeprefix("ai_")
+    if mode not in ("gemini", "groq", "auto"):
+        return
+    if mode != "gemini" and not os.environ.get("GROQ_API_KEY", "").strip():
+        await update.effective_message.reply_text(
+            "Сначала укажите GROQ_API_KEY в переменных Bothost."
+        )
+        return
+    context.application.bot_data["test_ai_mode"] = mode
+    await update.effective_message.reply_text(
+        f"Режим ИИ: {mode}. После ответа будет подпись действительной модели. "
+        "Память читается через прежний координатор; "
+        "автозапоминание через Groq ещё не подключено."
+    )
+
+
+async def show_ai_mode(update, context):
+    mode = context.application.bot_data.get("test_ai_mode", "gemini")
+    await update.effective_message.reply_text(
+        f"Текущий режим: {mode}. После перезапуска — Gemini."
+    )
+
+
 def create_test_application(bot, allowed_ids, expected_username):
     """Private-only routes; group/archive/topic handlers do not exist here."""
     from telegram.ext import Application, CommandHandler, MessageHandler, filters
@@ -276,7 +303,13 @@ def create_test_application(bot, allowed_ids, expected_username):
             application, expected_username
         )
     ).build())
+    app.bot_data["test_ai_mode"] = "gemini"
+    app.bot_data["test_show_provider"] = True
     commands = {
+        "ai_gemini": choose_ai_mode,
+        "ai_groq": choose_ai_mode,
+        "ai_auto": choose_ai_mode,
+        "ai_mode": show_ai_mode,
         "start": start_test,
         "memory_on": bot.memory_on_command,
         "memory_off": bot.memory_off_command,

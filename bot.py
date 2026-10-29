@@ -15,6 +15,9 @@ from memory.coordinator import (
 from pathlib import Path
 
 from memory.gemini_prompt_adapter import append_private_memory
+from memory.ai_providers import (
+    GroqRequestError, request_personal_ai, GROQ_DEFAULT_MODEL
+)
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
@@ -151,7 +154,7 @@ class GeminiRequestError(Exception):
 
 
 def get_user_error_message(error):
-    if isinstance(error, GeminiRequestError):
+    if isinstance(error, (GeminiRequestError, GroqRequestError)):
         if error.error_type == "timeout":
             return TIMEOUT_MESSAGE
         if error.error_type == "rate_limit":
@@ -183,11 +186,12 @@ HTTP_DESCRIPTIONS = {
 
 
 def create_error_record(error, operation):
-    if isinstance(error, GeminiRequestError):
+    if isinstance(error, (GeminiRequestError, GroqRequestError)):
         error_type = error.error_type
         http_code = error.http_code
         reason = error.reason
-        service = "Gemini API"
+        service = ("Groq API" if isinstance(error, GroqRequestError)
+                   else "Gemini API")
     else:
         error_type = "general"
         http_code = None
@@ -203,7 +207,7 @@ def create_error_record(error, operation):
         "reason": reason
     }
 
-    if isinstance(error, GeminiRequestError):
+    if isinstance(error, (GeminiRequestError, GroqRequestError)):
         record.update(error.request_stats)
 
     return record
@@ -775,7 +779,8 @@ def request_gemini(
     archive_context=None,
     history=None,
     request_stats_sink=None,
-    personal_memory_context=None
+    personal_memory_context=None,
+    timeout_override=None
 ):
     if not GEMINI_API_KEY:
         logger.error(
@@ -982,7 +987,7 @@ def request_gemini(
 
         with urllib.request.urlopen(
             request,
-            timeout=GEMINI_TIMEOUT
+            timeout=timeout_override if timeout_override is not None else GEMINI_TIMEOUT
         ) as response:
             result = json.loads(
                 response.read().decode("utf-8")
@@ -1382,13 +1387,14 @@ async def private_message(
             except Exception:
                 logger.exception("Private memory lookup unavailable")
                 memory_prompt = ""
-            answer = await asyncio.to_thread(
-                request_gemini,
+            mode = context.application.bot_data.get("test_ai_mode", "gemini")
+            answer, provider = await asyncio.to_thread(
+                request_personal_ai,
                 question,
-                None,
                 history,
-                None,
                 memory_prompt,
+                mode,
+                request_gemini,
             )
 
             append_dialog_record(
@@ -1397,17 +1403,25 @@ async def private_message(
                 question,
                 answer
             )
-            try:
-                saved_facts = await asyncio.to_thread(
-                    remember_dialog_facts,
-                    user_id,
-                    message.message_id,
-                    question
+            if provider == "Gemini":
+                try:
+                    saved_facts = await asyncio.to_thread(
+                        remember_dialog_facts,
+                        user_id,
+                        message.message_id,
+                        question
+                    )
+                    logger.info("Automatic memory saved %s facts", saved_facts)
+                except Exception:
+                    logger.exception("Automatic memory extraction failed")
+            else:
+                logger.info(
+                    "Groq answer: skip Gemini-only automatic fact extraction"
                 )
-                logger.info("Automatic memory saved %s facts", saved_facts)
-            except Exception:
-                logger.exception("Automatic memory extraction failed")
-                
+            if context.application.bot_data.get("test_show_provider"):
+                model = (GEMINI_MODEL if provider == "Gemini"
+                         else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
+                answer += f"\n\n[Тест: {provider} · {model}]"
             await send_long_message(
                 message,
                 answer
