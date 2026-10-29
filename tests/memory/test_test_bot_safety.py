@@ -141,7 +141,7 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
         builder = next(x for x in tree.body if isinstance(x, ast.FunctionDef)
                        and x.name == "create_test_application")
         body = ast.unparse(builder)
-        self.assertIn('"network_check": network_check', body)
+        self.assertIn("'network_check': network_check", body)
         self.assertIn("filters.ChatType.PRIVATE", body)
         self.assertIn("filters.User", body)
 
@@ -158,12 +158,12 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
              namespace)
         detect = namespace["detect_server_country"]
 
-        with patch("urllib.request.urlopen", return_value=io.BytesIO(b"NL\\n")) as api:
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(b"NL\n")) as api:
             self.assertEqual(detect(), "NL")
             self.assertEqual(api.call_args.kwargs["timeout"], 8)
             self.assertEqual(api.call_args.args[0].full_url,
                              "https://ipinfo.io/country")
-        for invalid in (b"", b"US,NL", b"Unknown", b"NL\\nGB", b"nl"):
+        for invalid in (b"", b"US,NL", b"Unknown", b"NL\nGB", b"nl"):
             with self.subTest(invalid=invalid):
                 with patch("urllib.request.urlopen",
                            return_value=io.BytesIO(invalid)):
