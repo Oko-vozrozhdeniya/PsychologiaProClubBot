@@ -85,6 +85,7 @@ async def start_test(update, context):
         "Проверка доступности Gemini API: /gemini_check.\n"
         "Короткая пробная генерация Gemini: /gemini_ping.\n"
         "Режим ИИ: /ai_gemini, /ai_groq, /ai_auto, /ai_mode.\n"
+        "Проверка доступности Groq API: /groq_check.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -261,6 +262,77 @@ async def gemini_ping(update, context):
     )
 
 
+def probe_groq_metadata():
+    """Single GET to Groq model metadata; no conversation or inference request.
+
+    Returned diagnostics only describe sanitized HTTP status and response type.
+    Never print API keys, raw response bodies, HTML or network identifiers.
+    """
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not key:
+        return "GROQ_API_KEY не задан в Bothost"
+    request = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read(32768).decode("utf-8"))
+        models = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return "HTTP 200: неожиданный формат ответа Groq"
+        target = "openai/gpt-oss-20b"
+        available = any(
+            isinstance(item, dict) and item.get("id") == target
+            for item in models
+        )
+        verdict = "есть" if available else "нет в списке"
+        return (f"GET /models: HTTP 200; модель {target}: {verdict}; "
+                "ключ принят для этого запроса")
+    except urllib.error.HTTPError as error:
+        content_type = str(error.headers.get("Content-Type", "")).lower()
+        server = str(error.headers.get("Server", "")).lower()
+        cf_challenge = str(error.headers.get("cf-mitigated", "")).lower()
+        # Do not send header values or raw HTML to Telegram.
+        is_html = "text/html" in content_type
+        edge = "Cloudflare" if ("cloudflare" in server or cf_challenge == "challenge") else "не установлен"
+        detail = "нет JSON-кода ошибки"
+        try:
+            data = json.loads(error.read(4096).decode("utf-8"))
+            info = data.get("error") if isinstance(data, dict) else None
+            if isinstance(info, dict):
+                value = info.get("code")
+                if (isinstance(value, str) and 0 < len(value) <= 80
+                        and all(ch in "abcdefghijklmnopqrstuvwxyz0123456789_" for ch in value)):
+                    detail = "код Groq: " + value
+                else:
+                    detail = "JSON-ошибка Groq без безопасного машинного кода"
+        except (ValueError, OSError, UnicodeError):
+            if is_html:
+                detail = "получена HTML-страница отказа, не JSON API"
+        if cf_challenge == "challenge":
+            detail += "; обнаружена защитная проверка Cloudflare"
+        return (f"GET /models: HTTP {error.code}; "
+                f"формат: {'HTML' if is_html else 'не HTML'}; "
+                f"сетевой слой: {edge}; {detail}")
+    except (TimeoutError, socket.timeout):
+        return "GET /models: превышено время ожидания (12 секунд)"
+    except (OSError, ValueError, UnicodeError):
+        return "GET /models: сетевая ошибка или неожиданный ответ"
+
+
+async def groq_check(update, context):
+    """Private-only safe diagnostic, no chat text passed to Groq."""
+    result = await asyncio.to_thread(probe_groq_metadata)
+    await update.effective_message.reply_text(
+        "Диагностика Groq с сервера Bothost (без переписки):\n" + result
+    )
+
+
 async def choose_ai_mode(update, context):
     """Owner-only session-local model choice; resets on service restart."""
     command = update.effective_message.text.split()[0].split("@")[0].lstrip("/")
@@ -323,6 +395,7 @@ def create_test_application(bot, allowed_ids, expected_username):
         "network_check": network_check,
         "gemini_check": gemini_check,
         "gemini_ping": gemini_ping,
+        "groq_check": groq_check,
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(

@@ -282,6 +282,68 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.assertIn("NOT_FOUND", result)
                 self.assertNotIn(fake_key, result)
 
+    def test_groq_probe_owner_only_and_no_private_data(self):
+        import io
+        import json
+        import socket
+        import urllib
+        import urllib.error
+        import urllib.request
+        code = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        funcs = {node.name: node for node in ast.parse(code).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertIn("probe_groq_metadata", funcs)
+        build = ast.unparse(funcs["create_test_application"])
+        self.assertIn("'groq_check': groq_check", build)
+        self.assertIn("filters.ChatType.PRIVATE", build)
+        self.assertIn("filters.User", build)
+        namespace = {"os": os, "json": json, "socket": socket, "urllib": urllib}
+        exec(compile(ast.Module(body=[funcs["probe_groq_metadata"]],
+                                type_ignores=[]), "test_bot.py", "exec"), namespace)
+        check = namespace["probe_groq_metadata"]
+        key = "FAKE_TEST_KEY_DO_NOT_EXPOSE"
+        env = {"GROQ_API_KEY": key}
+        payload = b'{"data":[{"id":"openai/gpt-oss-20b"}]}'
+        with patch.dict(os.environ, env, clear=True):
+            with patch("urllib.request.urlopen",
+                       return_value=io.BytesIO(payload)) as api:
+                result = check()
+                self.assertIn("HTTP 200", result)
+                self.assertIn("модель openai/gpt-oss-20b: есть", result)
+                request = api.call_args.args[0]
+                self.assertEqual(request.get_method(), "GET")
+                self.assertEqual(request.full_url,
+                                 "https://api.groq.com/openai/v1/models")
+                self.assertEqual(api.call_args.kwargs["timeout"], 12)
+                self.assertEqual(request.get_header("Authorization"),
+                                 "Bearer " + key)
+                self.assertIsNone(request.data)
+                self.assertNotIn(key, result)
+
+            errors = [
+                ({"Content-Type": "text/html", "Server": "cloudflare",
+                  "cf-mitigated": "challenge"},
+                 b"<html>Private " + key.encode() + b"</html>",
+                 ("HTTP 403", "HTML", "Cloudflare", "защитная проверка")),
+                ({"Content-Type": "application/json"},
+                 b'{"error":{"code":"model_permission_blocked_org"}}',
+                 ("HTTP 403", "model_permission_blocked_org")),
+            ]
+            for headers, body, expected in errors:
+                with self.subTest(headers=headers):
+                    err = urllib.error.HTTPError(
+                        "https://api.groq.com/openai/v1/models",
+                        403, "Forbidden", headers, io.BytesIO(body)
+                    )
+                    with patch("urllib.request.urlopen", side_effect=err):
+                        result = check()
+                    for piece in expected:
+                        self.assertIn(piece, result)
+                    self.assertNotIn(key, result)
+
+            with patch("urllib.request.urlopen", side_effect=socket.timeout()):
+                self.assertIn("12 секунд", check())
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)
