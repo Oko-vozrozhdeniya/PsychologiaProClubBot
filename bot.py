@@ -1620,11 +1620,11 @@ def remember_dialog_facts(user_id, message_id, question):
     personal_storage.initialize_database()
     personal_lifecycle.initialize_lifecycle()
     now = datetime.now(timezone.utc)
-    personal_lifecycle.register_message(user_id, source, question, now)
     existing = personal_lifecycle.list_live_memories(user_id, now)
-    # A retry of the same Telegram message must never duplicate its memories.
+    # A retry must not re-register a source with a new timestamp.
     if any(item["source"] == source for item in existing):
         return 0
+    personal_lifecycle.register_message(user_id, source, question, now)
     known = {item["content"].casefold().strip() for item in existing}
     saved = 0
     for candidate in validated:
