@@ -66,7 +66,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
              self.ns)
 
     def fake_urlopen(self, request, timeout):
-        self.assertEqual(request.headers["X-google-api-key"], "test-key")
+        self.assertEqual(request.get_header("X-google-api-key"), "test-key")
         response = {
             "candidates": [{
                 "content": {"parts": [{
