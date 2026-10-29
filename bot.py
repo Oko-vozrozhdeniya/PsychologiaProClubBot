@@ -16,7 +16,7 @@ from pathlib import Path
 
 from memory.gemini_prompt_adapter import append_private_memory
 from memory.ai_providers import (
-    GroqRequestError, request_personal_ai, GROQ_DEFAULT_MODEL
+    GroqRequestError, request_groq, request_personal_ai, GROQ_DEFAULT_MODEL
 )
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory.retrieval import rank_memories
@@ -2057,6 +2057,35 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def groq_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only quick live Groq API test, without chat history or memory."""
+    if (not is_owner(update) or not update.effective_chat
+            or update.effective_chat.type != "private"):
+        return
+    try:
+        answer = await asyncio.to_thread(
+            request_groq,
+            "Привет! Ответь одним коротким предложением.",
+            [],
+            None,
+        )
+    except GroqRequestError as error:
+        await update.effective_message.reply_text(
+            f"Groq не ответил. HTTP: {error.http_code or 'не получен'}. "
+            f"Причина: {error.reason}"
+        )
+        return
+    except Exception as error:
+        logger.warning("Groq ping failed: %s", type(error).__name__)
+        await update.effective_message.reply_text(
+            "Groq: неожиданная ошибка диагностического запроса."
+        )
+        return
+    await update.effective_message.reply_text(
+        "Groq ответил успешно (openai/gpt-oss-20b):\n" + answer[:2500]
+    )
+
+
 def main():
     app = Application.builder().token(
         TOKEN
@@ -2088,6 +2117,12 @@ def main():
 
     app.add_handler(
         CommandHandler("testai", testai)
+    )
+    app.add_handler(
+        CommandHandler(
+            "groq_ping", groq_ping,
+            filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID)
+        )
     )
 
     app.add_handler(
