@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import ipaddress
 import socket
 import urllib.request
 import urllib.error
@@ -1529,6 +1530,30 @@ async def reset_dialog(
             )
 
 
+def read_public_ip():
+    """Get the egress IP via a neutral external service."""
+    with urllib.request.urlopen("https://api.ipify.org", timeout=10) as response:
+        value = response.read(64).decode("ascii").strip()
+    address = ipaddress.ip_address(value)
+    if not isinstance(address, ipaddress.IPv4Address) or not address.is_global:
+        raise ValueError("Invalid public IPv4")
+    return value
+
+
+async def ip_check(update, context):
+    """Only the owner may request the IP in a private chat."""
+    if not is_owner(update) or update.effective_chat.type != "private":
+        return
+    try:
+        ip = await asyncio.to_thread(read_public_ip)
+    except (OSError, ValueError, UnicodeError):
+        await update.effective_message.reply_text("Не удалось определить исходящий IPv4.")
+        return
+    await update.effective_message.reply_text(
+        f"Исходящий IPv4 старого бота: {ip}\nИсточник: api.ipify.org"
+    )
+
+
 def main():
     app = Application.builder().token(
         TOKEN
@@ -1552,6 +1577,12 @@ def main():
 
     app.add_handler(
         CommandHandler("testai", testai)
+    )
+    app.add_handler(
+        CommandHandler(
+            "ip_check", ip_check,
+            filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID)
+        )
     )
 
     app.add_handler(
