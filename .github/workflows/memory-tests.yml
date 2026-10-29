@@ -6,12 +6,14 @@ on:
       - feature/memory-dialog-bridge
     paths:
       - "bot.py"
+      - "test_bot.py"
       - "memory/**"
       - "tests/memory/**"
       - ".github/workflows/memory-tests.yml"
   pull_request:
     paths:
       - "bot.py"
+      - "test_bot.py"
       - "memory/**"
       - "tests/memory/**"
       - ".github/workflows/memory-tests.yml"
@@ -34,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Check memory module syntax
-        run: python -m compileall -q bot.py memory tests/memory
+        run: python -m compileall -q bot.py test_bot.py memory tests/memory
 
       - name: Run every memory unit test
         run: python -m unittest discover -s tests/memory -p "test_*.py" -v

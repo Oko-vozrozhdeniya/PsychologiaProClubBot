@@ -47,7 +47,7 @@ TEST_USER_IDS = {7563789785}
 CLUB_CHAT_ID = -1003994062695
 TECH_ADMIN_IDS = set()
 
-DATA_DIR = Path("/app/data")
+DATA_DIR = Path(os.environ.get("BOT_DATA_DIR", "/app/data"))
 STORAGE_TEST_A = DATA_DIR / "storage_test_A.txt"
 TEXT_FILE = DATA_DIR / "messages.txt"
 JSON_FILE = DATA_DIR / "messages.jsonl"

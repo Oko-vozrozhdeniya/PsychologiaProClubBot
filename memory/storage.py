@@ -4,12 +4,13 @@
 No database is created on import. Call initialize_database() explicitly.
 """
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DATABASE_PATH = Path("/app/data/memory.db")
+DATABASE_PATH = Path(os.environ.get("MEMORY_DB_PATH", "/app/data/memory.db"))
 VALID_KINDS = frozenset({"fact", "preference", "hypothesis"})
 
 
