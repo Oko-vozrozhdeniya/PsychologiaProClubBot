@@ -66,7 +66,7 @@ class GeminiPromptAdapterTests(unittest.TestCase):
             node.id for node in ast.walk(handler)
             if isinstance(node, ast.Name)
         }
-        self.assertIn("optional_private_memory", names)
+        self.assertIn("read_explicit_memory_prompt", names)
         self.assertIn("request_gemini", names)
         gemini = next(
             node for node in tree.body
@@ -82,8 +82,7 @@ class GeminiPromptAdapterTests(unittest.TestCase):
             for node in ast.walk(gemini)
         ))
 
-    def test_no_automatic_permission_provider_in_bot(self):
-        """Current wiring must not fabricate consent or permissions."""
+    def test_explicit_memory_commands_registered(self):
         import ast
         from pathlib import Path
         tree = ast.parse(
@@ -91,24 +90,46 @@ class GeminiPromptAdapterTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        handler = next(
+        functions = {
+            node.name for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertTrue({
+            "read_explicit_memory_prompt", "remember_command",
+            "memories_command", "forget_command",
+        }.issubset(functions))
+        main = next(
             node for node in tree.body
-            if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "private_message"
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
         )
-        calls = [
-            node for node in ast.walk(handler)
+        registered = {
+            node.args[0].value
+            for node in ast.walk(main)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "to_thread"
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "CommandHandler"
             and node.args
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == "optional_private_memory"
-        ]
-        self.assertEqual(len(calls), 1)
-        self.assertFalse(any(
-            kw.arg == "provider" for kw in calls[0].keywords
-        ))
+            and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertTrue({"remember", "memories", "forget"}.issubset(registered))
+
+    def test_recall_reads_only_explicit_live_user_memories(self):
+        import ast
+        from pathlib import Path
+        tree = ast.parse(
+            (Path(__file__).resolve().parents[2] / "bot.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        func = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "read_explicit_memory_prompt"
+        )
+        source = ast.unparse(func)
+        self.assertIn("list_live_memories(user_id, now)", source)
+        self.assertIn('f"telegram:private:{user_id}:"', source)
+        self.assertIn("purge_expired(now)", source)
 
 
 if __name__ == "__main__":
