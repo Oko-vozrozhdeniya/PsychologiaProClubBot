@@ -9,6 +9,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from memory.coordinator import (
     AccessPolicy, SourcePermission, read_context, prepare_candidates,
+    prepare_correction,
 )
 from pathlib import Path
 
@@ -1823,6 +1824,131 @@ async def memory_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         change_kind):
+    """A confirmed user's correction or real-life change, never an AI guess."""
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    args = context.args
+    if len(args) < 2 or not args[0].isdigit():
+        command = "/correct" if change_kind == "correction" else "/change"
+        await update.effective_message.reply_text(
+            f"Формат: {command} номер_записи новый_текст"
+        )
+        return
+    new_content = " ".join(args[1:]).strip()
+    if not new_content or len(new_content) > 2000:
+        await update.effective_message.reply_text(
+            "Новый текст должен содержать от 1 до 2000 символов."
+        )
+        return
+    user_id = update.effective_user.id
+    memory_id = int(args[0])
+    source = f"telegram:private:{user_id}:{update.effective_message.message_id}"
+    async with dialog_lock:
+        personal_lifecycle.initialize_lifecycle()
+        if not personal_lifecycle.has_memory_consent(user_id):
+            await update.effective_message.reply_text(
+                "Сначала включи долговременную память командой /memory_on."
+            )
+            return
+        now = datetime.now(timezone.utc)
+        old = personal_storage.get_memory(user_id, memory_id)
+        live = personal_lifecycle.list_live_memories(user_id, now)
+        if old is None or not any(item["id"] == memory_id for item in live):
+            await update.effective_message.reply_text(
+                "Действующая запись с таким номером не найдена."
+            )
+            return
+        verified = [
+            item for item in personal_lifecycle.list_live_sources(user_id, now)
+            if item["source"] == old["source"]
+        ]
+        if len(verified) != 1:
+            await update.effective_message.reply_text(
+                "Источник записи недоступен. Исправление не выполнено."
+            )
+            return
+        policy = AccessPolicy(
+            user_id=user_id, consent=True, entitled=True, verified=True,
+            expires_at=(now + timedelta(minutes=2)).isoformat(),
+        )
+        permission = SourcePermission(
+            source=old["source"], expires_at=verified[0]["expires_at"],
+        )
+        decision = prepare_correction(
+            user_id, old["content"], new_content, old["source"],
+            policy, [permission], now.isoformat(),
+            explicitly_corrected=True,
+        )
+        if decision.action == "keep":
+            await update.effective_message.reply_text(
+                "Формулировка уже такая. Изменений не требуется."
+            )
+            return
+        if decision.action != "update":
+            await update.effective_message.reply_text(
+                "Изменение требует дополнительного подтверждения."
+            )
+            return
+        try:
+            changed = personal_lifecycle.revise_memory(
+                user_id, memory_id, old["content"], old["source"],
+                new_content, source, update.effective_message.text, now,
+                change_kind,
+            )
+        except (LookupError, ValueError, PermissionError) as error:
+            logger.warning("Memory revision refused: %s", type(error).__name__)
+            await update.effective_message.reply_text(
+                "Не удалось обновить запись: источник устарел или запись изменилась."
+            )
+            return
+    if changed:
+        label = "Исправил" if change_kind == "correction" else "Обновил"
+        await update.effective_message.reply_text(
+            f"{label} запись №{memory_id}. Предыдущая версия доступна "
+            f"через /history {memory_id}."
+        )
+
+
+async def correct_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await revise_command(update, context, "correction")
+
+
+async def change_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await revise_command(update, context, "change")
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User-only view of previous versions, never sent as current AI context."""
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Формат: /history номер_записи")
+        return
+    user_id = update.effective_user.id
+    memory_id = int(context.args[0])
+    async with dialog_lock:
+        personal_lifecycle.initialize_lifecycle()
+        versions = personal_lifecycle.list_memory_revisions(
+            user_id, memory_id, datetime.now(timezone.utc)
+        )
+    if not versions:
+        await update.effective_message.reply_text(
+            "Истории изменений для этой записи нет."
+        )
+        return
+    rows = [
+        f"{item['changed_at']} ({'исправление' if item['change_kind'] == 'correction' else 'изменение'}): "
+        f"{item['previous_content']} → {item['new_content']}"
+        for item in versions
+    ]
+    await send_long_message(
+        update.effective_message,
+        f"История записи №{memory_id}:\n" + "\n".join(rows),
+    )
+
+
 def main():
     app = Application.builder().token(
         TOKEN
@@ -1844,6 +1970,9 @@ def main():
     app.add_handler(CommandHandler("forget", forget_command))
     app.add_handler(CommandHandler("memory_on", memory_on_command))
     app.add_handler(CommandHandler("memory_off", memory_off_command))
+    app.add_handler(CommandHandler("correct", correct_command))
+    app.add_handler(CommandHandler("change", change_command))
+    app.add_handler(CommandHandler("history", history_command))
 
     app.add_handler(
         CommandHandler("diagnostics", diagnostics)

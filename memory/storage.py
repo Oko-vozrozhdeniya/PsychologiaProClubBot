@@ -143,6 +143,20 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
     _validate_memory_id(memory_id)
 
     with _connection(db_path) as connection:
+        # A forgotten fact must not survive in revision history or source links.
+        tables = {row["name"] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        if "memory_revisions" in tables:
+            connection.execute(
+                "DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",
+                (user_id, memory_id),
+            )
+        if "memory_sources" in tables:
+            connection.execute(
+                "DELETE FROM memory_sources WHERE user_id=? AND memory_id=?",
+                (user_id, memory_id),
+            )
         cursor = connection.execute("""
             DELETE FROM memories
             WHERE user_id = ? AND id = ?

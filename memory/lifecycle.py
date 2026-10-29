@@ -56,6 +56,19 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
             enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
             updated_at TEXT NOT NULL
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS memory_revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL CHECK(user_id > 0),
+            memory_id INTEGER NOT NULL,
+            previous_content TEXT NOT NULL,
+            new_content TEXT NOT NULL,
+            previous_source TEXT NOT NULL,
+            new_source TEXT NOT NULL,
+            change_kind TEXT NOT NULL CHECK(change_kind IN ('correction', 'change')),
+            changed_at TEXT NOT NULL
+        )""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_revisions_owner
+            ON memory_revisions(user_id, memory_id, id)""")
 
 
 def register_message(user_id, message_id, content, created_at, *,
@@ -144,12 +157,26 @@ def purge_expired(now, *, db_path=storage.DATABASE_PATH):
             WHERE pm.user_id=memory_sources.user_id
               AND pm.message_id=memory_sources.message_id
         )""")
+        # History is source-backed as well. Never retain revisions whose
+        # previous or new source has been removed or expired.
+        db.execute("""DELETE FROM memory_revisions
+            WHERE NOT EXISTS (
+                SELECT 1 FROM private_messages pm
+                WHERE pm.user_id=memory_revisions.user_id
+                  AND pm.message_id=memory_revisions.previous_source
+            ) OR NOT EXISTS (
+                SELECT 1 FROM private_messages pm
+                WHERE pm.user_id=memory_revisions.user_id
+                  AND pm.message_id=memory_revisions.new_source
+            )""")
         removed = 0
         for row in managed:
             remaining = db.execute("""SELECT 1 FROM memory_sources
                 WHERE user_id=? AND memory_id=? LIMIT 1""",
                 (row["user_id"], row["memory_id"])).fetchone()
             if not remaining:
+                db.execute("DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",
+                           (row["user_id"], row["memory_id"]))
                 removed += db.execute(
                     "DELETE FROM memories WHERE user_id=? AND id=?",
                     (row["user_id"], row["memory_id"])).rowcount
@@ -163,6 +190,9 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
     with storage._connection(db_path) as db:
         affected = db.execute("""SELECT DISTINCT memory_id FROM memory_sources
             WHERE user_id=? AND message_id=?""", (user_id, message_id)).fetchall()
+        db.execute("""DELETE FROM memory_revisions
+            WHERE user_id=? AND (previous_source=? OR new_source=?)""",
+            (user_id, message_id, message_id))
         deleted = db.execute("DELETE FROM private_messages WHERE user_id=? AND message_id=?",
                              (user_id, message_id)).rowcount
         db.execute("DELETE FROM memory_sources WHERE user_id=? AND message_id=?",
@@ -172,6 +202,8 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
             if not db.execute("""SELECT 1 FROM memory_sources
                 WHERE user_id=? AND memory_id=?""",
                 (user_id, row["memory_id"])).fetchone():
+                db.execute("DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",
+                           (user_id, row["memory_id"]))
                 removed += db.execute("DELETE FROM memories WHERE user_id=? AND id=?",
                                       (user_id, row["memory_id"])).rowcount
     return {"deleted_messages": deleted, "deleted_memories": removed}
@@ -223,3 +255,134 @@ def list_live_sources(user_id, now, *, db_path=storage.DATABASE_PATH):
         {"source": row["message_id"], "expires_at": row["expires_at"]}
         for row in rows if row["message_id"].startswith(prefix)
     ]
+
+
+def revise_memory(user_id, memory_id, expected_content, expected_source,
+                  new_content, new_source, message_text, now, change_kind,
+                  *, db_path=storage.DATABASE_PATH):
+    """Atomically revise an owned live memory while preserving its provenance.
+
+    A new authenticated Telegram message becomes the only *current* source.
+    The previous content remains in a source-bound revision history, not in
+    active retrieval. Missing consent, stale content, replay, or expired
+    sources fail without changing the database.
+    """
+    storage._validate_user_id(user_id)
+    storage._validate_memory_id(memory_id)
+    previous = storage._validate_text(expected_content, "expected_content")
+    previous_source = storage._validate_text(expected_source, "expected_source")
+    new_content = storage._validate_text(new_content, "new_content")
+    new_source = storage._validate_text(new_source, "new_source")
+    message_text = storage._validate_text(message_text, "message_text")
+    if change_kind not in ("correction", "change"):
+        raise ValueError("Invalid change kind")
+    if len(new_content) > 2000:
+        raise ValueError("Memory content exceeds limit")
+    if not previous_source.startswith(f"telegram:private:{user_id}:"):
+        raise PermissionError("Invalid previous source")
+    if not new_source.startswith(f"telegram:private:{user_id}:"):
+        raise PermissionError("Invalid new source")
+    if new_source == previous_source:
+        raise ValueError("A revision requires a new source")
+    moment = _moment(now)
+    expiry = (moment + timedelta(days=RETENTION_DAYS)).isoformat()
+    with storage._connection(db_path) as db:
+        consent = db.execute(
+            "SELECT enabled FROM memory_consents WHERE user_id=?", (user_id,)
+        ).fetchone()
+        if not consent or consent["enabled"] != 1:
+            raise PermissionError("Explicit memory consent required")
+        current = db.execute(
+            "SELECT content, source FROM memories WHERE user_id=? AND id=?",
+            (user_id, memory_id),
+        ).fetchone()
+        if current is None:
+            raise LookupError("Memory not owned or not found")
+        if (current["content"], current["source"]) != (previous, previous_source):
+            raise ValueError("Stale memory version")
+        active = db.execute(
+            """SELECT 1 FROM memory_sources ms
+               JOIN private_messages pm ON pm.user_id=ms.user_id
+                  AND pm.message_id=ms.message_id
+               WHERE ms.user_id=? AND ms.memory_id=? AND pm.expires_at>?
+               LIMIT 1""", (user_id, memory_id, moment.isoformat()),
+        ).fetchone()
+        if not active:
+            raise PermissionError("Memory has no live source")
+        old_message = db.execute(
+            """SELECT 1 FROM private_messages WHERE user_id=?
+               AND message_id=? AND expires_at>?""",
+            (user_id, previous_source, moment.isoformat()),
+        ).fetchone()
+        if not old_message:
+            raise PermissionError("Previous primary source expired")
+        if db.execute(
+            "SELECT 1 FROM private_messages WHERE user_id=? AND message_id=?",
+            (user_id, new_source),
+        ).fetchone():
+            raise ValueError("Duplicate revision message")
+        if previous == new_content:
+            return False
+        db.execute(
+            """INSERT INTO private_messages(user_id, message_id, content,
+               created_at, expires_at) VALUES (?, ?, ?, ?, ?)""",
+            (user_id, new_source, message_text, moment.isoformat(), expiry),
+        )
+        db.execute(
+            """INSERT INTO memory_revisions(user_id, memory_id,
+               previous_content, new_content, previous_source, new_source,
+               change_kind, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, memory_id, previous, new_content, previous_source,
+             new_source, change_kind, moment.isoformat()),
+        )
+        db.execute(
+            """UPDATE memories SET content=?, source=?, updated_at=?
+               WHERE user_id=? AND id=?""",
+            (new_content, new_source, moment.isoformat(), user_id, memory_id),
+        )
+        # Previous versions are audit history only; do not expose them as
+        # competing current facts through the active coordinator.
+        db.execute("DELETE FROM memory_sources WHERE user_id=? AND memory_id=?",
+                   (user_id, memory_id))
+        db.execute(
+            """INSERT INTO memory_sources(user_id, memory_id, message_id)
+               VALUES (?, ?, ?)""", (user_id, memory_id, new_source),
+        )
+    return True
+
+
+def list_memory_revisions(user_id, memory_id, now, *,
+                          db_path=storage.DATABASE_PATH):
+    """Read user-owned revision history only while its current source is live."""
+    storage._validate_user_id(user_id)
+    storage._validate_memory_id(memory_id)
+    moment = _iso(now)
+    with storage._connection(db_path) as db:
+        live = db.execute(
+            """SELECT 1 FROM memories m
+               JOIN memory_sources ms ON ms.user_id=m.user_id
+                  AND ms.memory_id=m.id
+               JOIN private_messages pm ON pm.user_id=ms.user_id
+                  AND pm.message_id=ms.message_id
+               WHERE m.user_id=? AND m.id=? AND pm.expires_at>? LIMIT 1""",
+            (user_id, memory_id, moment),
+        ).fetchone()
+        if not live:
+            return []
+        rows = db.execute(
+            """SELECT previous_content, new_content, change_kind, changed_at
+               FROM memory_revisions WHERE user_id=? AND memory_id=?
+               AND EXISTS (
+                  SELECT 1 FROM private_messages old
+                  WHERE old.user_id=memory_revisions.user_id
+                  AND old.message_id=memory_revisions.previous_source
+                  AND old.expires_at>?
+               ) AND EXISTS (
+                  SELECT 1 FROM private_messages new
+                  WHERE new.user_id=memory_revisions.user_id
+                  AND new.message_id=memory_revisions.new_source
+                  AND new.expires_at>?
+               ) ORDER BY id ASC""",
+            (user_id, memory_id, moment, moment),
+        ).fetchall()
+    return [dict(row) for row in rows]
