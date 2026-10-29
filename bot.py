@@ -13,6 +13,7 @@ from memory.gemini_prompt_adapter import append_private_memory
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
+from memory.extraction import extract_candidates
 
 from telegram import Update
 from telegram.ext import (
