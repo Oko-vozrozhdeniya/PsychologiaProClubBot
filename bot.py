@@ -9,7 +9,10 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-from memory.gemini_prompt_adapter import append_private_memory, optional_private_memory
+from memory.gemini_prompt_adapter import append_private_memory
+from memory import storage as personal_storage, lifecycle as personal_lifecycle
+from memory.retrieval import rank_memories
+from memory.prompt_context import build_memory_context
 
 from telegram import Update
 from telegram.ext import (
@@ -793,9 +796,8 @@ def request_gemini(
         "Ты работаешь через Telegram-бота. "
         "Голосовые сообщения пока "
         "не распознаются. "
-        "Смысловая долгосрочная память "
-        "и поиск по старым разговорам "
-        "пока не реализованы. "
+        "Долгосрочная память включает только явно сохранённые "
+        "пользователем записи. "
         "Материалы курса «Психосоматика PRO» "
         "пока не загружены в твою базу знаний. "
         "Не утверждай, что можешь выполнять "
@@ -1366,11 +1368,9 @@ async def private_message(
             )
 
             memory_prompt = await asyncio.to_thread(
-                optional_private_memory,
+                read_explicit_memory_prompt,
                 user_id,
-                message.message_id,
                 question,
-                datetime.now(timezone.utc),
             )
             answer = await asyncio.to_thread(
                 request_gemini,
@@ -1544,6 +1544,85 @@ async def reset_dialog(
             )
 
 
+
+def read_explicit_memory_prompt(user_id, query):
+    """Recall only live, user-owned memories explicitly saved with /remember."""
+    personal_storage.initialize_database()
+    personal_lifecycle.initialize_lifecycle()
+    now = datetime.now(timezone.utc)
+    personal_lifecycle.purge_expired(now)
+    live = personal_lifecycle.list_live_memories(user_id, now)
+    allowed = [
+        item for item in live
+        if item["source"].startswith(f"telegram:private:{user_id}:")
+    ]
+    return build_memory_context({
+        "memories": rank_memories(query, allowed, limit=5)
+    })
+
+
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    content = " ".join(context.args).strip()
+    if not content or len(content) > 2000:
+        await update.effective_message.reply_text(
+            "Напиши /remember и текст до 2000 символов."
+        )
+        return
+    user_id = update.effective_user.id
+    source = f"telegram:private:{user_id}:{update.effective_message.message_id}"
+    async with dialog_lock:
+        personal_storage.initialize_database()
+        personal_lifecycle.initialize_lifecycle()
+        now = datetime.now(timezone.utc)
+        personal_lifecycle.register_message(user_id, source, content, now)
+        memory_id = personal_storage.add_memory(user_id, content, "fact", source)
+        personal_lifecycle.link_memory_sources(user_id, memory_id, [source], now)
+    await update.effective_message.reply_text(
+        f"Запомнил. Номер записи: {memory_id}. Удалить: /forget {memory_id}"
+    )
+
+
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    user_id = update.effective_user.id
+    async with dialog_lock:
+        personal_storage.initialize_database()
+        personal_lifecycle.initialize_lifecycle()
+        now = datetime.now(timezone.utc)
+        personal_lifecycle.purge_expired(now)
+        items = [
+            item for item in personal_lifecycle.list_live_memories(user_id, now)
+            if item["source"].startswith(f"telegram:private:{user_id}:")
+        ][:20]
+    if not items:
+        await update.effective_message.reply_text("Сохранённых записей нет.")
+        return
+    await send_long_message(
+        update.effective_message,
+        "Твоя память:\n" + "\n".join(
+            f'{item["id"]}. {item["content"]}' for item in items
+        )
+    )
+
+
+async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.effective_message.reply_text("Напиши /forget номер_записи")
+        return
+    user_id = update.effective_user.id
+    async with dialog_lock:
+        personal_storage.initialize_database()
+        deleted = personal_storage.delete_memory(user_id, int(context.args[0]))
+    await update.effective_message.reply_text(
+        "Запись удалена." if deleted else "Запись не найдена."
+    )
+
+
 def main():
     app = Application.builder().token(
         TOKEN
@@ -1560,6 +1639,9 @@ def main():
     app.add_handler(
         CommandHandler("reset", reset_dialog)
     )
+    app.add_handler(CommandHandler("remember", remember_command))
+    app.add_handler(CommandHandler("memories", memories_command))
+    app.add_handler(CommandHandler("forget", forget_command))
 
     app.add_handler(
         CommandHandler("diagnostics", diagnostics)
