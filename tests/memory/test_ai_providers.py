@@ -101,8 +101,10 @@ class GroqProviderTests(unittest.TestCase):
 
     def test_direct_groq_skips_gemini_and_auto_falls_back_only_on_outage(self):
         success = {"choices": [{"message": {"content": "Ответ Groq"}}]}
+        def fresh_response(*args, **kwargs):
+            return io.BytesIO(json.dumps(success).encode())
         with self.env(), patch("urllib.request.urlopen",
-                               return_value=io.BytesIO(json.dumps(success).encode())):
+                               side_effect=fresh_response):
             calls = []
             def gemini(*args):
                 calls.append(args)
