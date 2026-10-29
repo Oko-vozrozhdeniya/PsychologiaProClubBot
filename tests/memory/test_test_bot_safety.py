@@ -29,41 +29,52 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
         self.config, self.tree = load_config()
 
     def base(self):
+        # Only secrets from the preexisting Bothost service are required.
         return {
-            "BOT_TEST_MODE": "1",
             "BOT_TOKEN": "TEST_TOKEN_NOT_FOR_NETWORK",
             "GEMINI_API_KEY": "TEST_GEMINI_KEY",
-            "TEST_BOT_USERNAME": "PsychologiaProMemoryTest_bot",
-            "TEST_BOT_ALLOWED_USER_IDS": "885005330",
         }
 
-    def test_test_mode_refuses_launch_without_explicit_flag(self):
+    def test_missing_optional_variables_uses_safe_defaults(self):
+        with patch.dict(os.environ, self.base(), clear=True):
+            username, testers = self.config["configure_test_runtime"]()
+            self.assertEqual(username, "psychologiaproclub_bot")
+            self.assertEqual(testers, {885005330})
+
+    def test_explicitly_disabling_test_mode_is_rejected(self):
         opts = self.base()
-        opts.pop("BOT_TEST_MODE")
+        opts["BOT_TEST_MODE"] = "0"
         with patch.dict(os.environ, opts, clear=True):
             with self.assertRaises(RuntimeError):
                 self.config["configure_test_runtime"]()
 
-    def test_existing_bot_identity_requires_explicit_opt_in(self):
+    def test_existing_bot_identity_override_must_match(self):
         opts = self.base()
-        opts["TEST_BOT_USERNAME"] = "PsychologiaProClub_bot"
+        opts["TEST_BOT_USERNAME"] = "AnotherTest_bot"
         with patch.dict(os.environ, opts, clear=True):
             with self.assertRaises(RuntimeError):
                 self.config["configure_test_runtime"]()
-        opts["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
+        opts["TEST_BOT_USERNAME"] = "@PsychologiaProClub_bot"
         with patch.dict(os.environ, opts, clear=True):
-            name, ids = self.config["configure_test_runtime"]()
-            self.assertEqual(name, "psychologiaproclub_bot")
-            self.assertEqual(ids, {885005330})
+            username, testers = self.config["configure_test_runtime"]()
+            self.assertEqual(username, "psychologiaproclub_bot")
+            self.assertEqual(testers, {885005330})
 
-    def test_existing_identity_flag_rejected_for_another_bot(self):
-        opts = self.base()
-        opts["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
-        with patch.dict(os.environ, opts, clear=True):
-            with self.assertRaises(RuntimeError):
-                self.config["configure_test_runtime"]()
+    def test_wrong_flag_or_testers_are_rejected(self):
+        for name, value in (
+            ("TEST_BOT_USE_EXISTING_IDENTITY", "0"),
+            ("TEST_BOT_ALLOWED_USER_IDS", "7563789785"),
+            ("TEST_BOT_ALLOWED_USER_IDS", "885005330,7563789785"),
+            ("TEST_BOT_ALLOWED_USER_IDS", "bad-id"),
+        ):
+            with self.subTest(name=name, value=value):
+                opts = self.base()
+                opts[name] = value
+                with patch.dict(os.environ, opts, clear=True):
+                    with self.assertRaises(RuntimeError):
+                        self.config["configure_test_runtime"]()
 
-    def test_existing_identity_mismatch_fails_before_polling(self):
+    def test_bot_identity_mismatch_fails_before_polling(self):
         import asyncio
         from types import SimpleNamespace
 
@@ -73,10 +84,7 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
             async def get_me(self):
                 return SimpleNamespace(username=self.username)
 
-        options = self.base()
-        options["TEST_BOT_USERNAME"] = "PsychologiaProClub_bot"
-        options["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
-        with patch.dict(os.environ, options, clear=True):
+        with patch.dict(os.environ, self.base(), clear=True):
             identity = self.config["verify_test_bot_identity"]
             asyncio.run(identity(
                 SimpleNamespace(bot=FakeBot("PsychologiaProClub_bot")),
@@ -87,17 +95,11 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                     SimpleNamespace(bot=FakeBot("SomeOther_bot")),
                     "psychologiaproclub_bot"
                 ))
-        with patch.dict(os.environ, self.base(), clear=True):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(identity(
-                    SimpleNamespace(bot=FakeBot("PsychologiaProClub_bot")),
-                    "psychologiaproclub_bot"
-                ))
 
     def test_data_folders_are_separate_from_production(self):
         with patch.dict(os.environ, self.base(), clear=True):
             name, ids = self.config["configure_test_runtime"]()
-            self.assertEqual(name, "psychologiapromemorytest_bot")
+            self.assertEqual(name, "psychologiaproclub_bot")
             self.assertEqual(ids, {885005330})
             self.assertEqual(os.environ["BOT_DATA_DIR"],
                              "/app/data/psychologia_live_test")
@@ -113,7 +115,7 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.config["configure_test_runtime"]()
 
     def test_missing_testers_and_gemini_key_fail_closed(self):
-        for name in ("BOT_TOKEN", "GEMINI_API_KEY", "TEST_BOT_ALLOWED_USER_IDS"):
+        for name in ("BOT_TOKEN", "GEMINI_API_KEY"):
             with self.subTest(name=name):
                 opts = self.base()
                 opts.pop(name)
