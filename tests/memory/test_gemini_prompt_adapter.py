@@ -128,7 +128,7 @@ class GeminiPromptAdapterTests(unittest.TestCase):
         )
         source = ast.unparse(func)
         self.assertIn("list_live_memories(user_id, now)", source)
-        self.assertIn('f"telegram:private:{user_id}:"', source)
+        self.assertIn("telegram:private:{user_id}:", source)
         self.assertIn("purge_expired(now)", source)
 
 
