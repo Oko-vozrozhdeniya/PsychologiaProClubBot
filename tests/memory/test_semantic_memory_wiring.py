@@ -2,6 +2,7 @@
 import ast
 import io
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
@@ -42,9 +43,11 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             "datetime": datetime,
             "timezone": timezone,
             "timedelta": timedelta,
+            "re": re,
             "AccessPolicy": AccessPolicy,
             "SourcePermission": SourcePermission,
             "prepare_candidates": prepare_candidates,
+            "prepare_correction": __import__("memory.coordinator", fromlist=["prepare_correction"]).prepare_correction,
             "extract_candidates": extract_candidates,
             "personal_storage": SimpleNamespace(
                 initialize_database=lambda: storage.initialize_database(self.db),

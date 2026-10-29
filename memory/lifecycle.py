@@ -259,7 +259,7 @@ def list_live_sources(user_id, now, *, db_path=storage.DATABASE_PATH):
 
 def revise_memory(user_id, memory_id, expected_content, expected_source,
                   new_content, new_source, message_text, now, change_kind,
-                  *, db_path=storage.DATABASE_PATH):
+                  *, db_path=storage.DATABASE_PATH, allow_existing_source=False):
     """Atomically revise an owned live memory while preserving its provenance.
 
     A new authenticated Telegram message becomes the only *current* source.
@@ -276,6 +276,8 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
     message_text = storage._validate_text(message_text, "message_text")
     if change_kind not in ("correction", "change"):
         raise ValueError("Invalid change kind")
+    if type(allow_existing_source) is not bool:
+        raise ValueError("Invalid existing-source flag")
     if len(new_content) > 2000:
         raise ValueError("Memory content exceeds limit")
     if not previous_source.startswith(f"telegram:private:{user_id}:"):
@@ -316,18 +318,25 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
         ).fetchone()
         if not old_message:
             raise PermissionError("Previous primary source expired")
-        if db.execute(
-            "SELECT 1 FROM private_messages WHERE user_id=? AND message_id=?",
+        registered = db.execute(
+            """SELECT content, created_at, expires_at FROM private_messages
+               WHERE user_id=? AND message_id=?""",
             (user_id, new_source),
-        ).fetchone():
-            raise ValueError("Duplicate revision message")
+        ).fetchone()
+        if registered:
+            if (not allow_existing_source or
+                (registered["content"], registered["created_at"],
+                 registered["expires_at"]) != (
+                     message_text, moment.isoformat(), expiry)):
+                raise ValueError("Duplicate or mismatched revision message")
         if previous == new_content:
             return False
-        db.execute(
-            """INSERT INTO private_messages(user_id, message_id, content,
-               created_at, expires_at) VALUES (?, ?, ?, ?, ?)""",
-            (user_id, new_source, message_text, moment.isoformat(), expiry),
-        )
+        if not registered:
+            db.execute(
+                """INSERT INTO private_messages(user_id, message_id, content,
+                   created_at, expires_at) VALUES (?, ?, ?, ?, ?)""",
+                (user_id, new_source, message_text, moment.isoformat(), expiry),
+            )
         db.execute(
             """INSERT INTO memory_revisions(user_id, memory_id,
                previous_content, new_content, previous_source, new_source,

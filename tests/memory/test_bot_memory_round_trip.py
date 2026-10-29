@@ -5,6 +5,7 @@ No Telegram credentials and no external Gemini call are needed for this test.
 import ast
 import io
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,10 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                 uid, src, c, t, db_path=self.db),
             link_memory_sources=lambda uid, mid, sources, t: lifecycle.link_memory_sources(
                 uid, mid, sources, t, db_path=self.db),
+            revise_memory=lambda uid, mid, prev, prev_src, new, new_src,
+                          text, now, kind, **kw: lifecycle.revise_memory(
+                uid, mid, prev, prev_src, new, new_src, text, now, kind,
+                db_path=self.db, **kw),
             delete_message=lambda uid, src: lifecycle.delete_message(uid, src, db_path=self.db),
             purge_expired=lambda t: lifecycle.purge_expired(t, db_path=self.db),
         )
@@ -54,10 +59,10 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
 
         def fake_urlopen(req, timeout):
             self.calls += 1
-            content = [
+            content = getattr(self, "model_result", [
                 {"content": "Пользователь изучает биологию",
                  "kind": "fact", "confidence": 0.98}
-            ]
+            ])
             body = {"candidates": [{"content": {"parts": [{
                 "text": json.dumps(content, ensure_ascii=False)
             }]}}]}
@@ -68,8 +73,10 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             "GEMINI_API_KEY": "test", "GEMINI_MODEL": "test",
             "GEMINI_TIMEOUT": 2, "OWNER_ID": 101, "TEST_USER_IDS": {202},
             "json": json, "datetime": datetime, "timezone": timezone,
-            "timedelta": timedelta, "AccessPolicy": AccessPolicy,
-            "SourcePermission": SourcePermission, "prepare_candidates": prepare_candidates,
+            "timedelta": timedelta, "re": re, "AccessPolicy": AccessPolicy,
+            "SourcePermission": SourcePermission,
+            "prepare_candidates": prepare_candidates,
+            "prepare_correction": __import__("memory.coordinator", fromlist=["prepare_correction"]).prepare_correction,
             "extract_candidates": extract_candidates,
             "build_memory_context": build_memory_context,
             "read_context": lambda uid, q, pol, perms, now, **kw: read_context(
@@ -81,6 +88,82 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         }
         self.save = load_function("remember_dialog_facts", ns)
         self.read = load_function("read_explicit_memory_prompt", ns)
+
+    def seed_old(self, content="Работает учителем"):
+        source = "telegram:private:101:100"
+        now = datetime.now(timezone.utc)
+        lifecycle.register_message(101, source, "Я работаю учителем", now, db_path=self.db)
+        mid = storage.add_memory(101, content, "fact", source, db_path=self.db)
+        lifecycle.link_memory_sources(101, mid, [source], now, db_path=self.db)
+        return mid
+
+    def test_natural_change_revises_current_fact_and_preserves_history(self):
+        mid = self.seed_old()
+        self.model_result = [{
+            "content": "Раньше работал учителем, сейчас работает психологом",
+            "kind": "fact", "confidence": 0.99,
+            "replaces_memory_id": mid,
+            "replaces_content": "Работает учителем",
+            "revision_kind": "change"
+        }]
+        self.assertEqual(
+            self.save(101, 506, "Раньше я работал учителем, теперь я психолог"), 1
+        )
+        live = lifecycle.list_live_memories(
+            101, datetime.now(timezone.utc), db_path=self.db
+        )
+        self.assertEqual(len(live), 1)
+        self.assertIn("психологом", live[0]["content"])
+        self.assertNotIn("Работает учителем", self.read(101, "работает"))
+        self.assertEqual(len(lifecycle.list_memory_revisions(
+            101, mid, datetime.now(timezone.utc), db_path=self.db
+        )), 1)
+
+    def test_natural_explicit_correction_replaces_wrong_fact(self):
+        mid = self.seed_old()
+        self.model_result = [{
+            "content": "Работает врачом", "kind": "fact", "confidence": 0.98,
+            "replaces_memory_id": mid,
+            "replaces_content": "Работает учителем",
+            "revision_kind": "correction"
+        }]
+        self.assertEqual(
+            self.save(101, 507, "Это ошибка: я не учитель, а врач"), 1
+        )
+        self.assertEqual(storage.get_memory(
+            101, mid, db_path=self.db
+        )["content"], "Работает врачом")
+
+    def test_untrusted_replacement_id_is_not_saved_as_new_fact(self):
+        mid = self.seed_old()
+        self.model_result = [{
+            "content": "Работает врачом", "kind": "fact", "confidence": 0.99,
+            "replaces_memory_id": mid + 1000,
+            "replaces_content": "Работает учителем",
+            "revision_kind": "correction"
+        }]
+        self.assertEqual(
+            self.save(101, 508, "Это ошибка, я врач"), 0
+        )
+        self.assertEqual(storage.get_memory(
+            101, mid, db_path=self.db
+        )["content"], "Работает учителем")
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 1)
+
+    def test_ambiguous_claim_must_not_silently_revise(self):
+        mid = self.seed_old()
+        self.model_result = [{
+            "content": "Работает врачом", "kind": "fact", "confidence": 0.99,
+            "replaces_memory_id": mid,
+            "replaces_content": "Работает учителем",
+            "revision_kind": "correction"
+        }]
+        self.assertEqual(
+            self.save(101, 509, "Сегодня хорошая погода"), 0
+        )
+        self.assertEqual(storage.get_memory(
+            101, mid, db_path=self.db
+        )["content"], "Работает учителем")
 
     def test_real_save_then_coordinator_recall(self):
         self.assertEqual(self.save(101, 500, "Я изучаю биологию"), 1)
