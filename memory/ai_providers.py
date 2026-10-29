@@ -6,6 +6,7 @@ The original Gemini archive-analysis mode is not modified.
 """
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -23,6 +24,48 @@ class GroqRequestError(Exception):
         self.http_code = http_code
         self.reason = reason
         self.request_stats = request_stats or {}
+
+
+def _describe_groq_http_error(error):
+    """Safely classify provider failure without exposing raw bodies or secrets.
+
+    Only allowlisted-shaped machine codes and semantic classifications are
+    reported. Never forward remote error messages into Telegram or log files.
+    """
+    try:
+        raw = error.read(4096)
+        parsed = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
+        return "Ответ об ошибке не является JSON; возможна блокировка на сетевом уровне"
+    data = parsed.get("error") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict):
+        return "Ошибка JSON без стандартного поля Groq error"
+    err_type = data.get("type")
+    err_code = data.get("code")
+    message = data.get("message")
+    safe_type = (err_type if isinstance(err_type, str) and
+                 re.fullmatch(r"[a-z0-9_]{1,64}", err_type)
+                 else "не указан")
+    safe_code = (err_code if isinstance(err_code, str) and
+                 re.fullmatch(r"[a-z0-9_]{1,80}", err_code)
+                 else "не указан")
+    description = "Причина требует дополнительной проверки"
+    raw_msg = message.lower() if isinstance(message, str) else ""
+    if safe_code == "model_permission_blocked_org":
+        description = "Модель заблокирована на уровне организации"
+    elif safe_code == "model_permission_blocked_project":
+        description = "Модель заблокирована на уровне проекта"
+    elif (("region" in raw_msg or "location" in raw_msg or "country" in raw_msg)
+          and ("not supported" in raw_msg or "restricted" in raw_msg
+               or "blocked" in raw_msg)):
+        description = "Сервис отклоняет регион или сетевой адрес запроса"
+    elif "signup_blocked" in raw_msg or safe_code == "signup_blocked":
+        description = "Ограничение регистрации или аккаунта"
+    elif "organization" in raw_msg and (
+        "restricted" in raw_msg or "blocked" in raw_msg
+    ):
+        description = "Ограничение организации Groq"
+    return f"тип={safe_type}; код={safe_code}; {description}"
 
 
 def request_groq(question, history=None, personal_memory_context=None):
@@ -95,8 +138,9 @@ def request_groq(question, history=None, personal_memory_context=None):
         category = ("rate_limit" if code == 429 else
                     "unavailable" if code in (500, 502, 503, 504) else
                     "general")
+        reason = f"Groq HTTP {code}; {_describe_groq_http_error(error)}"
         raise GroqRequestError(
-            category, http_code=code, reason=f"Groq HTTP {code}",
+            category, http_code=code, reason=reason,
             request_stats=stats
         ) from error
     except (socket.timeout, TimeoutError) as error:

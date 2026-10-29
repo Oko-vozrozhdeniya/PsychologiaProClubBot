@@ -84,6 +84,73 @@ class GroqProviderTests(unittest.TestCase):
         self.assertEqual(ctx.exception.http_code, 503)
         self.assertNotIn(KEY, ctx.exception.reason)
 
+    def test_http_403_org_and_project_blocks_report_only_safe_codes(self):
+        from memory.ai_providers import _describe_groq_http_error
+
+        for code, expected in (
+            ("model_permission_blocked_org", "организации"),
+            ("model_permission_blocked_project", "проекта"),
+        ):
+            with self.subTest(code=code):
+                payload = json.dumps({"error": {
+                    "type": "permissions_error", "code": code,
+                    "message": "Sensitive user token: " + KEY
+                }}).encode("utf-8")
+                err = urllib.error.HTTPError(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    403, "Forbidden", {}, io.BytesIO(payload)
+                )
+                with self.env(), patch("urllib.request.urlopen",
+                                       side_effect=err):
+                    with self.assertRaises(GroqRequestError) as raised:
+                        request_groq("Test request")
+                self.assertIn(code, raised.exception.reason)
+                self.assertIn(expected, raised.exception.reason)
+                self.assertNotIn(KEY, raised.exception.reason)
+
+    def test_http_403_region_or_account_restriction_sanitized(self):
+        scenarios = [
+            ("Your location is not supported", "регион"),
+            ("Your organization is restricted", "организации"),
+            ("Code signup_blocked: reference " + KEY, "аккаунта"),
+        ]
+        for message, expected in scenarios:
+            with self.subTest(message=message.split()[0]):
+                payload = json.dumps({"error": {
+                    "type": "permissions_error", "message": message
+                }}).encode()
+                err = urllib.error.HTTPError(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    403, "Forbidden", {}, io.BytesIO(payload)
+                )
+                with self.env(), patch("urllib.request.urlopen",
+                                       side_effect=err):
+                    with self.assertRaises(GroqRequestError) as raised:
+                        request_groq("Test")
+                self.assertIn(expected, raised.exception.reason)
+                self.assertNotIn(KEY, raised.exception.reason)
+
+    def test_html_403_and_malicious_code_do_not_echo_untrusted_text(self):
+        cases = [
+            (b"<html>Private " + KEY.encode() + b"</html>", "не является JSON"),
+            (json.dumps({"error": {
+                "type": "permissions_error", "code": KEY,
+                "message": "Unrecognized " + KEY
+            }}).encode(), "код=не указан"),
+        ]
+        for payload, expected in cases:
+            with self.subTest(expected=expected):
+                err = urllib.error.HTTPError(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    403, "Forbidden", {}, io.BytesIO(payload)
+                )
+                with self.env(), patch("urllib.request.urlopen",
+                                       side_effect=err):
+                    with self.assertRaises(GroqRequestError) as raised:
+                        request_groq("Test")
+                self.assertIn(expected, raised.exception.reason)
+                self.assertNotIn(KEY, raised.exception.reason)
+
     def test_timeout_and_rate_limit_keep_provider_error(self):
         with self.env(), patch("urllib.request.urlopen",
                                side_effect=socket.timeout()):
