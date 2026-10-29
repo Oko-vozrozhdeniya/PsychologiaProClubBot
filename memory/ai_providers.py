@@ -123,7 +123,8 @@ def request_groq(question, history=None, personal_memory_context=None):
         "https://api.groq.com/openai/v1/chat/completions",
         data=payload,
         headers={"Authorization": "Bearer " + key,
-                 "Content-Type": "application/json"},
+                 "Content-Type": "application/json",
+                 "User-Agent": "PsychologiaProClubBot/1.0"},
         method="POST",
     )
     try:

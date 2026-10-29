@@ -317,6 +317,8 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.assertEqual(api.call_args.kwargs["timeout"], 12)
                 self.assertEqual(request.get_header("Authorization"),
                                  "Bearer " + key)
+                self.assertEqual(request.get_header("User-agent"),
+                                 "PsychologiaProClubBot/1.0")
                 self.assertIsNone(request.data)
                 self.assertNotIn(key, result)
 
@@ -380,6 +382,10 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
                 self.assertEqual(len(seen), 2)
                 self.assertTrue(seen[0].has_header("Authorization"))
                 self.assertFalse(seen[1].has_header("Authorization"))
+                self.assertEqual(seen[0].get_header("User-agent"),
+                                 "PsychologiaProClubBot/1.0")
+                self.assertEqual(seen[1].get_header("User-agent"),
+                                 "PsychologiaProClubBot/1.0")
                 self.assertEqual(seen[0].full_url, seen[1].full_url)
                 self.assertEqual(seen[1].get_method(), "GET")
                 self.assertIsNone(seen[1].data)

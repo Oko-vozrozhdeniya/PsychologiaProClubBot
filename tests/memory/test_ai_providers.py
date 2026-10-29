@@ -42,6 +42,7 @@ class GroqProviderTests(unittest.TestCase):
             self.assertEqual(req.full_url,
                              "https://api.groq.com/openai/v1/chat/completions")
             self.assertEqual(req.get_header("Authorization"), "Bearer " + KEY)
+            self.assertEqual(req.get_header("User-agent"), "PsychologiaProClubBot/1.0")
             body = json.loads(req.data.decode("utf-8"))
             self.assertEqual(body["model"], "openai/gpt-oss-20b")
             self.assertEqual([m["role"] for m in body["messages"]],

@@ -312,6 +312,7 @@ def probe_groq_metadata():
         headers={
             "Authorization": "Bearer " + key,
             "Accept": "application/json",
+            "User-Agent": "PsychologiaProClubBot/1.0",
         },
         method="GET",
     )
@@ -360,7 +361,8 @@ def probe_groq_metadata():
         # An anonymous request must not contain Authorization or chat data.
         anonymous_request = urllib.request.Request(
             "https://api.groq.com/openai/v1/models",
-            headers={"Accept": "application/json"},
+            headers={"Accept": "application/json",
+                     "User-Agent": "PsychologiaProClubBot/1.0"},
             method="GET",
         )
         try:
