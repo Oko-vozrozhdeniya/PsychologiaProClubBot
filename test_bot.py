@@ -263,10 +263,10 @@ async def gemini_ping(update, context):
 
 
 def probe_groq_metadata():
-    """Single GET to Groq model metadata; no conversation or inference request.
+    """Compare authorized GET with anonymous control if access is denied.
 
-    Returned diagnostics only describe sanitized HTTP status and response type.
-    Never print API keys, raw response bodies, HTML or network identifiers.
+    No user messages, inference, raw error bodies, keys or private IDs are sent
+    to Telegram. One extra metadata request is made only on HTTP 403.
     """
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
@@ -316,9 +316,36 @@ def probe_groq_metadata():
                 detail = "получена HTML-страница отказа, не JSON API"
         if cf_challenge == "challenge":
             detail += "; обнаружена защитная проверка Cloudflare"
-        return (f"GET /models: HTTP {error.code}; "
-                f"формат: {'HTML' if is_html else 'не HTML'}; "
-                f"сетевой слой: {edge}; {detail}")
+        result = (f"GET /models с ключом: HTTP {error.code}; "
+                  f"формат: {'HTML' if is_html else 'не HTML'}; "
+                  f"посредник: {edge}; {detail}")
+        if error.code != 403:
+            return result
+        # An anonymous request must not contain Authorization or chat data.
+        anonymous_request = urllib.request.Request(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(anonymous_request, timeout=8) as response:
+                anonymous_status = getattr(response, "status", 200)
+            anonymous_result = f"HTTP {anonymous_status}"
+        except urllib.error.HTTPError as anonymous_error:
+            anonymous_result = f"HTTP {anonymous_error.code}"
+        except (OSError, ValueError, UnicodeError, TimeoutError):
+            anonymous_result = "сетевая ошибка"
+        if anonymous_result == "HTTP 403":
+            conclusion = ("оба запроса получают 403; подозрение на блокировку "
+                          "по сети усилилось, но источник отказа не установлен")
+        elif anonymous_result == "HTTP 401":
+            conclusion = ("без ключа сервер ожидаемо требует авторизацию; "
+                          "нужно проверить ограничения ключа, организации "
+                          "или доступ именно авторизованных запросов")
+        else:
+            conclusion = "по контрольному запросу источник ограничения не определён"
+        return (result + "\nКонтроль без ключа: " + anonymous_result
+                + "; " + conclusion)
     except (TimeoutError, socket.timeout):
         return "GET /models: превышено время ожидания (12 секунд)"
     except (OSError, ValueError, UnicodeError):

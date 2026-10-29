@@ -344,6 +344,49 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
             with patch("urllib.request.urlopen", side_effect=socket.timeout()):
                 self.assertIn("12 секунд", check())
 
+    def test_groq_403_compare_no_key_control_and_never_send_secret(self):
+        import io
+        import json
+        import socket
+        import urllib
+        import urllib.error
+        import urllib.request
+        text = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        funcs = {node.name: node for node in ast.parse(text).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        namespace = {"os": os, "json": json, "socket": socket, "urllib": urllib}
+        exec(compile(ast.Module(body=[funcs["probe_groq_metadata"]],
+                                type_ignores=[]), "test_bot.py", "exec"), namespace)
+        check = namespace["probe_groq_metadata"]
+        key = "NOT_A_REAL_GROQ_KEY"
+        for control, expected in ((401, "ожидаемо требует авторизацию"),
+                                  (403, "подозрение на блокировку")):
+            with self.subTest(control=control):
+                seen = []
+                def fail(req, timeout):
+                    seen.append(req)
+                    authenticated = req.has_header("Authorization")
+                    status = 403 if authenticated else control
+                    headers = {"Server": "cloudflare",
+                               "Content-Type": "text/plain"}
+                    return_error = urllib.error.HTTPError(
+                        req.full_url, status, "Forbidden", headers,
+                        io.BytesIO(b"no diagnostic JSON " + key.encode())
+                    )
+                    raise return_error
+                with patch.dict(os.environ, {"GROQ_API_KEY": key}, clear=True), \
+                     patch("urllib.request.urlopen", side_effect=fail):
+                    output = check()
+                self.assertEqual(len(seen), 2)
+                self.assertTrue(seen[0].has_header("Authorization"))
+                self.assertFalse(seen[1].has_header("Authorization"))
+                self.assertEqual(seen[0].full_url, seen[1].full_url)
+                self.assertEqual(seen[1].get_method(), "GET")
+                self.assertIsNone(seen[1].data)
+                self.assertIn("Контроль без ключа: HTTP " + str(control), output)
+                self.assertIn(expected, output)
+                self.assertNotIn(key, output)
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)
