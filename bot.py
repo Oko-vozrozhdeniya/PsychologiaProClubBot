@@ -1388,6 +1388,16 @@ async def private_message(
                 question,
                 answer
             )
+            try:
+                saved_facts = await asyncio.to_thread(
+                    remember_dialog_facts,
+                    user_id,
+                    message.message_id,
+                    question
+                )
+                logger.info("Automatic memory saved %s facts", saved_facts)
+            except Exception:
+                logger.exception("Automatic memory extraction failed")
                 
             await send_long_message(
                 message,
