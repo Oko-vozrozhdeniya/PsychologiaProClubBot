@@ -1,8 +1,9 @@
-
-name: Memory Storage Tests
+name: Memory Module Tests
 
 on:
   push:
+    branches:
+      - feature/memory-dialog-bridge
     paths:
       - "memory/**"
       - "tests/memory/**"
@@ -19,10 +20,10 @@ permissions:
 
 jobs:
   test-memory:
+    name: Full memory test suite (Python 3.11)
     runs-on: ubuntu-latest
-
     steps:
-      - name: Download repository
+      - name: Checkout feature branch
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
@@ -30,5 +31,15 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run memory storage tests
+      - name: Check memory module syntax
+        run: python -m compileall -q memory tests/memory
+
+      - name: Run every memory unit test
         run: python -m unittest discover -s tests/memory -p "test_*.py" -v
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          echo "## Memory tests" >> "$GITHUB_STEP_SUMMARY"
+          echo "Branch: \`$GITHUB_REF_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the **Run every memory unit test** step for the full results." >> "$GITHUB_STEP_SUMMARY"
