@@ -9,6 +9,7 @@ Never commit Telegram or AI tokens.
 """
 import asyncio
 import os
+import urllib.request
 from pathlib import Path
 
 TEST_DATA_DIR = Path("/app/data/psychologia_live_test")
@@ -76,6 +77,7 @@ async def start_test(update, context):
         "Затем /remember <текст>, /memories, /correct <номер> <новый текст>, "
         "/change <номер> <новый текст>, /history <номер>.\n"
         "Проверка извлечения: /check_memory <слова из факта>.\n"
+        "Диагностика страны сервера: /network_check.\n"
         "Остановить использование памяти: /memory_off.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
@@ -95,6 +97,42 @@ async def check_memory(update, context):
     if not result:
         result = "Подходящих разрешённых воспоминаний не найдено."
     await bot.send_long_message(update.effective_message, result)
+
+
+def detect_server_country():
+    """Check external egress country only; never expose the public IP.
+
+    This third-party lookup is for the owner's explicit diagnostic request.
+    The returned country is informative: Google may classify an IP differently.
+    """
+    request = urllib.request.Request(
+        "https://ipinfo.io/country",
+        headers={"User-Agent": "PsychologiaPro-MemoryTest/1.0"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        # A country endpoint must return just a 2-letter country code.
+        raw = response.read(16).decode("ascii").strip()
+    if len(raw) != 2 or not raw.isalpha() or not raw.isupper():
+        raise ValueError("Unexpected country lookup response")
+    return raw
+
+
+async def network_check(update, context):
+    """Owner-only country check, isolated from the Gemini request path."""
+    try:
+        code = await asyncio.to_thread(detect_server_country)
+    except (OSError, ValueError, UnicodeError):
+        await update.effective_message.reply_text(
+            "Не удалось определить страну выходного IP через внешний сервис. "
+            "Это не влияет на сохранённую память."
+        )
+        return
+    await update.effective_message.reply_text(
+        f"Страна выхода сервера по ipinfo.io: {code}.\n"
+        "Это оценка стороннего сервиса, а не решение Google "
+        "о доступности Gemini API."
+    )
 
 
 def create_test_application(bot, allowed_ids, expected_username):
@@ -124,6 +162,7 @@ def create_test_application(bot, allowed_ids, expected_username):
         "change": bot.change_command,
         "history": bot.history_command,
         "check_memory": check_memory,
+        "network_check": network_check,
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(

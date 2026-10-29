@@ -134,6 +134,42 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
         self.assertNotIn("bot.main(", build)
         self.assertNotIn("bot.save_message", build)
 
+    def test_network_check_requires_owner_private_filter(self):
+        import ast
+        code = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        tree = ast.parse(code)
+        builder = next(x for x in tree.body if isinstance(x, ast.FunctionDef)
+                       and x.name == "create_test_application")
+        body = ast.unparse(builder)
+        self.assertIn('"network_check": network_check', body)
+        self.assertIn("filters.ChatType.PRIVATE", body)
+        self.assertIn("filters.User", body)
+
+    def test_country_diagnostic_success_and_untrusted_response(self):
+        import io
+        import urllib.request
+
+        code = (ROOT / "test_bot.py").read_text(encoding="utf-8")
+        tree = ast.parse(code)
+        fn = next(x for x in tree.body if isinstance(x, ast.FunctionDef)
+                  and x.name == "detect_server_country")
+        namespace = {"urllib": urllib}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "test_bot.py", "exec"),
+             namespace)
+        detect = namespace["detect_server_country"]
+
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(b"NL\\n")) as api:
+            self.assertEqual(detect(), "NL")
+            self.assertEqual(api.call_args.kwargs["timeout"], 8)
+            self.assertEqual(api.call_args.args[0].full_url,
+                             "https://ipinfo.io/country")
+        for invalid in (b"", b"US,NL", b"Unknown", b"NL\\nGB", b"nl"):
+            with self.subTest(invalid=invalid):
+                with patch("urllib.request.urlopen",
+                           return_value=io.BytesIO(invalid)):
+                    with self.assertRaises(ValueError):
+                        detect()
+
     def test_bot_identity_checked_before_polling(self):
         build = ast.unparse(next(node for node in self.tree.body
                                  if isinstance(node, ast.FunctionDef)
