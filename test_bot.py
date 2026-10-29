@@ -1,8 +1,10 @@
 """Isolated Telegram live-test entrypoint for the memory module.
 
-Deploy as a NEW Bothost bot from the feature branch, not as a replacement for
-the production bot. Its application registers private handlers only.
-Never commit a token or run this entrypoint with the production bot token.
+Deploy to a separate, stopped Bothost service from the feature branch.
+This service can use the existing Telegram bot identity only with an explicit
+opt-in; the original service MUST be stopped before starting test polling.
+Its application registers private handlers only and uses isolated storage.
+Never commit Telegram or AI tokens.
 """
 import asyncio
 import os
@@ -18,16 +20,26 @@ def configure_test_runtime():
         raise RuntimeError("BOT_TEST_MODE=1 is required for test_bot.py")
     raw_username = os.environ.get("TEST_BOT_USERNAME", "").strip()
     expected_username = raw_username.lstrip("@").lower()
-    if (not expected_username or not expected_username.endswith("bot")
-            or expected_username == EXPECTED_PRODUCTION_USERNAME):
-        raise RuntimeError("Set the separate TEST_BOT_USERNAME from BotFather")
+    if not expected_username or not expected_username.endswith("bot"):
+        raise RuntimeError("Set the confirmed TEST_BOT_USERNAME")
+    if expected_username == EXPECTED_PRODUCTION_USERNAME:
+        if os.environ.get("TEST_BOT_USE_EXISTING_IDENTITY") != "1":
+            raise RuntimeError(
+                "Using the existing Telegram bot requires "
+                "TEST_BOT_USE_EXISTING_IDENTITY=1 and stopping the other "
+                "BotHost service before starting this one"
+            )
+    elif os.environ.get("TEST_BOT_USE_EXISTING_IDENTITY") == "1":
+        raise RuntimeError(
+            "TEST_BOT_USE_EXISTING_IDENTITY=1 is only for the existing bot"
+        )
     raw_ids = os.environ.get("TEST_BOT_ALLOWED_USER_IDS", "").strip()
     if (not raw_ids or any(not item.strip().isdigit()
             or int(item.strip()) <= 0 for item in raw_ids.split(","))):
         raise RuntimeError("Set TEST_BOT_ALLOWED_USER_IDS to numeric user IDs")
     allowed = {int(item.strip()) for item in raw_ids.split(",")}
     if not os.environ.get("BOT_TOKEN", "").strip():
-        raise RuntimeError("BOT_TOKEN must be set only in the new test bot service")
+        raise RuntimeError("BOT_TOKEN must be configured on the stopped test service")
     if not os.environ.get("GEMINI_API_KEY", "").strip():
         raise RuntimeError("GEMINI_API_KEY is required for live AI testing")
     # No service may override the isolated data paths with a production path.
@@ -46,15 +58,18 @@ async def verify_test_bot_identity(application, expected_username):
     """Check BotFather identity before Telegram polling starts."""
     me = await application.bot.get_me()
     actual = (me.username or "").lower()
-    if actual != expected_username or actual == EXPECTED_PRODUCTION_USERNAME:
+    if actual != expected_username:
         raise RuntimeError(
             "Wrong Telegram bot identity. Test polling was not started."
         )
+    if (actual == EXPECTED_PRODUCTION_USERNAME and
+            os.environ.get("TEST_BOT_USE_EXISTING_IDENTITY") != "1"):
+        raise RuntimeError("Existing bot identity not explicitly authorized")
 
 
 async def start_test(update, context):
     await update.effective_message.reply_text(
-        "Это отдельный тестовый бот памяти «Психология PRO».\n"
+        "Это тестовый режим памяти «Психология PRO».\n"
         "Сначала /memory_on — согласие на тестовую память.\n"
         "Затем /remember <текст>, /memories, /correct <номер> <новый текст>, "
         "/change <номер> <новый текст>, /history <номер>.\n"

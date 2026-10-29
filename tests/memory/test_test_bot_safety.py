@@ -44,12 +44,55 @@ class IsolatedTelegramTestModeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.config["configure_test_runtime"]()
 
-    def test_production_username_is_always_refused(self):
+    def test_existing_bot_identity_requires_explicit_opt_in(self):
         opts = self.base()
         opts["TEST_BOT_USERNAME"] = "PsychologiaProClub_bot"
         with patch.dict(os.environ, opts, clear=True):
             with self.assertRaises(RuntimeError):
                 self.config["configure_test_runtime"]()
+        opts["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
+        with patch.dict(os.environ, opts, clear=True):
+            name, ids = self.config["configure_test_runtime"]()
+            self.assertEqual(name, "psychologiaproclub_bot")
+            self.assertEqual(ids, {885005330})
+
+    def test_existing_identity_flag_rejected_for_another_bot(self):
+        opts = self.base()
+        opts["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
+        with patch.dict(os.environ, opts, clear=True):
+            with self.assertRaises(RuntimeError):
+                self.config["configure_test_runtime"]()
+
+    def test_existing_identity_mismatch_fails_before_polling(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        class FakeBot:
+            def __init__(self, username):
+                self.username = username
+            async def get_me(self):
+                return SimpleNamespace(username=self.username)
+
+        options = self.base()
+        options["TEST_BOT_USERNAME"] = "PsychologiaProClub_bot"
+        options["TEST_BOT_USE_EXISTING_IDENTITY"] = "1"
+        with patch.dict(os.environ, options, clear=True):
+            identity = self.config["verify_test_bot_identity"]
+            asyncio.run(identity(
+                SimpleNamespace(bot=FakeBot("PsychologiaProClub_bot")),
+                "psychologiaproclub_bot"
+            ))
+            with self.assertRaises(RuntimeError):
+                asyncio.run(identity(
+                    SimpleNamespace(bot=FakeBot("SomeOther_bot")),
+                    "psychologiaproclub_bot"
+                ))
+        with patch.dict(os.environ, self.base(), clear=True):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(identity(
+                    SimpleNamespace(bot=FakeBot("PsychologiaProClub_bot")),
+                    "psychologiaproclub_bot"
+                ))
 
     def test_data_folders_are_separate_from_production(self):
         with patch.dict(os.environ, self.base(), clear=True):
