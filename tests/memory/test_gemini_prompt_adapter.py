@@ -48,5 +48,68 @@ class GeminiPromptAdapterTests(unittest.TestCase):
                 datetime.now(timezone.utc), provider=lambda u, t: None)
 
 
+    def test_bot_private_handler_is_connected(self):
+        """Inspect actual bot.py without importing Telegram or API credentials."""
+        import ast
+        from pathlib import Path
+        tree = ast.parse(
+            (Path(__file__).resolve().parents[2] / "bot.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        handler = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "private_message"
+        )
+        names = {
+            node.id for node in ast.walk(handler)
+            if isinstance(node, ast.Name)
+        }
+        self.assertIn("optional_private_memory", names)
+        self.assertIn("request_gemini", names)
+        gemini = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "request_gemini"
+        )
+        self.assertIn(
+            "personal_memory_context",
+            [arg.arg for arg in gemini.args.args],
+        )
+        self.assertTrue(any(
+            isinstance(node, ast.Name) and node.id == "append_private_memory"
+            for node in ast.walk(gemini)
+        ))
+
+    def test_no_automatic_permission_provider_in_bot(self):
+        """Current wiring must not fabricate consent or permissions."""
+        import ast
+        from pathlib import Path
+        tree = ast.parse(
+            (Path(__file__).resolve().parents[2] / "bot.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        handler = next(
+            node for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "private_message"
+        )
+        calls = [
+            node for node in ast.walk(handler)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_thread"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "optional_private_memory"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(any(
+            kw.arg == "provider" for kw in calls[0].keywords
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()
