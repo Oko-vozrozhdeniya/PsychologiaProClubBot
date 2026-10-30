@@ -59,6 +59,16 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                 uid, enabled, now, db_path=self.db),
         )
         self.calls = 0
+        self.groq_calls = 0
+
+        def fake_groq_request(question, *, system_instruction):
+            self.groq_calls += 1
+            self.last_groq_extraction_prompt = question
+            self.last_groq_instruction = system_instruction
+            return json.dumps(getattr(self, "model_result", [
+                {"content": "Пользователь изучает биологию",
+                 "kind": "fact", "confidence": 0.98}
+            ]), ensure_ascii=False)
 
         def fake_urlopen(req, timeout):
             self.calls += 1
@@ -94,6 +104,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                 uid, q, pol, perms, now, db_path=self.db, **kw),
             "personal_storage": self.personal_storage,
             "personal_lifecycle": self.personal_lifecycle,
+            "request_groq": fake_groq_request,
             "urllib": SimpleNamespace(request=SimpleNamespace(
                 Request=urllib.request.Request, urlopen=fake_urlopen)),
         }
@@ -216,6 +227,69 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         mid = storage.add_memory(101, content, "fact", source, db_path=self.db)
         lifecycle.link_memory_sources(101, mid, [source], now, db_path=self.db)
         return mid
+
+    def test_groq_saves_and_recalls_without_gemini_key_or_request(self):
+        self.ns["GEMINI_API_KEY"] = ""
+        self.assertEqual(self.save(101, 1000, "Я изучаю биологию", "Groq"), 1)
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.groq_calls, 1)
+        self.assertIn("Пользователь изучает биологию", self.read(101, "изучает биологию"))
+        self.assertIn("JSON-массив", self.last_groq_instruction)
+
+    def test_groq_natural_change_preserves_current_fact_and_revision_history(self):
+        mid = self.seed_old()
+        self.model_result = [{
+            "content": "Раньше работал учителем, сейчас работает психологом",
+            "kind": "fact", "confidence": 0.99,
+            "replaces_memory_id": mid, "replaces_content": "Работает учителем",
+            "revision_kind": "change",
+        }]
+        self.assertEqual(self.save(
+            101, 1001, "Раньше я работал учителем, теперь я психолог", "Groq"), 1)
+        self.assertEqual(storage.get_memory(101, mid, db_path=self.db)["source"],
+                         "telegram:private:101:1001")
+        self.assertEqual(len(lifecycle.list_memory_revisions(
+            101, mid, datetime.now(timezone.utc), db_path=self.db)), 1)
+        self.assertEqual(self.calls, 0)
+
+    def test_groq_invalid_extraction_cannot_write_sources_or_facts(self):
+        self.ns["request_groq"] = lambda *a, **kw: "Ответ без JSON"
+        with self.assertRaises(ValueError):
+            self.save(101, 1002, "Я изучаю биологию", "Groq")
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_sources(
+            101, datetime.now(timezone.utc), db_path=self.db), [])
+
+    def test_groq_revocation_during_extraction_prevents_writes(self):
+        original = self.ns["request_groq"]
+
+        def revoke(*args, **kwargs):
+            result = original(*args, **kwargs)
+            lifecycle.set_memory_consent(101, False, datetime.now(timezone.utc), db_path=self.db)
+            return result
+
+        self.ns["request_groq"] = revoke
+        self.assertEqual(self.save(101, 1003, "Я изучаю биологию", "Groq"), 0)
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_sources(
+            101, datetime.now(timezone.utc), db_path=self.db), [])
+
+    def test_groq_without_consent_sends_nothing(self):
+        lifecycle.set_memory_consent(101, False, datetime.now(timezone.utc), db_path=self.db)
+        self.assertEqual(self.save(101, 1004, "Я изучаю биологию", "Groq"), 0)
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.groq_calls, 0)
+
+    def test_groq_extraction_never_receives_another_users_facts(self):
+        self.seed_old()
+        now = datetime.now(timezone.utc)
+        foreign_source = "telegram:private:202:100"
+        lifecycle.register_message(202, foreign_source, "Увлекается шахматами", now, db_path=self.db)
+        mid = storage.add_memory(202, "Увлекается шахматами", "fact", foreign_source, db_path=self.db)
+        lifecycle.link_memory_sources(202, mid, [foreign_source], now, db_path=self.db)
+        self.assertEqual(self.save(101, 1005, "Я изучаю биологию", "Groq"), 1)
+        self.assertIn("Работает учителем", self.last_groq_extraction_prompt)
+        self.assertNotIn("Увлекается шахматами", self.last_groq_extraction_prompt)
 
     def test_natural_change_revises_current_fact_and_preserves_history(self):
         mid = self.seed_old()

@@ -7,10 +7,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from memory import coordinator, lifecycle, storage
 from memory.prompt_context import build_memory_context
+from memory.ai_providers import GroqRequestError, request_personal_ai
 
 
 NOW = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
@@ -197,7 +198,7 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Моя прежняя реплика", str(args[1]))
         self.assertNotIn("Чужая прежняя реплика", str(args[1]))
         self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ по текущему вопросу")
-        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос")
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Gemini")
         self.assertTrue(self.ns["DIALOG_HISTORY_FILE"].read_bytes().startswith(self.history_before))
 
     async def test_consent_revoked_during_request_prevents_archiving_and_delivery(self):
@@ -223,6 +224,55 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.request.assert_not_called()
         self.append.assert_not_called()
         self.ns["send_error_response"].assert_awaited_once()
+
+    async def test_actual_auto_fallback_keeps_own_context_and_saves_only_once(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+        self.context.application.bot_data["test_ai_mode"] = "auto"
+        self.ns["request_personal_ai"] = request_personal_ai
+
+        class GeminiUnavailable(Exception):
+            error_type = "unavailable"
+
+        self.ns["request_gemini"] = Mock(side_effect=GeminiUnavailable())
+        with patch("memory.ai_providers.request_groq", return_value="Ответ резерва") as backup:
+            await self.invoke()
+        backup.assert_called_once()
+        question, history, memory = backup.call_args.args
+        self.assertEqual(question, "Мой новый вопрос")
+        self.assertIn("Моя прежняя реплика", str(history))
+        self.assertNotIn("Чужая прежняя реплика", str(history))
+        self.assertEqual(memory, "Разрешённая память")
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ резерва")
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Groq")
+        self.ns["send_long_message"].assert_awaited_once()
+        self.ns["send_error_response"].assert_not_awaited()
+
+    async def test_both_providers_unavailable_preserves_previous_history(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+        self.context.application.bot_data["test_ai_mode"] = "auto"
+        self.ns["request_personal_ai"] = request_personal_ai
+
+        class GeminiUnavailable(Exception):
+            error_type = "timeout"
+
+        self.ns["request_gemini"] = Mock(side_effect=GeminiUnavailable())
+        with patch("memory.ai_providers.request_groq", side_effect=GroqRequestError("unavailable")):
+            await self.invoke()
+        self.append.assert_not_called()
+        self.extract.assert_not_called()
+        self.ns["send_error_response"].assert_awaited_once()
+        self.assertEqual(self.ns["DIALOG_HISTORY_FILE"].read_bytes(), self.history_before)
+
+    async def test_groq_extraction_failure_does_not_discard_the_successful_reply(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+        self.request.return_value = ("Ответ Groq", "Groq")
+        self.extract.side_effect = GroqRequestError("timeout")
+        with self.assertLogs(level="ERROR"):
+            await self.invoke()
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ Groq")
+        self.ns["send_long_message"].assert_awaited_once()
+        self.assertEqual(self.ns["send_long_message"].await_args.args[1], "Ответ Groq")
+        self.ns["send_error_response"].assert_not_awaited()
 
 
 if __name__ == "__main__":

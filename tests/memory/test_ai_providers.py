@@ -7,7 +7,8 @@ import socket
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from memory.ai_providers import (
     GroqRequestError, request_groq, request_personal_ai
@@ -63,6 +64,25 @@ class GroqProviderTests(unittest.TestCase):
                          personal_memory_context="Я люблю красные кактусы")
             sent = json.loads(fetch.call_args.args[0].data)["messages"]
             self.assertIn("красные кактусы", json.dumps(sent, ensure_ascii=False))
+
+    def test_explicit_extraction_instruction_uses_existing_client_without_history(self):
+        response = {"choices": [{"message": {"content": "[]"}}]}
+        with self.env(), patch("urllib.request.urlopen",
+                               return_value=io.BytesIO(json.dumps(response).encode())) as fetch:
+            self.assertEqual(request_groq("Сообщение пользователя",
+                             system_instruction="Верни только JSON-массив фактов"), "[]")
+            sent = json.loads(fetch.call_args.args[0].data)["messages"]
+        self.assertEqual(sent, [
+            {"role": "system", "content": "Верни только JSON-массив фактов"},
+            {"role": "user", "content": "Сообщение пользователя"},
+        ])
+
+    def test_invalid_extraction_instruction_fails_before_network(self):
+        for instruction in ("", "  ", False, 123, []):
+            with self.subTest(instruction=instruction), self.env(), patch("urllib.request.urlopen") as fetch:
+                with self.assertRaises(GroqRequestError):
+                    request_groq("Сообщение", system_instruction=instruction)
+                fetch.assert_not_called()
 
     def test_key_missing_fails_without_network(self):
         with patch.dict(os.environ, {}, clear=True), patch(
@@ -228,6 +248,88 @@ class GroqProviderTests(unittest.TestCase):
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
         self.assertIn('bot_data.get("test_ai_mode", "gemini")', bot)
         self.assertIn("if provider == \"Gemini\"", bot)
+
+
+class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        code = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.functions = {node.name: node for node in ast.parse(code).body
+                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.ns = {"OWNER_ID": 101, "os": os, "Update": object,
+                   "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object)}
+        for name in ("is_owner", "choose_ai_mode", "show_ai_mode"):
+            exec(compile(ast.Module(body=[self.functions[name]], type_ignores=[]),
+                         "bot.py", "exec"), self.ns)
+        self.context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+
+    async def invoke(self, command, *, user=101, chat_type="private"):
+        reply = AsyncMock()
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=user),
+                                 effective_chat=SimpleNamespace(type=chat_type),
+                                 effective_message=SimpleNamespace(text="/" + command, reply_text=reply))
+        callback = "show_ai_mode" if command == "ai_mode" else "choose_ai_mode"
+        await self.ns[callback](update, self.context)
+        return reply
+
+    async def test_owner_can_choose_auto_and_groq_in_actual_private_callbacks(self):
+        with patch.dict(os.environ, {"GROQ_API_KEY": KEY}, clear=True):
+            await self.invoke("ai_auto")
+            self.assertEqual(self.context.application.bot_data["test_ai_mode"], "auto")
+            self.assertTrue(self.context.application.bot_data["test_show_provider"])
+            reply = await self.invoke("ai_mode")
+            self.assertIn("auto", reply.await_args.args[0])
+            await self.invoke("ai_groq")
+            self.assertEqual(self.context.application.bot_data["test_ai_mode"], "groq")
+
+    async def test_participants_and_group_chats_cannot_change_or_read_owner_mode(self):
+        with patch.dict(os.environ, {"GROQ_API_KEY": KEY}, clear=True):
+            for user, chat in ((202, "private"), (101, "group")):
+                for command in ("ai_auto", "ai_groq", "ai_gemini", "ai_mode"):
+                    with self.subTest(user=user, chat=chat, command=command):
+                        reply = await self.invoke(command, user=user, chat_type=chat)
+                        reply.assert_not_awaited()
+        self.assertEqual(self.context.application.bot_data, {})
+
+    async def test_backup_key_missing_does_not_change_the_selected_mode(self):
+        self.context.application.bot_data["test_ai_mode"] = "gemini"
+        with patch.dict(os.environ, {}, clear=True):
+            for command in ("ai_auto", "ai_groq"):
+                reply = await self.invoke(command)
+                self.assertIn("GROQ_API_KEY", reply.await_args.args[0])
+                self.assertEqual(self.context.application.bot_data["test_ai_mode"], "gemini")
+
+    async def test_fresh_runtime_defaults_to_gemini_without_new_settings(self):
+        reply = await self.invoke("ai_mode")
+        self.assertIn("gemini", reply.await_args.args[0])
+
+    async def test_main_entrypoint_registers_the_owner_mode_callbacks(self):
+        registered = {}
+
+        def add_handler(handler):
+            if isinstance(handler, tuple):
+                registered[handler[0]] = handler
+
+        app = SimpleNamespace(add_handler=add_handler, run_polling=Mock())
+        builder = MagicMock()
+        builder.token.return_value = builder
+        builder.build.return_value = app
+        self.ns.update({
+            "Application": SimpleNamespace(builder=lambda: builder), "TOKEN": "FAKE",
+            "CommandHandler": lambda name, callback, **kw: (name, callback, kw.get("filters")),
+            "MessageHandler": lambda *args: None, "filters": MagicMock(),
+        })
+        for name in ("start", "analyze", "reset_dialog", "remember_command", "memories_command",
+                     "forget_command", "memory_on_command", "memory_off_command", "correct_command",
+                     "change_command", "history_command", "diagnostics", "testai", "groq_ping",
+                     "private_message", "save_message", "track_topic_changes"):
+            self.ns[name] = Mock()
+        exec(compile(ast.Module(body=[self.functions["main"]], type_ignores=[]), "bot.py", "exec"), self.ns)
+        self.ns["main"]()
+        for command in ("ai_gemini", "ai_groq", "ai_auto"):
+            self.assertIs(registered[command][1], self.ns["choose_ai_mode"])
+            self.assertIsNotNone(registered[command][2])
+        self.assertIs(registered["ai_mode"][1], self.ns["show_ai_mode"])
+        self.assertIsNotNone(registered["ai_mode"][2])
 
 
 if __name__ == "__main__":

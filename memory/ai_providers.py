@@ -1,4 +1,4 @@
-"""Text-only Groq backup for the isolated memory test bot.
+"""Text-only Groq backup for the authorized private AI conversation.
 
 The privacy and identity gate lives in bot.private_message. This module gets
 only the specific user's authorized history/context supplied by that gate.
@@ -68,7 +68,8 @@ def _describe_groq_http_error(error):
     return f"тип={safe_type}; код={safe_code}; {description}"
 
 
-def request_groq(question, history=None, personal_memory_context=None):
+def request_groq(question, history=None, personal_memory_context=None, *,
+                 system_instruction=None):
     """Make one explicit, bounded Groq chat request. No secret/body logging."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL).strip()
@@ -80,9 +81,13 @@ def request_groq(question, history=None, personal_memory_context=None):
         raise GroqRequestError(reason="Некорректная модель Groq")
     if not isinstance(question, str) or not question.strip():
         raise GroqRequestError(reason="Пустой запрос")
+    if system_instruction is not None and (
+        not isinstance(system_instruction, str) or not system_instruction.strip()
+    ):
+        raise GroqRequestError(reason="Некорректная инструкция запроса")
     if personal_memory_context:
         question = append_private_memory(question, personal_memory_context)
-    instructions = (
+    instructions = system_instruction if system_instruction is not None else (
         "Ты ИИ-помощник клуба «Психология Pro». Общайся на русском языке, "
         "естественно и по существу. Не выдумывай факты или события клуба. "
         "Не ставь диагнозы и не выдавай психологические гипотезы за факты. "
