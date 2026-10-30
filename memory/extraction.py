@@ -5,6 +5,7 @@ This module does not call AI services, write to SQLite, or modify bot.py.
 It validates and normalizes candidates produced by a separate AI adapter.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -12,6 +13,50 @@ VALID_KINDS = frozenset({"fact", "preference", "hypothesis"})
 MAX_CONTENT_LENGTH = 2000
 MAX_SOURCE_LENGTH = 500
 MAX_CANDIDATES = 30
+
+
+def has_statement_for_extraction(message_text):
+    """Reject explicit question-only messages before any candidate can be saved.
+
+    This is a conservative punctuation guard, not a semantic fact classifier.
+    Mixed statements/questions still go through the normal extraction checks.
+    """
+    if not isinstance(message_text, str):
+        raise ValueError("Message must be text")
+    text = message_text.strip()
+    if not text or text.startswith("/"):
+        return False
+    quoted = text.rstrip(".! ")
+    if re.fullmatch(r'«[^»]*»|"[^"\r\n]*"', quoted):
+        text = quoted[1:-1]
+    # A question mark in a quoted title is not a question from the user.
+    text = re.sub(
+        r'«[^»]*»|"[^"\r\n]*"',
+        lambda match: re.sub(r"[.!?\r\n]", " ", match.group()),
+        text,
+    )
+    for match in re.finditer(r"([^.!?\r\n]+)([.!?]*)", text):
+        clause, punctuation = match.groups()
+        if "?" in punctuation:
+            # A declaration can precede a question within one sentence.
+            before_question = re.split(
+                r"[,;]\s*(?=(?:как|что|какие|какой|где|when|what|how)\b)",
+                clause, maxsplit=1, flags=re.IGNORECASE,
+            )
+            if len(before_question) == 2 and re.match(
+                r"\s*(?:я|мне|мой|моя|моё|мои|i|my)\b", before_question[0],
+                flags=re.IGNORECASE,
+            ):
+                return True
+            continue
+        if re.fullmatch(
+            r"\W*(?:спасибо|благодарю|пожалуйста|привет|здравствуйте|thank you|thanks)\W*",
+            clause, flags=re.IGNORECASE,
+        ):
+            continue
+        if re.search(r"[^\W\d_]", clause):
+            return True
+    return False
 
 
 @dataclass(frozen=True)

@@ -21,6 +21,7 @@ from memory.ai_providers import (
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
+from memory.extraction import has_statement_for_extraction
 
 from telegram import Update
 from telegram.ext import (
@@ -872,6 +873,10 @@ def request_gemini(
             "уточнения и продолжение темы. "
             "Переданная история относится "
             "только к текущему пользователю. "
+            "Различай прежнее и текущее состояние: если пользователь явно "
+            "заменил предпочтение или исправил факт, актуальна новая версия. "
+            "Не перечисляй прежнее предпочтение как действующее одновременно "
+            "с новым; прежнее упоминай только как прошлое, когда это уместно. "
             "Не утверждай, что помнишь "
             "сообщения, которых нет "
             "в переданном контексте. "
@@ -1581,7 +1586,7 @@ async def reset_dialog(
                 "Начат новый личный разговор.\n\n"
                 "Предыдущая переписка сохранена "
                 "в полной истории, но больше "
-                "не передаётся Gemini "
+                "не передаётся ИИ "
                 "как текущий контекст."
             )
 
@@ -1613,6 +1618,8 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
         return 0
     if not personal_lifecycle.has_memory_consent(user_id):
         return 0
+    if not has_statement_for_extraction(question):
+        return 0
     source = f"telegram:private:{user_id}:{message_id}"
     personal_lifecycle.initialize_lifecycle()
     now_before_gemini = datetime.now(timezone.utc)
@@ -1633,6 +1640,10 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
         "его предпочтениях, проектах и долгосрочных целях. "
         "Не сохраняй чужие данные, секреты, медицинские подробности, "
         "предположения или разовые вопросы. Ничего не придумывай. "
+        "Источником новых фактов служат только утверждения в СООБЩЕНИИ "
+        "ПОЛЬЗОВАТЕЛЯ, а не вопрос и не ЗАПИСИ ДЛЯ СВЕРКИ. "
+        "Не возвращай уже известный факт заново даже при другой формулировке; "
+        "если новых утверждений нет, верни []. "
         "Если пользователь ПРЯМО сообщил об изменении ранее сохранённого "
         "обстоятельства (раньше/теперь/сейчас) или явно исправляет "
         "ошибку, можно предложить замену только одной ТОЧНО подходящей "
@@ -1640,8 +1651,8 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
         "replaces_memory_id (точный id), replaces_content (точный текст "
         "записи без изменений) и revision_kind (change или correction). "
         "Не замещай запись по догадке, при неясности оставь эти поля пустыми. "
-        "Для изменений отрази прошлое и настоящее в content, если оба "
-        "состояния прямо подтверждены сообщением. "
+        "Для замены укажи в content только актуальное состояние. "
+        "Прежняя версия сохраняется отдельно в истории изменений. "
         "Ответ — только JSON-массив до пяти объектов: "
         "content (факт на русском), kind (fact или preference), "
         "confidence (число от 0 до 1), необязательные поля замены. "

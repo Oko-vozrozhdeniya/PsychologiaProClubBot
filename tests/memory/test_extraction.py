@@ -6,10 +6,33 @@ from memory.extraction import (
     validate_candidate,
     extract_candidates,
     candidate_to_storage_record,
+    has_statement_for_extraction,
 )
 
 
 class TestMemoryExtraction(unittest.TestCase):
+
+    def test_question_only_messages_are_not_memory_statements(self):
+        for text in ("Какие модели кораблей мне нравятся?",
+                     "Что я люблю? Что я предпочитаю теперь?",
+                     "Спасибо! Какие кактусы мне нравятся?",
+                     "Какие кактусы мне нравятся?\nСпасибо! 🙏",
+                     '"Какие кактусы мне нравятся?"',
+                     "«Какие кактусы мне нравятся?».",
+                     "What do I prefer now?", "", "   ", "/reset"):
+            with self.subTest(text=text):
+                self.assertFalse(has_statement_for_extraction(text))
+
+    def test_mixed_message_still_allows_a_new_fact_or_correction(self):
+        for text in ("Я изучаю биологию. Как организовать занятия?",
+                     "Как лучше заниматься? Я изучаю биологию",
+                     "Теперь предпочитаю металлические модели! Что посоветуешь?",
+                     "Мне нравятся металлические модели, какие посоветуешь?",
+                     "Я изучаю биологию; как лучше заниматься?",
+                     "Я люблю чай", "Моя любимая книга «Что делать?».",
+                     'Моя любимая книга "Что делать?".'):
+            with self.subTest(text=text):
+                self.assertTrue(has_statement_for_extraction(text))
 
     def test_valid_candidate(self):
         result = validate_candidate({

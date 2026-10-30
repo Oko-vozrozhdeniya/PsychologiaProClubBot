@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from memory import coordinator, storage, lifecycle
 from memory.coordinator import AccessPolicy
+from memory.extraction import has_statement_for_extraction
 
 
 class SemanticMemoryWiringTests(unittest.TestCase):
@@ -43,6 +44,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             "timezone": timezone,
             "timedelta": timedelta,
             "AccessPolicy": AccessPolicy,
+            "has_statement_for_extraction": has_statement_for_extraction,
             "save_dialog_candidates": lambda *args, **kw: coordinator.save_dialog_candidates(
                 *args, db_path=self.db, **kw),
             "personal_storage": SimpleNamespace(

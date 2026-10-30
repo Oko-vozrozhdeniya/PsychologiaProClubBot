@@ -178,6 +178,32 @@ class CoordinatorPersistenceTests(unittest.TestCase):
         self.assertEqual(lifecycle.list_live_sources(1, NOW, db_path=self.db), sources)
         self.assertEqual(len(storage.list_memories(1, db_path=self.db)), 1)
 
+    def test_question_cannot_persist_a_rephrased_recalled_fact(self):
+        mid = self.remember()
+        before_sources = lifecycle.list_live_sources(1, NOW, db_path=self.db)
+        self.assertEqual(self.automatic(
+            message_text="Какие кактусы мне нравятся?",
+            raw_candidates=[{"content": "Пользователь выращивает фиолетовые кактусы",
+                             "kind": "preference", "confidence": 0.99}],
+            visible_memories=lifecycle.list_live_memories(1, NOW, db_path=self.db),
+        ), 0)
+        self.assertEqual([item["id"] for item in storage.list_memories(
+            1, db_path=self.db)], [mid])
+        self.assertEqual(lifecycle.list_live_sources(1, NOW, db_path=self.db), before_sources)
+
+    def test_question_cannot_replace_current_memory_even_with_revision_metadata(self):
+        mid = self.remember()
+        self.assertEqual(self.automatic(
+            message_text="Какие кактусы мне нравятся теперь?",
+            raw_candidates=[{"content": "Теперь предпочитает жёлтые кактусы",
+                             "kind": "preference", "confidence": 0.99,
+                             "replaces_memory_id": mid, "replaces_content": self.content,
+                             "revision_kind": "change"}],
+            visible_memories=lifecycle.list_live_memories(1, NOW, db_path=self.db),
+        ), 0)
+        self.assertEqual(storage.get_memory(1, mid, db_path=self.db)["content"], self.content)
+        self.assertEqual(lifecycle.list_memory_revisions(1, mid, NOW, db_path=self.db), [])
+
     def test_delete_after_opt_out_removes_current_and_revision_without_replay(self):
         self.assertEqual(self.automatic(), 1)
         old = storage.list_memories(1, db_path=self.db)[0]

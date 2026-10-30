@@ -6,7 +6,9 @@ stored consent and independently verified, live participant sources.
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from memory.extraction import extract_candidates, candidate_to_storage_record
+from memory.extraction import (
+    extract_candidates, candidate_to_storage_record, has_statement_for_extraction,
+)
 from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
@@ -241,6 +243,8 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
     kwargs = {"db_path": db_path} if db_path is not None else {}
     moment = _write_policy(user_id, policy, now, kwargs)
     _private_source(user_id, source)
+    if not has_statement_for_extraction(message_text):
+        return 0
     if not isinstance(raw_candidates, list) or len(raw_candidates) > 5:
         raise ValueError("Invalid memory extraction response")
     if not isinstance(visible_memories, (list, tuple)):

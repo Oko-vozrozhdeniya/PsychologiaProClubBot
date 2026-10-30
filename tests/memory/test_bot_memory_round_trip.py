@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from memory import coordinator, storage, lifecycle
 from memory.coordinator import AccessPolicy, SourcePermission, read_context
 from memory.prompt_context import build_memory_context
+from memory.extraction import has_statement_for_extraction
 
 
 def load_function(name, namespace):
@@ -100,6 +101,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             "forget_memory": lambda *args, **kw: coordinator.forget_memory(
                 *args, db_path=self.db, **kw),
             "build_memory_context": build_memory_context,
+            "has_statement_for_extraction": has_statement_for_extraction,
             "read_context": lambda uid, q, pol, perms, now, **kw: read_context(
                 uid, q, pol, perms, now, db_path=self.db, **kw),
             "personal_storage": self.personal_storage,
@@ -235,6 +237,35 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.assertEqual(self.groq_calls, 1)
         self.assertIn("Пользователь изучает биологию", self.read(101, "изучает биологию"))
         self.assertIn("JSON-массив", self.last_groq_instruction)
+
+    def test_recall_questions_never_reextract_or_duplicate_existing_memory(self):
+        original = "Пользователь теперь предпочитает жёлтые кактусы вместо фиолетовых"
+        self.model_result = [{"content": original, "kind": "preference", "confidence": 0.99}]
+        self.assertEqual(self.save(101, 1100, "Теперь мне нравятся жёлтые кактусы"), 1)
+        before = storage.list_memories(101, db_path=self.db)
+        sources = lifecycle.list_live_sources(101, datetime.now(timezone.utc), db_path=self.db)
+        self.model_result = [{"content": "Пользователь предпочитает выращивать жёлтые кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        calls = (self.calls, self.groq_calls)
+        for message_id, provider in enumerate(("Gemini", "Groq"), 1101):
+            with self.subTest(provider=provider):
+                self.assertEqual(self.save(
+                    101, message_id, "Какие кактусы мне нравятся?", provider), 0)
+        self.assertEqual((self.calls, self.groq_calls), calls)
+        self.assertEqual(storage.list_memories(101, db_path=self.db), before)
+        self.assertEqual(lifecycle.list_live_sources(
+            101, datetime.now(timezone.utc), db_path=self.db), sources)
+        self.assertIn(original, self.read(101, "Какие кактусы мне нравятся?"))
+
+    def test_question_with_a_new_declarative_fact_is_still_saved_by_each_provider(self):
+        for message_id, provider in enumerate(("Gemini", "Groq"), 1120):
+            with self.subTest(provider=provider):
+                self.model_result = [{"content": "Изучает биологию " + provider,
+                                      "kind": "fact", "confidence": 0.99}]
+                self.assertEqual(self.save(
+                    101, message_id, "Я изучаю биологию. Как лучше организовать занятия?",
+                    provider), 1)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
 
     def test_groq_natural_change_preserves_current_fact_and_revision_history(self):
         mid = self.seed_old()
