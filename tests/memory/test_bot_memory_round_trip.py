@@ -101,7 +101,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.read = load_function("read_explicit_memory_prompt", ns)
         self.ns = ns
 
-    def command(self, name, args=(), *, user=101, message_id=700):
+    def command(self, name, args=(), *, user=101, message_id=700, chat_type="private"):
         replies = []
 
         async def reply_text(text):
@@ -110,12 +110,13 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.ns.update({
             "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
             "dialog_lock": asyncio.Lock(),
-            "has_personal_ai_access": lambda update: update.effective_user.id in (101, 202),
             "logger": logging.getLogger(__name__),
         })
+        for helper in ("is_owner", "has_personal_ai_access", "has_memory_test_access"):
+            load_function(helper, self.ns)
         fn = load_function(name, self.ns)
         update = SimpleNamespace(
-            effective_chat=SimpleNamespace(type="private"),
+            effective_chat=SimpleNamespace(type=chat_type),
             effective_user=SimpleNamespace(id=user),
             effective_message=SimpleNamespace(
                 message_id=message_id, text="/command " + " ".join(args), reply_text=reply_text),
@@ -152,11 +153,61 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
     def test_actual_forget_command_cannot_delete_another_users_memory(self):
         self.assertEqual(self.save(101, 500, "Я изучаю биологию"), 1)
         mid = storage.list_memories(101, db_path=self.db)[0]["id"]
-        self.assertIn("не найдена", self.command("forget_command", [str(mid)], user=202)[0])
+        self.assertEqual(self.command("forget_command", [str(mid)], user=202), [])
         self.assertIsNotNone(storage.get_memory(101, mid, db_path=self.db))
 
     def test_actual_forget_command_rejects_zero_id(self):
         self.assertEqual(self.command("forget_command", ["0"]), ["Напиши /forget номер_записи"])
+
+    def test_participant_cannot_delete_own_memory_or_toggle_test_processing(self):
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+        self.assertEqual(self.save(202, 900, "Я изучаю биологию"), 1)
+        mid = storage.list_memories(202, db_path=self.db)[0]["id"]
+        for name in ("forget_command", "memory_off_command", "remember_command",
+                     "revise_command", "memories_command", "history_command"):
+            with self.subTest(command=name):
+                self.assertEqual(self.command(name, [str(mid), "Другой факт"], user=202), [])
+        self.assertTrue(lifecycle.has_memory_consent(202, db_path=self.db))
+        self.assertEqual(storage.get_memory(202, mid, db_path=self.db)["content"],
+                         "Пользователь изучает биологию")
+
+    def test_owner_test_commands_in_group_cannot_change_private_data(self):
+        self.assertEqual(self.save(101, 500, "Я изучаю биологию"), 1)
+        mid = storage.list_memories(101, db_path=self.db)[0]["id"]
+        for name in ("forget_command", "memory_off_command", "remember_command",
+                     "revise_command", "memories_command", "history_command"):
+            with self.subTest(command=name):
+                self.assertEqual(self.command(name, [str(mid), "Другой факт"], chat_type="group"), [])
+        self.assertTrue(lifecycle.has_memory_consent(101, db_path=self.db))
+        self.assertIsNotNone(storage.get_memory(101, mid, db_path=self.db))
+
+    def test_participant_consent_does_not_advertise_owner_only_commands(self):
+        replies = self.command("memory_on_command", user=202)
+        self.assertTrue(lifecycle.has_memory_consent(202, db_path=self.db))
+        self.assertIn("обработк", replies[0])
+        self.assertNotIn("/forget", replies[0])
+        self.assertNotIn("/memory_off", replies[0])
+
+    def test_participant_can_naturally_update_memory_without_owner_commands(self):
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+        self.model_result = [{"content": "Любит выращивать фиолетовые кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        self.assertEqual(self.save(202, 910, "Мне нравятся фиолетовые кактусы"), 1)
+        old = storage.list_memories(202, db_path=self.db)[0]
+        self.model_result = [{
+            "content": "Теперь любит выращивать жёлтые кактусы вместо фиолетовых",
+            "kind": "preference", "confidence": 0.99,
+            "replaces_memory_id": old["id"], "replaces_content": old["content"],
+            "revision_kind": "change",
+        }]
+        self.assertEqual(self.save(
+            202, 911, "Раньше нравились фиолетовые кактусы, теперь люблю жёлтые"), 1)
+        current = storage.list_memories(202, db_path=self.db)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["id"], old["id"])
+        self.assertIn("Теперь любит выращивать жёлтые", self.read(
+            202, "Какие кактусы мне нравится выращивать?"))
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
 
     def seed_old(self, content="Работает учителем"):
         source = "telegram:private:101:100"

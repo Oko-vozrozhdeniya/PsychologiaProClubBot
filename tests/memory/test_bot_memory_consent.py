@@ -1,10 +1,13 @@
 """Integration-oriented checks for real bot.py coordinator wiring and consent."""
 import ast
+import asyncio
+import logging
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 from memory import coordinator, lifecycle, storage
 from memory.prompt_context import build_memory_context
@@ -119,6 +122,107 @@ class PrivateMemoryConsentTests(unittest.TestCase):
             and isinstance(n.args[0], ast.Constant)
         }
         self.assertTrue({"memory_on", "memory_off"}.issubset(registered))
+
+
+class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.db = self.root / "memory.db"
+        lifecycle.initialize_lifecycle(self.db)
+        code = (Path(__file__).resolve().parents[2] / "bot.py").read_text(encoding="utf-8")
+        names = {node.name: node for node in ast.parse(code).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.request = Mock(return_value=("Ответ по текущему вопросу", "Gemini"))
+        self.extract = Mock(return_value=1)
+        self.lookup = Mock(return_value="Разрешённая память")
+        self.ns = {
+            "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
+            "OWNER_ID": 101, "TEST_USER_IDS": {202},
+            "DATA_DIR": self.root, "DIALOG_STATE_FILE": self.root / "state.json",
+            "DIALOG_HISTORY_FILE": self.root / "history.jsonl",
+            "MAX_DIALOG_PAIRS": 30, "MAX_DIALOG_CHARS": 30000,
+            "datetime": datetime, "timezone": timezone, "asyncio": asyncio,
+            "dialog_lock": asyncio.Lock(), "logger": logging.getLogger(__name__),
+            "personal_lifecycle": SimpleNamespace(
+                has_memory_consent=lambda uid: lifecycle.has_memory_consent(uid, db_path=self.db)),
+            "read_explicit_memory_prompt": self.lookup,
+            "request_personal_ai": self.request, "request_gemini": Mock(),
+            "remember_dialog_facts": self.extract,
+            "send_long_message": AsyncMock(), "send_error_response": AsyncMock(),
+        }
+        import json
+        import os
+        self.ns.update(json=json, os=os)
+        for name in ("has_personal_ai_access", "read_dialog_state", "save_dialog_state",
+                     "get_session_id", "append_dialog_record", "read_recent_dialog", "private_message"):
+            exec(compile(ast.Module(body=[names[name]], type_ignores=[]), "bot.py", "exec"), self.ns)
+        self.ns["append_dialog_record"](101, 0, "Чужая прежняя реплика", "Чужой ответ")
+        self.ns["append_dialog_record"](202, 0, "Моя прежняя реплика", "Мой прежний ответ")
+        self.history_before = self.ns["DIALOG_HISTORY_FILE"].read_bytes()
+        self.append = Mock(wraps=self.ns["append_dialog_record"])
+        self.history = Mock(wraps=self.ns["read_recent_dialog"])
+        self.ns.update(append_dialog_record=self.append, read_recent_dialog=self.history)
+        self.reply = AsyncMock()
+        message = SimpleNamespace(text="Мой новый вопрос", message_id=12, reply_text=self.reply)
+        self.update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=202),
+            effective_chat=SimpleNamespace(type="private"),
+            effective_message=message, message=message,
+        )
+        self.context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+
+    async def invoke(self):
+        await self.ns["private_message"](self.update, self.context)
+
+    async def test_without_consent_neither_history_nor_ai_nor_archive_is_used(self):
+        await self.invoke()
+        self.history.assert_not_called()
+        self.lookup.assert_not_called()
+        self.request.assert_not_called()
+        self.append.assert_not_called()
+        self.extract.assert_not_called()
+        self.ns["send_long_message"].assert_not_awaited()
+        self.assertIn("согласие", self.reply.await_args.args[0].lower())
+        self.assertEqual(self.ns["DIALOG_HISTORY_FILE"].read_bytes(), self.history_before)
+
+    async def test_consent_allows_current_users_dialog_without_changing_old_archive(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+        await self.invoke()
+        self.ns["send_error_response"].assert_not_awaited()
+        self.request.assert_called_once()
+        args = self.request.call_args.args
+        self.assertEqual(args[0], "Мой новый вопрос")
+        self.assertIn("Моя прежняя реплика", str(args[1]))
+        self.assertNotIn("Чужая прежняя реплика", str(args[1]))
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ по текущему вопросу")
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос")
+        self.assertTrue(self.ns["DIALOG_HISTORY_FILE"].read_bytes().startswith(self.history_before))
+
+    async def test_consent_revoked_during_request_prevents_archiving_and_delivery(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+
+        def revoke(*args):
+            lifecycle.set_memory_consent(202, False, NOW, db_path=self.db)
+            return "Ответ, который уже не должен сохраняться", "Gemini"
+
+        self.request.side_effect = revoke
+        await self.invoke()
+        self.request.assert_called_once()
+        self.append.assert_not_called()
+        self.extract.assert_not_called()
+        self.ns["send_long_message"].assert_not_awaited()
+        self.assertEqual(self.ns["DIALOG_HISTORY_FILE"].read_bytes(), self.history_before)
+
+    async def test_unavailable_consent_store_fails_closed(self):
+        self.ns["personal_lifecycle"].has_memory_consent = Mock(side_effect=OSError("unavailable"))
+        await self.invoke()
+        self.history.assert_not_called()
+        self.lookup.assert_not_called()
+        self.request.assert_not_called()
+        self.append.assert_not_called()
+        self.ns["send_error_response"].assert_awaited_once()
 
 
 if __name__ == "__main__":

@@ -98,6 +98,12 @@ def has_personal_ai_access(update):
     )
 
 
+def has_memory_test_access(update):
+    """Keep technical memory controls separate from participant AI access."""
+    chat = update.effective_chat
+    return bool(chat and chat.type == "private" and is_owner(update))
+
+
 SUPPORT_ADVICE = (
     "\n\nЕсли проблема повторяется, "
     "обратитесь в службу поддержки клуба "
@@ -1182,6 +1188,9 @@ async def start(
         "Вы можете просто написать мне "
         "сообщение для свободного общения."
         "\n\n"
+        "Перед первым личным диалогом: /memory_on "
+        "— согласие на обработку информации."
+        "\n\n"
         "Я учитываю последние сообщения "
         "разговора и сохраняю полную "
         "историю переписки."
@@ -1353,14 +1362,21 @@ async def private_message(
         return
 
     message = update.effective_message
-    question = message.text.strip()
-
-    if not question:
-        return
 
     async with dialog_lock:
         try:
             user_id = update.effective_user.id
+            if not await asyncio.to_thread(
+                personal_lifecycle.has_memory_consent, user_id
+            ):
+                await message.reply_text(
+                    "Для личного диалога с ИИ требуется согласие на обработку "
+                    "информации. Его можно дать командой /memory_on."
+                )
+                return
+            question = message.text.strip()
+            if not question:
+                return
             state = read_dialog_state()
 
             session_id = get_session_id(
@@ -1395,6 +1411,15 @@ async def private_message(
                 mode,
                 request_gemini,
             )
+            # A request already in flight may outlive the stored consent.
+            if not await asyncio.to_thread(
+                personal_lifecycle.has_memory_consent, user_id
+            ):
+                await message.reply_text(
+                    "Обработка личного диалога приостановлена: согласие "
+                    "на обработку информации больше не действует."
+                )
+                return
 
             append_dialog_record(
                 user_id,
@@ -1704,7 +1729,7 @@ def read_explicit_memory_prompt(user_id, query):
     return build_memory_context(context)
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    if not has_memory_test_access(update):
         return
     content = " ".join(context.args).strip()
     if not content or len(content) > 2000:
@@ -1741,7 +1766,7 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    if not has_memory_test_access(update):
         return
     user_id = update.effective_user.id
     async with dialog_lock:
@@ -1765,7 +1790,7 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    if not has_memory_test_access(update):
         return
     if (len(context.args) != 1 or not context.args[0].isdigit()
             or int(context.args[0]) <= 0):
@@ -1788,38 +1813,36 @@ async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def memory_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Explicit, durable consent for the optional long-term memory feature."""
+    """Record explicit consent before processing the private AI conversation."""
     if update.effective_chat.type != "private" or not has_personal_ai_access(update):
         return
     user_id = update.effective_user.id
     async with dialog_lock:
         personal_lifecycle.set_memory_consent(user_id, True, datetime.now(timezone.utc))
     await update.effective_message.reply_text(
-        "Личная долговременная память включена по твоему согласию. "
-        "Значимые факты из личных сообщений могут сохраняться на срок "
-        "действия исходных сообщений (до 365 дней). "
-        "Отключить: /memory_off. Просмотреть: /memories."
+        "Согласие на обработку информации личного диалога принято. "
+        "Теперь можно общаться с ИИ."
     )
 
 
 async def memory_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stop future use and collection; do not silently destroy old records."""
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    """Owner's technical consent-revocation test; never delete stored data."""
+    if not has_memory_test_access(update):
         return
     user_id = update.effective_user.id
     async with dialog_lock:
         personal_lifecycle.set_memory_consent(user_id, False, datetime.now(timezone.utc))
     await update.effective_message.reply_text(
-        "Личная долговременная память отключена: новые факты не сохраняются, "
-        "старые не используются в ответах. Ранее сохранённые записи "
-        "не удалены. Посмотреть их: /memories; удалить запись: /forget номер."
+        "Служебная проверка: согласие на тестовую обработку отозвано. "
+        "Личный диалог с ИИ и пополнение памяти приостановлены. "
+        "Переписка и записи не удалены. Возобновить: /memory_on."
     )
 
 
 async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          change_kind):
     """A confirmed user's correction or real-life change, never an AI guess."""
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    if not has_memory_test_access(update):
         return
     args = context.args
     if len(args) < 2 or not args[0].isdigit():
@@ -1890,7 +1913,7 @@ async def change_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User-only view of previous versions, never sent as current AI context."""
-    if update.effective_chat.type != "private" or not has_personal_ai_access(update):
+    if not has_memory_test_access(update):
         return
     if len(context.args) != 1 or not context.args[0].isdigit():
         await update.effective_message.reply_text("Формат: /history номер_записи")

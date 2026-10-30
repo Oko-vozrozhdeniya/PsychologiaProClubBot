@@ -78,8 +78,8 @@ async def verify_test_bot_identity(application, expected_username):
 async def start_test(update, context):
     await update.effective_message.reply_text(
         "Это тестовый режим памяти «Психология PRO».\n"
-        "Сначала /memory_on — согласие на тестовую память.\n"
-        "Затем /remember <текст>, /memories, /correct <номер> <новый текст>, "
+        "Сначала /memory_on — согласие на обработку информации личного диалога.\n"
+        "Служебные проверки владельца: /remember <текст>, /memories, /correct <номер> <новый текст>, "
         "/change <номер> <новый текст>, /history <номер>.\n"
         "Проверка извлечения: /check_memory <слова из факта>.\n"
         "Диагностика страны сервера: /network_check.\n"
@@ -88,7 +88,7 @@ async def start_test(update, context):
         "Режим ИИ: /ai_gemini, /ai_groq, /ai_auto, /ai_mode.\n"
         "Проверка доступности Groq API: /groq_check.\n"
         "Показать исходящий IPv4 контейнера: /ip_check.\n"
-        "Остановить использование памяти: /memory_off.\n"
+        "Служебная проверка отзыва согласия: /memory_off; сохранённые данные остаются.\n"
         "Пожалуйста, используйте вымышленные данные при проверке."
     )
 
