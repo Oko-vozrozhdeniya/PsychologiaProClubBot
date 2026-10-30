@@ -139,6 +139,39 @@ def list_live_memories(user_id, now, *, db_path=storage.DATABASE_PATH):
         return [dict(row) for row in rows]
 
 
+def add_memory(user_id, content, kind, source, now, *, db_path=storage.DATABASE_PATH):
+    """Atomically save a consented memory and link its registered live source."""
+    storage._validate_user_id(user_id)
+    content = storage._validate_text(content, "content")
+    source = storage._validate_text(source, "source")
+    if len(content) > 2000 or kind not in storage.VALID_KINDS:
+        raise ValueError("Invalid memory content or kind")
+    if not source.startswith(f"telegram:private:{user_id}:"):
+        raise PermissionError("Invalid participant source")
+    moment = _iso(now)
+    with storage._connection(db_path) as db:
+        # Serialize the consent/source check and both writes with opt-out and
+        # source deletion. A failed linkage rolls back the memory as well.
+        db.execute("BEGIN IMMEDIATE")
+        consent = db.execute("SELECT enabled FROM memory_consents WHERE user_id=?",
+                             (user_id,)).fetchone()
+        if not consent or consent["enabled"] != 1:
+            raise PermissionError("Explicit memory consent required")
+        live = db.execute("""SELECT 1 FROM private_messages WHERE user_id=?
+                             AND message_id=? AND expires_at>?""",
+                          (user_id, source, moment)).fetchone()
+        if not live:
+            raise PermissionError("Missing or expired participant source")
+        cursor = db.execute("""INSERT INTO memories
+            (user_id, content, kind, source, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, content, kind, source, moment, moment))
+        memory_id = cursor.lastrowid
+        db.execute("""INSERT INTO memory_sources (user_id, memory_id, message_id)
+                      VALUES (?, ?, ?)""", (user_id, memory_id, source))
+    return memory_id
+
+
 def purge_expired(now, *, db_path=storage.DATABASE_PATH):
     """Atomically expire messages and remove memories without live sources.
 
@@ -289,6 +322,7 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
     moment = _moment(now)
     expiry = (moment + timedelta(days=RETENTION_DAYS)).isoformat()
     with storage._connection(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
         consent = db.execute(
             "SELECT enabled FROM memory_consents WHERE user_id=?", (user_id,)
         ).fetchone()

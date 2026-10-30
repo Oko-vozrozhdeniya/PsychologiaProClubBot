@@ -8,16 +8,14 @@ import io
 import json
 import logging
 import os
-import re
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from memory import storage, lifecycle
-from memory.coordinator import AccessPolicy, SourcePermission, read_context, prepare_candidates
-from memory.extraction import extract_candidates
+from memory import coordinator, storage, lifecycle
+from memory.coordinator import AccessPolicy, SourcePermission, read_context
 from memory.prompt_context import build_memory_context
 
 
@@ -40,7 +38,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         lifecycle.set_memory_consent(101, True, datetime.now(timezone.utc), db_path=self.db)
         self.personal_storage = SimpleNamespace(
             initialize_database=lambda: storage.initialize_database(self.db),
-            add_memory=lambda uid, c, k, src: storage.add_memory(uid, c, k, src, db_path=self.db),
+            get_memory=lambda uid, mid: storage.get_memory(uid, mid, db_path=self.db),
         )
         self.personal_lifecycle = SimpleNamespace(
             initialize_lifecycle=lambda: lifecycle.initialize_lifecycle(self.db),
@@ -57,6 +55,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                 db_path=self.db, **kw),
             delete_message=lambda uid, src: lifecycle.delete_message(uid, src, db_path=self.db),
             purge_expired=lambda t: lifecycle.purge_expired(t, db_path=self.db),
+            set_memory_consent=lambda uid, enabled, now: lifecycle.set_memory_consent(
+                uid, enabled, now, db_path=self.db),
         )
         self.calls = 0
 
@@ -79,11 +79,16 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             "GEMINI_API_KEY": "test", "GEMINI_MODEL": "test",
             "GEMINI_TIMEOUT": 2, "OWNER_ID": 101, "TEST_USER_IDS": {202},
             "json": json, "datetime": datetime, "timezone": timezone,
-            "timedelta": timedelta, "re": re, "AccessPolicy": AccessPolicy,
+            "timedelta": timedelta, "AccessPolicy": AccessPolicy,
             "SourcePermission": SourcePermission,
-            "prepare_candidates": prepare_candidates,
-            "prepare_correction": __import__("memory.coordinator", fromlist=["prepare_correction"]).prepare_correction,
-            "extract_candidates": extract_candidates,
+            "save_dialog_candidates": lambda *args, **kw: coordinator.save_dialog_candidates(
+                *args, db_path=self.db, **kw),
+            "remember_memory": lambda *args, **kw: coordinator.remember_memory(
+                *args, db_path=self.db, **kw),
+            "revise_memory": lambda *args, **kw: coordinator.revise_memory(
+                *args, db_path=self.db, **kw),
+            "forget_memory": lambda *args, **kw: coordinator.forget_memory(
+                *args, db_path=self.db, **kw),
             "build_memory_context": build_memory_context,
             "read_context": lambda uid, q, pol, perms, now, **kw: read_context(
                 uid, q, pol, perms, now, db_path=self.db, **kw),
@@ -94,6 +99,64 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         }
         self.save = load_function("remember_dialog_facts", ns)
         self.read = load_function("read_explicit_memory_prompt", ns)
+        self.ns = ns
+
+    def command(self, name, args=(), *, user=101, message_id=700):
+        replies = []
+
+        async def reply_text(text):
+            replies.append(text)
+
+        self.ns.update({
+            "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
+            "dialog_lock": asyncio.Lock(),
+            "has_personal_ai_access": lambda update: update.effective_user.id in (101, 202),
+            "logger": logging.getLogger(__name__),
+        })
+        fn = load_function(name, self.ns)
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(type="private"),
+            effective_user=SimpleNamespace(id=user),
+            effective_message=SimpleNamespace(
+                message_id=message_id, text="/command " + " ".join(args), reply_text=reply_text),
+        )
+        context = SimpleNamespace(args=list(args))
+        if name == "revise_command":
+            asyncio.run(fn(update, context, "change"))
+        else:
+            asyncio.run(fn(update, context))
+        return replies
+
+    def test_actual_commands_save_revise_revoke_and_delete_through_coordinator(self):
+        content = "Пользователь изучает биологию"
+        self.assertIn("Запомнил", self.command("remember_command", content.split())[0])
+        mid = storage.list_memories(101, db_path=self.db)[0]["id"]
+        self.assertIn(content, self.read(101, "изучает биологию"))
+        changed = "Пользователь теперь изучает ботанику"
+        args = [str(mid)] + changed.split()
+        self.assertIn("Обновил", self.command("revise_command", args, message_id=701)[0])
+        self.assertIn(changed, self.read(101, "изучает ботанику"))
+        self.assertIn("уже такая", self.command("revise_command", args, message_id=702)[0])
+        self.command("memory_off_command")
+        self.assertEqual(self.read(101, "изучает ботанику"), "")
+        self.assertIsNotNone(storage.get_memory(101, mid, db_path=self.db))
+        self.assertIn("Запись удалена", self.command("forget_command", [str(mid)])[0])
+        self.command("memory_on_command")
+        self.assertEqual(self.read(101, "изучает ботанику"), "")
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+        self.assertEqual(self.save(101, 700, content), 0)
+        with storage._connection(self.db) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0], 0)
+
+    def test_actual_forget_command_cannot_delete_another_users_memory(self):
+        self.assertEqual(self.save(101, 500, "Я изучаю биологию"), 1)
+        mid = storage.list_memories(101, db_path=self.db)[0]["id"]
+        self.assertIn("не найдена", self.command("forget_command", [str(mid)], user=202)[0])
+        self.assertIsNotNone(storage.get_memory(101, mid, db_path=self.db))
+
+    def test_actual_forget_command_rejects_zero_id(self):
+        self.assertEqual(self.command("forget_command", ["0"]), ["Напиши /forget номер_записи"])
 
     def seed_old(self, content="Работает учителем"):
         source = "telegram:private:101:100"

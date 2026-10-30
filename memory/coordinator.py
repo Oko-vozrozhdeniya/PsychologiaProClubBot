@@ -1,9 +1,9 @@
-"""Fail-closed coordination of existing memory modules; no bot or AI calls.
+"""Coordinate private memory access, persistence and deletion; no AI calls.
 
-The current storage schema has no consent, entitlement, source-expiry or
-cascade-deletion fields. Callers must supply an explicit verified policy;
-missing/expired permissions never expose personal memories.
+Callers supply a verified access policy. Persistent writes also require
+stored consent and independently verified, live participant sources.
 """
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from memory.extraction import extract_candidates, candidate_to_storage_record
@@ -61,12 +61,13 @@ class SourcePermission:
         _utc(self.expires_at)
 
 
-def _allowed(user_id, policy, now):
+def _allowed(user_id, policy, now, *, require_consent=True):
     _user(user_id)
     moment = _utc(now)
     if not isinstance(policy, AccessPolicy) or policy.user_id != user_id:
         raise PermissionError("Missing or cross-user policy")
-    if not (policy.verified and policy.consent and policy.entitled):
+    if not (policy.verified and policy.entitled
+            and (policy.consent or not require_consent)):
         raise PermissionError("Memory access not permitted")
     if _utc(policy.expires_at) <= moment:
         raise PermissionError("Permission expired")
@@ -152,3 +153,174 @@ def prepare_correction(user_id, old_content, new_content, source, policy,
     return make_update_decision(old_content, new_content, source,
                                 explicitly_corrected=explicitly_corrected,
                                 conflict_detected=conflict_detected)
+
+
+def _write_policy(user_id, policy, now, kwargs):
+    moment = _allowed(user_id, policy, now)
+    lifecycle.initialize_lifecycle(**kwargs)
+    if not lifecycle.has_memory_consent(user_id, **kwargs):
+        raise PermissionError("Explicit memory consent required")
+    return moment
+
+
+def _private_source(user_id, source):
+    prefix = f"telegram:private:{user_id}:"
+    if (not isinstance(source, str) or source != source.strip()
+            or not source.startswith(prefix) or not source[len(prefix):]):
+        raise PermissionError("Invalid participant source")
+
+
+def _register_source(user_id, source, message_text, moment, kwargs):
+    _private_source(user_id, source)
+    expiry = lifecycle.register_message(user_id, source, message_text, moment, **kwargs)
+    verified = [item for item in lifecycle.list_live_sources(user_id, moment, **kwargs)
+                if item["source"] == source and item["expires_at"] == expiry]
+    if len(verified) != 1:
+        raise PermissionError("New memory source was not independently verified")
+    return SourcePermission(source, expiry)
+
+
+def remember_memory(user_id, content, kind, source, message_text, policy, now, *,
+                    db_path=None):
+    """Persist an explicitly supplied memory and its live source linkage."""
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    moment = _write_policy(user_id, policy, now, kwargs)
+    _private_source(user_id, source)
+    raw = [{"content": content, "kind": kind, "source": source, "confidence": 1.0}]
+    extract_candidates(raw)  # Validate before registering a source.
+    permission = _register_source(user_id, source, message_text, moment, kwargs)
+    record = prepare_candidates(user_id, raw, policy, [permission], now)[0]
+    return lifecycle.add_memory(user_id, record["content"], record["kind"],
+                                source, moment, **kwargs)
+
+
+def revise_memory(user_id, memory_id, expected_content, expected_source,
+                  new_content, new_source, message_text, policy, now, change_kind,
+                  *, explicitly_corrected=False, db_path=None,
+                  allow_existing_source=False):
+    """Apply a confirmed revision atomically, rejecting stale or expired sources."""
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    moment = _write_policy(user_id, policy, now, kwargs)
+    _private_source(user_id, expected_source)
+    _private_source(user_id, new_source)
+    permissions = [SourcePermission(**item)
+                   for item in lifecycle.list_live_sources(user_id, moment, **kwargs)
+                   if item["source"] == expected_source]
+    decision = prepare_correction(
+        user_id, expected_content, new_content, expected_source,
+        policy, permissions, now, explicitly_corrected=explicitly_corrected,
+    )
+    if decision.action != "update":
+        return False
+    return lifecycle.revise_memory(
+        user_id, memory_id, expected_content, expected_source, new_content,
+        new_source, message_text, moment, change_kind,
+        allow_existing_source=allow_existing_source, **kwargs,
+    )
+
+
+def forget_memory(user_id, memory_id, policy, now, *, db_path=None):
+    """Delete owned memory, links and revisions even after consent is withdrawn.
+
+    Source receipts remain subject to their existing retention, preventing
+    a replay of the same message from resurrecting the deleted fact.
+    """
+    _allowed(user_id, policy, now, require_consent=False)
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    storage.initialize_database(**kwargs)
+    return storage.delete_memory(user_id, memory_id, **kwargs)
+
+
+def save_dialog_candidates(user_id, source, message_text, raw_candidates,
+                           visible_memories, policy, now, *, db_path=None):
+    """Validate and persist a private extraction response behind one boundary.
+
+    The caller supplies only the owned live memories shown to the extractor.
+    Proposed revisions must still match the current stored version exactly.
+    """
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    moment = _write_policy(user_id, policy, now, kwargs)
+    _private_source(user_id, source)
+    if not isinstance(raw_candidates, list) or len(raw_candidates) > 5:
+        raise ValueError("Invalid memory extraction response")
+    if not isinstance(visible_memories, (list, tuple)):
+        raise ValueError("Visible memory snapshot required")
+    validated = extract_candidates([
+        {"content": item["content"], "kind": item["kind"],
+         "confidence": item["confidence"], "source": source}
+        for item in raw_candidates
+    ], min_confidence=0.85)
+    if not validated:
+        return 0
+    existing = lifecycle.list_live_memories(user_id, moment, **kwargs)
+    registered_sources = lifecycle.list_live_sources(user_id, moment, **kwargs)
+    # Retries cannot extend the 365-day expiry, duplicate or resurrect a fact.
+    if any(item["source"] == source for item in registered_sources):
+        return 0
+    permission = _register_source(user_id, source, message_text, moment, kwargs)
+    approved = prepare_candidates(
+        user_id, [dict(content=item.content, kind=item.kind,
+                       confidence=item.confidence, source=item.source)
+                  for item in validated],
+        policy, [permission], now, min_confidence=0.85,
+    )
+    if not lifecycle.has_memory_consent(user_id, **kwargs):
+        lifecycle.delete_message(user_id, source, **kwargs)
+        return 0
+
+    visible = {item["id"]: item for item in visible_memories}
+    live_by_id = {item["id"]: item for item in existing}
+    live_sources = {item["source"] for item in registered_sources}
+    known = {item["content"].casefold().strip() for item in existing}
+    saved = 0
+    for candidate in approved:
+        key = candidate["content"].casefold().strip()
+        matching = next(item for item in raw_candidates
+                        if " ".join(item["content"].split()).casefold() == key
+                        and item["kind"] == candidate["kind"]
+                        and item["confidence"] >= 0.85)
+        target = matching.get("replaces_memory_id")
+        if target is not None:
+            kind = matching.get("revision_kind")
+            old = live_by_id.get(target) if type(target) is int else None
+            marker = (
+                r"\b(раньше|теперь|сейчас|прежде|уже|стал|стала)\b"
+                if kind == "change" else
+                r"\b(ошибка|ошибся|ошиблась|неверно|неправильно|исправь|"
+                r"исправляю|на самом деле|я не)\b"
+            )
+            if not (
+                kind in ("correction", "change")
+                and isinstance(matching.get("replaces_content"), str)
+                and old is not None and target in visible
+                and old["content"] == matching["replaces_content"]
+                and visible[target]["content"] == old["content"]
+                and visible[target]["source"] == old["source"]
+                and candidate["kind"] == old["kind"]
+                and old["source"] in live_sources
+                and matching["confidence"] >= 0.95
+                and re.search(marker, message_text.casefold())
+            ):
+                continue
+            if not lifecycle.has_memory_consent(user_id, **kwargs):
+                break
+            if revise_memory(
+                user_id, target, old["content"], old["source"],
+                candidate["content"], source, message_text, policy, now, kind,
+                explicitly_corrected=True, allow_existing_source=True, **kwargs,
+            ):
+                known.discard(old["content"].casefold().strip())
+                known.add(key)
+                live_by_id[target] = {**old, "content": candidate["content"],
+                                      "source": source}
+                saved += 1
+            continue
+        if key in known:
+            continue
+        if not lifecycle.has_memory_consent(user_id, **kwargs):
+            break
+        lifecycle.add_memory(user_id, candidate["content"], candidate["kind"],
+                             source, moment, **kwargs)
+        known.add(key)
+        saved += 1
+    return saved

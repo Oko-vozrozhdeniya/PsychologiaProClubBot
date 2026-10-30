@@ -1,4 +1,5 @@
 import tempfile
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +105,32 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.message(1, "a", 0) if False else lifecycle.register_message(
                 1, "a", "content", "2026-10-28T12:00:00", db_path=self.db)
+
+    def test_atomic_save_rechecks_consent_and_source(self):
+        source = "telegram:private:1:12"
+        self.message(1, source)
+        with self.assertRaises(PermissionError):
+            lifecycle.add_memory(1, "Любит рисовать", "preference", source,
+                                 NOW, db_path=self.db)
+        lifecycle.set_memory_consent(1, True, NOW, db_path=self.db)
+        lifecycle.delete_message(1, source, db_path=self.db)
+        with self.assertRaises(PermissionError):
+            lifecycle.add_memory(1, "Любит рисовать", "preference", source,
+                                 NOW, db_path=self.db)
+        self.assertEqual(storage.list_memories(1, db_path=self.db), [])
+
+    def test_failed_linkage_rolls_back_the_new_memory(self):
+        source = "telegram:private:1:12"
+        self.message(1, source)
+        lifecycle.set_memory_consent(1, True, NOW, db_path=self.db)
+        with storage._connection(self.db) as db:
+            db.execute("""CREATE TRIGGER fail_link BEFORE INSERT ON memory_sources
+                          BEGIN SELECT RAISE(ABORT, 'test link failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            lifecycle.add_memory(1, "Любит рисовать", "preference", source,
+                                 NOW, db_path=self.db)
+        self.assertEqual(storage.list_memories(1, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_memories(1, NOW, db_path=self.db), [])
 
 
 if __name__ == "__main__":

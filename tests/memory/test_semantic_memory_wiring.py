@@ -2,7 +2,6 @@
 import ast
 import io
 import json
-import re
 import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
@@ -10,9 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from memory import storage, lifecycle
-from memory.coordinator import AccessPolicy, SourcePermission, prepare_candidates
-from memory.extraction import extract_candidates
+from memory import coordinator, storage, lifecycle
+from memory.coordinator import AccessPolicy
 
 
 class SemanticMemoryWiringTests(unittest.TestCase):
@@ -24,6 +22,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
         self.gemini_calls = 0
         storage.initialize_database(self.db)
         lifecycle.initialize_lifecycle(self.db)
+        lifecycle.set_memory_consent(101, True, datetime.now(timezone.utc), db_path=self.db)
         source = (Path(__file__).resolve().parents[2] / "bot.py").read_text(
             encoding="utf-8"
         )
@@ -43,12 +42,9 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             "datetime": datetime,
             "timezone": timezone,
             "timedelta": timedelta,
-            "re": re,
             "AccessPolicy": AccessPolicy,
-            "SourcePermission": SourcePermission,
-            "prepare_candidates": prepare_candidates,
-            "prepare_correction": __import__("memory.coordinator", fromlist=["prepare_correction"]).prepare_correction,
-            "extract_candidates": extract_candidates,
+            "save_dialog_candidates": lambda *args, **kw: coordinator.save_dialog_candidates(
+                *args, db_path=self.db, **kw),
             "personal_storage": SimpleNamespace(
                 initialize_database=lambda: storage.initialize_database(self.db),
                 add_memory=lambda u, c, k, s: storage.add_memory(
@@ -145,8 +141,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             {"content": "Пользователь изучает биологию",
              "kind": "fact", "confidence": 0.98}
         ]
-        self.ns["personal_lifecycle"].list_live_sources = lambda user, now: []
-        with self.assertRaises(PermissionError):
+        with patch.object(lifecycle, "list_live_sources", return_value=[]), self.assertRaises(PermissionError):
             self.ns["remember_dialog_facts"](101, 12, "Я изучаю биологию")
         self.assertEqual(storage.list_memories(101, db_path=self.db), [])
 

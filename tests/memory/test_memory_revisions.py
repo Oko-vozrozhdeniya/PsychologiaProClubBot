@@ -190,7 +190,7 @@ class MemoryRevisionTests(unittest.TestCase):
         for name in ("correct_command", "change_command", "history_command", "revise_command"):
             self.assertIn(name, funcs)
         self.assertTrue(any(
-            isinstance(n, ast.Name) and n.id == "prepare_correction"
+            isinstance(n, ast.Name) and n.id == "revise_memory"
             for n in ast.walk(funcs["revise_command"])
         ))
         commands = {

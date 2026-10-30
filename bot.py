@@ -9,8 +9,8 @@ import urllib.error
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from memory.coordinator import (
-    AccessPolicy, SourcePermission, read_context, prepare_candidates,
-    prepare_correction,
+    AccessPolicy, SourcePermission, read_context, save_dialog_candidates,
+    remember_memory, revise_memory, forget_memory,
 )
 from pathlib import Path
 
@@ -21,7 +21,6 @@ from memory.ai_providers import (
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
-from memory.extraction import extract_candidates
 
 from telegram import Update
 from telegram.ext import (
@@ -1598,9 +1597,6 @@ def remember_dialog_facts(user_id, message_id, question):
         )
         if item["source"].startswith(f"telegram:private:{user_id}:")
     ][:20]
-    visible_before_gemini = {
-        item["id"]: item for item in active_before_gemini
-    }
     # Only this user's live memories enter the extraction prompt.
     memory_reference = [
         {"id": item["id"], "content": item["content"][:240],
@@ -1662,146 +1658,18 @@ def remember_dialog_facts(user_id, message_id, question):
     raw = json.loads(raw_text)
     if not isinstance(raw, list) or len(raw) > 5:
         raise ValueError("Invalid memory extraction response")
-    validated = extract_candidates(
-        [
-            {
-                "content": item["content"],
-                "kind": item["kind"],
-                "confidence": item["confidence"],
-                "source": source,
-            }
-            for item in raw
-        ],
-        min_confidence=0.85,
-    )
-    if not validated:
-        return 0
     # Consent may have been revoked while Gemini was extracting candidates.
     if not personal_lifecycle.has_memory_consent(user_id):
         return 0
-
-    personal_storage.initialize_database()
-    personal_lifecycle.initialize_lifecycle()
     now = datetime.now(timezone.utc)
-    existing = personal_lifecycle.list_live_memories(user_id, now)
-    registered_sources = personal_lifecycle.list_live_sources(user_id, now)
-    # A retry cannot extend the 365-day expiry or duplicate linked memories.
-    if any(item["source"] == source for item in registered_sources):
-        return 0
-
-    expires_at = personal_lifecycle.register_message(
-        user_id, source, question, now
-    )
-    verified = [
-        item for item in personal_lifecycle.list_live_sources(user_id, now)
-        if item["source"] == source and item["expires_at"] == expires_at
-    ]
-    if len(verified) != 1:
-        raise PermissionError("New memory source was not independently verified")
-
-    # Prepare only under the coordinator's verified policy and source boundary.
     policy = AccessPolicy(
         user_id=user_id, consent=True, entitled=True, verified=True,
         expires_at=(now + timedelta(minutes=2)).isoformat(),
     )
-    permissions = [
-        SourcePermission(source=source, expires_at=expires_at)
-    ]
-    approved = prepare_candidates(
-        user_id,
-        [
-            {
-                "content": item.content,
-                "kind": item.kind,
-                "confidence": item.confidence,
-                "source": item.source,
-            }
-            for item in validated
-        ],
-        policy, permissions, now.isoformat(), min_confidence=0.85,
+    return save_dialog_candidates(
+        user_id, source, question, raw, active_before_gemini,
+        policy, now.isoformat(),
     )
-    # No new records after a concurrent opt-out.
-    if not personal_lifecycle.has_memory_consent(user_id):
-        personal_lifecycle.delete_message(user_id, source)
-        return 0
-
-    known = {item["content"].casefold().strip() for item in existing}
-    saved = 0
-    live_by_id = {item["id"]: item for item in existing}
-    live_source_permissions = {
-        item["source"]: item["expires_at"]
-        for item in registered_sources
-    }
-    for candidate in approved:
-        key = candidate["content"].casefold().strip()
-        matching = next((
-            item for item in raw
-            if item.get("content", "").casefold().strip() == key
-            and item.get("kind") == candidate["kind"]
-        ), {})
-        # A model's proposed replacement is untrusted. Accept it only for an
-        # explicit statement, exact old text, same user and proven live source.
-        target = matching.get("replaces_memory_id")
-        if target is not None:
-            kind = matching.get("revision_kind")
-            old = live_by_id.get(target) if type(target) is int else None
-            marker = (
-                r"\b(раньше|теперь|сейчас|прежде|уже|стал|стала)\b"
-                if kind == "change" else
-                r"\b(ошибка|ошибся|ошиблась|неверно|неправильно|исправь|"
-                r"исправляю|на самом деле|я не)\b"
-            )
-            if not (
-                kind in ("correction", "change")
-                and isinstance(matching.get("replaces_content"), str)
-                and old is not None and target in visible_before_gemini
-                and old["content"] == matching["replaces_content"]
-                and visible_before_gemini[target]["content"] == old["content"]
-                and old["source"] == visible_before_gemini[target]["source"]
-                and candidate["kind"] == old["kind"]
-                and old["source"] in live_source_permissions
-                and matching.get("confidence", 0) >= 0.95
-                and re.search(marker, question.casefold())
-            ):
-                continue
-            old_permission = SourcePermission(
-                source=old["source"],
-                expires_at=live_source_permissions[old["source"]],
-            )
-            decision = prepare_correction(
-                user_id, old["content"], candidate["content"],
-                old["source"], policy, [old_permission], now.isoformat(),
-                explicitly_corrected=True,
-            )
-            if decision.action != "update":
-                continue
-            if not personal_lifecycle.has_memory_consent(user_id):
-                break
-            if personal_lifecycle.revise_memory(
-                user_id, target, old["content"], old["source"],
-                candidate["content"], source, question, now, kind,
-                allow_existing_source=True,
-            ):
-                known.discard(old["content"].casefold().strip())
-                known.add(key)
-                live_by_id[target] = {
-                    **old, "content": candidate["content"], "source": source
-                }
-                saved += 1
-            continue
-        if key in known:
-            continue
-        if not personal_lifecycle.has_memory_consent(user_id):
-            break
-        memory_id = personal_storage.add_memory(
-            user_id, candidate["content"], candidate["kind"], source
-        )
-        personal_lifecycle.link_memory_sources(
-            user_id, memory_id, [source], now
-        )
-        known.add(key)
-        saved += 1
-    return saved
 
 
 def read_explicit_memory_prompt(user_id, query):
@@ -1853,12 +1721,20 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     source = f"telegram:private:{user_id}:{update.effective_message.message_id}"
     async with dialog_lock:
-        personal_storage.initialize_database()
-        personal_lifecycle.initialize_lifecycle()
         now = datetime.now(timezone.utc)
-        personal_lifecycle.register_message(user_id, source, content, now)
-        memory_id = personal_storage.add_memory(user_id, content, "fact", source)
-        personal_lifecycle.link_memory_sources(user_id, memory_id, [source], now)
+        policy = AccessPolicy(
+            user_id=user_id, consent=True, entitled=True, verified=True,
+            expires_at=(now + timedelta(minutes=2)).isoformat(),
+        )
+        try:
+            memory_id = remember_memory(
+                user_id, content, "fact", source, content, policy, now.isoformat(),
+            )
+        except PermissionError:
+            await update.effective_message.reply_text(
+                "Память отключена или источник недоступен. Запись не сохранена."
+            )
+            return
     await update.effective_message.reply_text(
         f"Запомнил. Номер записи: {memory_id}. Удалить: /forget {memory_id}"
     )
@@ -1891,13 +1767,21 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or not has_personal_ai_access(update):
         return
-    if len(context.args) != 1 or not context.args[0].isdigit():
+    if (len(context.args) != 1 or not context.args[0].isdigit()
+            or int(context.args[0]) <= 0):
         await update.effective_message.reply_text("Напиши /forget номер_записи")
         return
     user_id = update.effective_user.id
     async with dialog_lock:
-        personal_storage.initialize_database()
-        deleted = personal_storage.delete_memory(user_id, int(context.args[0]))
+        now = datetime.now(timezone.utc)
+        # Managing deletion remains available after memory consent is revoked.
+        policy = AccessPolicy(
+            user_id=user_id, consent=False, entitled=True, verified=True,
+            expires_at=(now + timedelta(minutes=2)).isoformat(),
+        )
+        deleted = forget_memory(
+            user_id, int(context.args[0]), policy, now.isoformat(),
+        )
     await update.effective_message.reply_text(
         "Запись удалена." if deleted else "Запись не найдена."
     )
@@ -1968,42 +1852,15 @@ async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 "Действующая запись с таким номером не найдена."
             )
             return
-        verified = [
-            item for item in personal_lifecycle.list_live_sources(user_id, now)
-            if item["source"] == old["source"]
-        ]
-        if len(verified) != 1:
-            await update.effective_message.reply_text(
-                "Источник записи недоступен. Исправление не выполнено."
-            )
-            return
         policy = AccessPolicy(
             user_id=user_id, consent=True, entitled=True, verified=True,
             expires_at=(now + timedelta(minutes=2)).isoformat(),
         )
-        permission = SourcePermission(
-            source=old["source"], expires_at=verified[0]["expires_at"],
-        )
-        decision = prepare_correction(
-            user_id, old["content"], new_content, old["source"],
-            policy, [permission], now.isoformat(),
-            explicitly_corrected=True,
-        )
-        if decision.action == "keep":
-            await update.effective_message.reply_text(
-                "Формулировка уже такая. Изменений не требуется."
-            )
-            return
-        if decision.action != "update":
-            await update.effective_message.reply_text(
-                "Изменение требует дополнительного подтверждения."
-            )
-            return
         try:
-            changed = personal_lifecycle.revise_memory(
+            changed = revise_memory(
                 user_id, memory_id, old["content"], old["source"],
-                new_content, source, update.effective_message.text, now,
-                change_kind,
+                new_content, source, update.effective_message.text,
+                policy, now.isoformat(), change_kind, explicitly_corrected=True,
             )
         except (LookupError, ValueError, PermissionError) as error:
             logger.warning("Memory revision refused: %s", type(error).__name__)
@@ -2016,6 +1873,10 @@ async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.effective_message.reply_text(
             f"{label} запись №{memory_id}. Предыдущая версия доступна "
             f"через /history {memory_id}."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Формулировка уже такая. Изменений не требуется."
         )
 
 
