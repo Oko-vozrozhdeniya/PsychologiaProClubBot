@@ -3,6 +3,8 @@
 
 This module reads existing memories only.
 It does not initialize the database or modify stored records.
+Search supports bounded Russian word-form matching and common preference
+phrases. It is still lexical retrieval, not a general semantic search engine.
 """
 
 import re
@@ -24,7 +26,25 @@ STOP_WORDS = frozenset({
     "мы", "на", "над", "не", "но", "о", "об", "он",
     "она", "они", "от", "по", "под", "при", "с", "со",
     "так", "то", "у", "что", "это", "я",
+    "ты", "тебе", "тебя", "меня", "мои", "мое", "моего", "мою", "моих",
+    "чем", "чему", "кого", "кому", "кем", "кто", "где", "когда", "куда",
+    "почему", "зачем", "какого", "какому", "какую", "каком", "какими",
+    "помнишь", "помните", "вспомни", "вспомните", "расскажи", "расскажите",
+    "пожалуйста",
 })
+
+# These phrases describe the same preference relation. Topic words must still
+# match independently: liking dogs must never retrieve a preference for cats.
+PREFERENCE_WORDS = frozenset({
+    "люблю", "любишь", "любит", "любим", "любите", "любят",
+    "любил", "любила", "любили",
+    "нравится", "нравятся", "нравилось", "нравились", "нравился", "нравилась",
+    "увлекаюсь", "увлекаешься", "увлекается", "увлекаемся", "увлекаетесь",
+    "увлекаются", "увлекался", "увлекалась", "увлекались",
+    "предпочитаю", "предпочитаешь", "предпочитает", "предпочитаем",
+    "предпочитаете", "предпочитают",
+})
+PREFERENCE_TOKEN = "__preference__"
 
 
 def _validate_user_id(user_id):
@@ -46,17 +66,38 @@ def _validate_limit(limit):
 
 
 def _tokens(text):
-    """Return meaningful lowercase words from text."""
+    """Return normalized topic words and explicit preference relations."""
     if not isinstance(text, str):
         raise ValueError("text must be a string")
 
-    words = re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
+    words = re.findall(r"[^\W_]+", text.casefold().replace("ё", "е"), flags=re.UNICODE)
 
     return {
-        word
+        PREFERENCE_TOKEN if word in PREFERENCE_WORDS else word
         for word in words
         if len(word) >= 2 and word not in STOP_WORDS
     }
+
+
+def _same_russian_word_form(left, right):
+    """Accept a long shared stem with short endings, never arbitrary substrings.
+
+    Exact matches are handled first by the caller. Approximation is restricted
+    to Russian words with at least four shared initial letters; at least 75%
+    of the shorter word must match, with at most four remaining letters.
+    This covers common forms such as книги/книгах and выращивать/выращиванием
+    without enabling fuzzy matching for IDs, numbers or Latin words.
+    """
+    common = 0
+    for first, second in zip(left, right):
+        if first != second:
+            break
+        common += 1
+    return (
+        common >= 4
+        and common * 4 >= min(len(left), len(right)) * 3
+        and max(len(left), len(right)) - common <= 4
+    )
 
 
 def _parse_timestamp(value):
@@ -74,14 +115,28 @@ def _parse_timestamp(value):
 
 
 def _score_memory(memory, query_tokens):
-    """Calculate a simple, explainable relevance score."""
+    """Require every topic term, preferring exact words over word-form matches."""
     content = memory.get("content", "")
     memory_tokens = _tokens(content)
 
-    if not query_tokens.issubset(memory_tokens):
-        return 0
+    word_forms = {}
+    for word in memory_tokens:
+        if len(word) >= 4 and re.fullmatch(r"[а-я]+", word):
+            word_forms.setdefault(word[:4], []).append(word)
 
-    score = len(query_tokens) * 10 + 10
+    match_quality = []
+    for word in query_tokens:
+        if word in memory_tokens:
+            match_quality.append(2)
+        elif re.fullmatch(r"[а-я]+", word) and any(
+            _same_russian_word_form(word, candidate)
+            for candidate in word_forms.get(word[:4], ())
+        ):
+            match_quality.append(1)
+        else:
+            return 0
+
+    score = sum(match_quality) * 10 + 10
 
     kind = memory.get("kind")
 
@@ -96,7 +151,8 @@ def _score_memory(memory, query_tokens):
 def rank_memories(query, memories, limit=DEFAULT_LIMIT):
     """Rank supplied memory records without modifying them.
 
-    Only records containing matching query words are returned.
+    Every meaningful query term must have an exact, normalized preference,
+    or bounded Russian word-form match. Unrelated records are not a fallback.
     This function does not perform user authorization; use
     retrieve_memories() for user-scoped database retrieval.
     """

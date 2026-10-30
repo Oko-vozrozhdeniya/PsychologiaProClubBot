@@ -127,6 +127,78 @@ class TestMemoryRetrieval(unittest.TestCase):
         )
         self.assertEqual(record["content"], "Любит книги")
 
+    def test_natural_question_finds_rephrased_russian_preference(self):
+        memory_id = add_memory(
+            100, "Пользователь увлекается выращиванием фиолетовых кактусов",
+            "preference", "message:purple", self.db_path,
+        )
+        result = retrieve_memories(
+            100, "Какие кактусы мне нравится выращивать?", db_path=self.db_path,
+        )
+        self.assertEqual([item["id"] for item in result], [memory_id])
+
+    def test_preference_paraphrase_is_not_specific_to_cacti(self):
+        memory_id = add_memory(
+            100, "Пользователь увлекается рисованием акварелью",
+            "preference", "message:painting", self.db_path,
+        )
+        result = retrieve_memories(
+            100, "Мне нравится рисовать акварелью", db_path=self.db_path,
+        )
+        self.assertEqual([item["id"] for item in result], [memory_id])
+
+    def test_recall_question_words_do_not_hide_the_topic(self):
+        memory_id = add_memory(
+            100, "Любит читать книги", "preference", "message:books", self.db_path,
+        )
+        result = retrieve_memories(
+            100, "Ты помнишь, какие книги я люблю?", db_path=self.db_path,
+        )
+        self.assertEqual([item["id"] for item in result], [memory_id])
+
+    def test_shared_preference_and_activity_do_not_replace_missing_topic(self):
+        add_memory(
+            100, "Пользователь увлекается выращиванием роз",
+            "preference", "message:roses", self.db_path,
+        )
+        self.assertEqual(retrieve_memories(
+            100, "Какие кактусы мне нравится выращивать?", db_path=self.db_path,
+        ), [])
+
+    def test_short_shared_prefix_does_not_match_different_topics(self):
+        records = [{"id": 1, "content": "Любит коттеджи", "kind": "preference"}]
+        self.assertEqual(rank_memories("Любит котов", records), [])
+
+    def test_latin_identifiers_and_numbers_require_exact_words(self):
+        records = [{"id": 1, "content": "Project alpha100", "kind": "fact"}]
+        self.assertEqual(rank_memories("Project alpha101", records), [])
+        self.assertEqual(rank_memories("Project alpha 100", records), [])
+
+    def test_exact_word_forms_rank_above_approximate_forms(self):
+        records = [
+            {"id": 1, "content": "Любит выращивать кактусы", "kind": "preference"},
+            {"id": 2, "content": "Увлекается выращиванием кактусов", "kind": "preference"},
+        ]
+        result = rank_memories("Любит выращивать кактусы", records)
+        self.assertEqual([item["id"] for item in result], [1, 2])
+
+    def test_russian_yo_and_e_are_search_equivalent(self):
+        records = [{"id": 1, "content": "Любит ёлки", "kind": "preference"}]
+        self.assertEqual([item["id"] for item in rank_memories("Любит елки", records)], [1])
+
+    def test_paraphrased_query_cannot_retrieve_another_users_preference(self):
+        add_memory(
+            100, "Пользователь увлекается выращиванием роз",
+            "preference", "message:100", self.db_path,
+        )
+        add_memory(
+            200, "Пользователь увлекается выращиванием фиолетовых кактусов",
+            "preference", "message:200", self.db_path,
+        )
+        self.assertEqual(retrieve_memories(
+            100, "Какие кактусы мне нравится выращивать?", db_path=self.db_path,
+        ), [])
+
 
 if __name__ == "__main__":
     unittest.main()

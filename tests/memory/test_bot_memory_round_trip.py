@@ -3,8 +3,11 @@
 No Telegram credentials and no external Gemini call are needed for this test.
 """
 import ast
+import asyncio
 import io
 import json
+import logging
+import os
 import re
 import tempfile
 import unittest
@@ -22,7 +25,7 @@ def load_function(name, namespace):
     source = (Path(__file__).resolve().parents[2] / "bot.py").read_text(encoding="utf-8")
     node = next(
         item for item in ast.parse(source).body
-        if isinstance(item, ast.FunctionDef) and item.name == name
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == name
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), "bot.py", "exec"), namespace)
     return namespace[name]
@@ -200,6 +203,63 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.assertEqual(self.save(101, 504, "Я изучаю биологию"), 1)
         lifecycle.initialize_lifecycle(self.db)
         self.assertIn("Пользователь изучает биологию", self.read(101, "изучает биологию"))
+
+    def test_natural_preference_recall_after_actual_dialog_reset(self):
+        fact = "Пользователь увлекается выращиванием фиолетовых кактусов"
+        self.model_result = [{
+            "content": fact, "kind": "preference", "confidence": 0.99,
+        }]
+        original = "Мне нравится выращивать фиолетовые кактусы"
+        self.assertEqual(self.save(101, 600, original), 1)
+        root = Path(self.tmp.name)
+        ns = {
+            "os": os, "json": json,
+            "datetime": datetime, "timezone": timezone,
+            "DATA_DIR": root, "DIALOG_STATE_FILE": root / "state.json",
+            "DIALOG_HISTORY_FILE": root / "history.jsonl",
+            "MAX_DIALOG_PAIRS": 30, "MAX_DIALOG_CHARS": 30000,
+            "logger": logging.getLogger(__name__),
+            "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
+            "dialog_lock": asyncio.Lock(), "has_personal_ai_access": lambda _: True,
+        }
+        for name in ("read_dialog_state", "save_dialog_state", "get_session_id",
+                     "append_dialog_record", "read_recent_dialog", "reset_dialog"):
+            load_function(name, ns)
+        ns["append_dialog_record"](101, 0, original, "Ответ на прежнее сообщение")
+        self.assertTrue(ns["read_recent_dialog"](101, 0))
+        history_before_reset = ns["DIALOG_HISTORY_FILE"].read_bytes()
+        replies = []
+
+        async def reply_text(text):
+            replies.append(text)
+
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=101),
+            effective_chat=SimpleNamespace(type="private"),
+            effective_message=SimpleNamespace(reply_text=reply_text),
+        )
+        asyncio.run(ns["reset_dialog"](update, None))
+        session = ns["get_session_id"](ns["read_dialog_state"](), 101)
+        self.assertEqual(session, 1)
+        self.assertTrue(replies)
+        self.assertEqual(ns["read_recent_dialog"](101, session), [])
+        self.assertEqual(ns["DIALOG_HISTORY_FILE"].read_bytes(), history_before_reset)
+        self.assertIn(fact, self.read(101, "Какие кактусы мне нравится выращивать?"))
+        self.assertEqual(self.read(202, "Какие кактусы мне нравится выращивать?"), "")
+
+    def test_paraphrased_preference_recall_still_checks_consent_and_source(self):
+        self.model_result = [{
+            "content": "Пользователь увлекается выращиванием фиолетовых кактусов",
+            "kind": "preference", "confidence": 0.99,
+        }]
+        self.assertEqual(self.save(101, 601, "Мне нравятся фиолетовые кактусы"), 1)
+        query = "Какие кактусы мне нравится выращивать?"
+        self.assertIn("фиолетовых кактусов", self.read(101, query))
+        lifecycle.set_memory_consent(101, False, datetime.now(timezone.utc), db_path=self.db)
+        self.assertEqual(self.read(101, query), "")
+        lifecycle.set_memory_consent(101, True, datetime.now(timezone.utc), db_path=self.db)
+        lifecycle.delete_message(101, "telegram:private:101:601", db_path=self.db)
+        self.assertEqual(self.read(101, query), "")
 
 
 if __name__ == "__main__":
