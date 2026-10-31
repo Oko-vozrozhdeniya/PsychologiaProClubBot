@@ -246,7 +246,7 @@ class GroqProviderTests(unittest.TestCase):
         self.assertIn("bot.private_message", contents)
         self.assertNotIn("filters.ChatType.GROUPS", contents)
         bot = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('bot_data.get("test_ai_mode", "gemini")', bot)
+        self.assertIn('bot_data.get("test_ai_mode", "auto")', bot)
         self.assertIn("if provider == \"Gemini\"", bot)
 
 
@@ -298,9 +298,17 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("GROQ_API_KEY", reply.await_args.args[0])
                 self.assertEqual(self.context.application.bot_data["test_ai_mode"], "gemini")
 
-    async def test_fresh_runtime_defaults_to_gemini_without_new_settings(self):
+    async def test_fresh_runtime_defaults_to_auto_without_new_settings(self):
         reply = await self.invoke("ai_mode")
-        self.assertIn("gemini", reply.await_args.args[0])
+        self.assertIn("Текущий режим: auto", reply.await_args.args[0])
+
+    async def test_restart_returns_to_auto_after_a_forced_provider_test(self):
+        await self.invoke("ai_gemini")
+        self.assertEqual(self.context.application.bot_data["test_ai_mode"], "gemini")
+        self.context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        reply = await self.invoke("ai_mode")
+        self.assertIn("Текущий режим: auto", reply.await_args.args[0])
+        self.assertIn("После перезапуска — auto", reply.await_args.args[0])
 
     async def test_main_entrypoint_registers_the_owner_mode_callbacks(self):
         registered = {}

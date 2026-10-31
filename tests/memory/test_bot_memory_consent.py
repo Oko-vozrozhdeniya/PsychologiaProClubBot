@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from memory import coordinator, lifecycle, storage
 from memory.prompt_context import build_memory_context
@@ -152,13 +152,15 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
             "read_explicit_memory_prompt": self.lookup,
             "request_personal_ai": self.request, "request_gemini": Mock(),
             "remember_dialog_facts": self.extract,
+            "save_diagnostic_record": Mock(),
             "send_long_message": AsyncMock(), "send_error_response": AsyncMock(),
         }
         import json
         import os
         self.ns.update(json=json, os=os)
         for name in ("has_personal_ai_access", "read_dialog_state", "save_dialog_state",
-                     "get_session_id", "append_dialog_record", "read_recent_dialog", "private_message"):
+                     "get_session_id", "append_dialog_record", "read_recent_dialog", "private_message",
+                     "format_diagnostic"):
             exec(compile(ast.Module(body=[names[name]], type_ignores=[]), "bot.py", "exec"), self.ns)
         self.ns["append_dialog_record"](101, 0, "Чужая прежняя реплика", "Чужой ответ")
         self.ns["append_dialog_record"](202, 0, "Моя прежняя реплика", "Мой прежний ответ")
@@ -199,7 +201,8 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Моя прежняя реплика", str(args[1]))
         self.assertNotIn("Чужая прежняя реплика", str(args[1]))
         self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ по текущему вопросу")
-        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Gemini")
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Gemini", "auto", ANY)
+        self.assertEqual(self.request.call_args.args[3], "auto")
         self.assertTrue(self.ns["DIALOG_HISTORY_FILE"].read_bytes().startswith(self.history_before))
 
     async def test_consent_revoked_during_request_prevents_archiving_and_delivery(self):
@@ -244,7 +247,7 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Чужая прежняя реплика", str(history))
         self.assertEqual(memory, "Разрешённая память")
         self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ резерва")
-        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Groq")
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Groq", "auto", ANY)
         self.ns["send_long_message"].assert_awaited_once()
         self.ns["send_error_response"].assert_not_awaited()
 
@@ -274,6 +277,26 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.ns["send_long_message"].assert_awaited_once()
         self.assertEqual(self.ns["send_long_message"].await_args.args[1], "Ответ Groq")
         self.ns["send_error_response"].assert_not_awaited()
+
+    async def test_memory_diagnostic_identifies_failed_stages_without_private_bodies(self):
+        lifecycle.set_memory_consent(202, True, NOW, db_path=self.db)
+        self.lookup.side_effect = OSError("PRIVATE_LOOKUP_SECRET")
+        self.extract.side_effect = ValueError("PRIVATE_EXTRACTION_SECRET")
+        with self.assertLogs(level="ERROR"):
+            await self.invoke()
+        self.ns["send_long_message"].assert_awaited_once()
+        self.ns["send_error_response"].assert_not_awaited()
+        self.ns["save_diagnostic_record"].assert_called_once()
+        record = self.ns["save_diagnostic_record"].call_args.args[0]
+        self.assertEqual(record["user_id"], 202)
+        self.assertEqual(record["message_id"], 12)
+        self.assertEqual(record["read_error"], "OSError")
+        self.assertEqual(record["write_error"], "ValueError")
+        rendered = self.ns["format_diagnostic"](record)
+        self.assertIn("Ошибка поиска: OSError", rendered)
+        self.assertIn("Ошибка сохранения: ValueError", rendered)
+        self.assertNotIn("PRIVATE_", rendered)
+        self.assertNotIn("Мой новый вопрос", rendered)
 
 
 if __name__ == "__main__":

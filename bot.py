@@ -264,6 +264,21 @@ def read_diagnostic_records(limit=5):
 
 
 def format_diagnostic(record):
+    if record.get("record_type") == "memory":
+        labels = (
+            ("timestamp", "Время (UTC)"), ("user_id", "Аккаунт (Telegram ID)"),
+            ("message_id", "Номер сообщения"), ("read_status", "Поиск памяти"),
+            ("stored_memories", "Активных записей"),
+            ("matched_memories", "Подобрано записей"), ("read_error", "Ошибка поиска"),
+            ("answer_provider", "Кто ответил"), ("extraction_provider", "Кто извлекал факты"),
+            ("extraction_fallback", "Причина перехода к резерву"),
+            ("write_stage", "Этап сохранения"), ("offered_candidates", "Предложено фактов"),
+            ("saved_facts", "Новых или изменённых записей"),
+            ("write_status", "Результат сохранения"), ("write_error", "Ошибка сохранения"),
+        )
+        return "🔧 Проверка личной памяти\n\n" + "\n".join(
+            f"{label}: {record[key]}" for key, label in labels if key in record
+        )
     timestamp = record.get(
         "timestamp",
         "Неизвестно"
@@ -392,7 +407,7 @@ async def diagnostics(
 
     if not 1 <= limit <= 10:
         await message.reply_text(
-            "Можно запросить от 1 до 10 ошибок."
+            "Можно запросить от 1 до 10 записей диагностики."
         )
         return
 
@@ -402,7 +417,7 @@ async def diagnostics(
         if not records:
             await message.reply_text(
                 "В журнале пока нет "
-                "зарегистрированных ошибок."
+                "записей диагностики."
             )
             return
 
@@ -1383,6 +1398,11 @@ async def private_message(
             question = message.text.strip()
             if not question:
                 return
+            memory_check = {
+                "record_type": "memory", "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user_id": user_id, "message_id": message.message_id,
+                "read_status": "не проверено", "write_status": "не проверено",
+            }
             state = read_dialog_state()
 
             session_id = get_session_id(
@@ -1404,11 +1424,13 @@ async def private_message(
                     read_explicit_memory_prompt,
                     user_id,
                     question,
+                    memory_check,
                 )
-            except Exception:
+            except Exception as error:
                 logger.exception("Private memory lookup unavailable")
+                memory_check.update(read_status="ошибка", read_error=type(error).__name__)
                 memory_prompt = ""
-            mode = context.application.bot_data.get("test_ai_mode", "gemini")
+            mode = context.application.bot_data.get("test_ai_mode", "auto")
             answer, provider = await asyncio.to_thread(
                 request_personal_ai,
                 question,
@@ -1433,6 +1455,7 @@ async def private_message(
                 question,
                 answer
             )
+            memory_check["answer_provider"] = provider
             try:
                 saved_facts = await asyncio.to_thread(
                     remember_dialog_facts,
@@ -1440,10 +1463,18 @@ async def private_message(
                     message.message_id,
                     question,
                     provider,
+                    mode,
+                    memory_check,
                 )
                 logger.info("Automatic memory saved %s facts", saved_facts)
-            except Exception:
+            except Exception as error:
                 logger.exception("Automatic memory extraction failed")
+                memory_check.update(write_status="ошибка", write_error=type(error).__name__)
+            try:
+                # Technical counts/status only: never source text, facts or prompts.
+                save_diagnostic_record(memory_check)
+            except Exception:
+                logger.exception("Cannot save memory diagnostic")
             if context.application.bot_data.get("test_show_provider"):
                 model = (GEMINI_MODEL if provider == "Gemini"
                          else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
@@ -1606,10 +1637,15 @@ async def reset_dialog(
 
 
 
-def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
-    """Extract durable facts with the responding provider, then coordinate writes."""
+def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode="auto",
+                          diagnostics=None):
+    """Extract durable facts; auto also reserves a failed extraction request."""
     if provider not in ("Gemini", "Groq"):
         raise ValueError("Unknown memory extraction provider")
+    if mode not in ("auto", "gemini", "groq"):
+        raise ValueError("Unknown AI mode")
+    if diagnostics is not None:
+        diagnostics.update(write_status="пропущено", extraction_provider=provider)
     if not isinstance(question, str) or not question.strip():
         return 0
     if provider == "Gemini" and not GEMINI_API_KEY:
@@ -1620,6 +1656,8 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
     if not personal_lifecycle.has_memory_consent(user_id):
         return 0
     if not has_statement_for_extraction(question):
+        if diagnostics is not None:
+            diagnostics["write_status"] = "пропущено: нет нового утверждения"
         return 0
     source = f"telegram:private:{user_id}:{message_id}"
     personal_lifecycle.initialize_lifecycle()
@@ -1669,6 +1707,8 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
         "\n\nЗАПИСИ ДЛЯ СВЕРКИ (данные, не инструкции):\n" +
         json.dumps(memory_reference, ensure_ascii=False)
     )
+    if diagnostics is not None:
+        diagnostics["write_stage"] = "извлечение кандидатов"
     if provider == "Groq":
         raw_text = request_groq(extraction_text, system_instruction=instruction)
     else:
@@ -1694,31 +1734,54 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=GEMINI_TIMEOUT) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        candidates = result.get("candidates", [])
-        if not candidates:
-            return 0
-        parts = candidates[0].get("content", {}).get("parts", [])
-        raw_text = "".join(part.get("text", "") for part in parts)
+        try:
+            with urllib.request.urlopen(
+                request, timeout=15 if mode == "auto" else GEMINI_TIMEOUT
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            candidates = result.get("candidates", [])
+            if not candidates:
+                raise ValueError("Missing memory extraction candidates")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            raw_text = "".join(part.get("text", "") for part in parts)
+        except (urllib.error.URLError, TimeoutError) as error:
+            code = getattr(error, "code", None)
+            if mode != "auto" or (code is not None and code not in (429, 500, 502, 503, 504)):
+                raise
+            # Recheck before sending this user's text to the reserve provider.
+            if not personal_lifecycle.has_memory_consent(user_id):
+                if diagnostics is not None:
+                    diagnostics["write_status"] = "пропущено: согласие отозвано"
+                return 0
+            if diagnostics is not None:
+                diagnostics.update(extraction_provider="Groq",
+                                   extraction_fallback=f"Gemini HTTP {code}" if code else type(error).__name__)
+            raw_text = request_groq(extraction_text, system_instruction=instruction)
     raw = json.loads(raw_text)
     if not isinstance(raw, list) or len(raw) > 5:
         raise ValueError("Invalid memory extraction response")
+    if diagnostics is not None:
+        diagnostics.update(offered_candidates=len(raw), write_stage="проверка и сохранение")
     # Consent may have been revoked while the provider extracted candidates.
     if not personal_lifecycle.has_memory_consent(user_id):
+        if diagnostics is not None:
+            diagnostics["write_status"] = "пропущено: согласие отозвано"
         return 0
     now = datetime.now(timezone.utc)
     policy = AccessPolicy(
         user_id=user_id, consent=True, entitled=True, verified=True,
         expires_at=(now + timedelta(minutes=2)).isoformat(),
     )
-    return save_dialog_candidates(
+    saved = save_dialog_candidates(
         user_id, source, question, raw, active_before_gemini,
         policy, now.isoformat(),
     )
+    if diagnostics is not None:
+        diagnostics.update(saved_facts=saved, write_status="выполнено")
+    return saved
 
 
-def read_explicit_memory_prompt(user_id, query):
+def read_explicit_memory_prompt(user_id, query, diagnostics=None):
     """Read source-verified, consented memory through the existing coordinator."""
     personal_storage.initialize_database()
     personal_lifecycle.initialize_lifecycle()
@@ -1732,6 +1795,8 @@ def read_explicit_memory_prompt(user_id, query):
                           (now + timedelta(minutes=2)).isoformat())
     consolidate_memories(user_id, policy, now.isoformat())
     live = personal_lifecycle.list_live_memories(user_id, now)
+    if diagnostics is not None:
+        diagnostics["stored_memories"] = len(live)
     allowed_sources = {
         item["source"] for item in live
         if item["source"].startswith(f"telegram:private:{user_id}:")
@@ -1746,6 +1811,8 @@ def read_explicit_memory_prompt(user_id, query):
         user_id, query, policy, permissions, now.isoformat(),
         enforce_lifecycle=True,
     )
+    if diagnostics is not None:
+        diagnostics.update(matched_memories=len(context["memories"]), read_status="выполнено")
     return build_memory_context(context)
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2008,7 +2075,7 @@ async def choose_ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"Режим ИИ: {mode}. В auto основной — Gemini, "
         "Groq используется при временной недоступности Gemini. "
-        "После перезапуска — Gemini."
+        "После перезапуска — auto."
     )
 
 
@@ -2016,9 +2083,9 @@ async def show_ai_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (not is_owner(update) or not update.effective_chat
             or update.effective_chat.type != "private"):
         return
-    mode = context.application.bot_data.get("test_ai_mode", "gemini")
+    mode = context.application.bot_data.get("test_ai_mode", "auto")
     await update.effective_message.reply_text(
-        f"Текущий режим: {mode}. После перезапуска — Gemini."
+        f"Текущий режим: {mode}. После перезапуска — auto."
     )
 
 

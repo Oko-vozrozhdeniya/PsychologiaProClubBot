@@ -10,9 +10,11 @@ import logging
 import os
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from memory import coordinator, storage, lifecycle
 from memory.coordinator import AccessPolicy, SourcePermission, read_context
@@ -112,7 +114,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             "personal_lifecycle": self.personal_lifecycle,
             "request_groq": fake_groq_request,
             "urllib": SimpleNamespace(request=SimpleNamespace(
-                Request=urllib.request.Request, urlopen=fake_urlopen)),
+                Request=urllib.request.Request, urlopen=fake_urlopen), error=urllib.error),
         }
         self.save = load_function("remember_dialog_facts", ns)
         self.read = load_function("read_explicit_memory_prompt", ns)
@@ -453,6 +455,160 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.assertEqual(self.save(101, 1004, "Я изучаю биологию", "Groq"), 0)
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.groq_calls, 0)
+
+    def test_participant_extraction_outage_recovers_and_keeps_owner_separate(self):
+        self.model_result = [{"content": "Предпочитает выращивать жёлтые кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        self.assertEqual(self.save(101, 2500, "Мне нравится выращивать жёлтые кактусы"), 1)
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+        self.model_result = [{"content": "Предпочитает выращивать красные кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+
+        def overloaded(*args, **kwargs):
+            raise urllib.error.HTTPError("https://example.invalid", 503, "overloaded", {}, None)
+
+        self.ns["urllib"].request.urlopen = overloaded
+        self.assertEqual(self.save(202, 2501, "Мне нравится выращивать красные кактусы"), 1)
+        query = "Какие кактусы мне нравится выращивать?"
+        self.assertIn("красные", self.read(202, query))
+        self.assertNotIn("жёлтые", self.read(202, query))
+        self.assertIn("жёлтые", self.read(101, query))
+        self.assertNotIn("красные", self.read(101, query))
+        self.assertEqual(self.groq_calls, 1)
+        self.assertNotIn("жёлтые", self.last_groq_extraction_prompt)
+
+    def test_transient_extraction_failures_are_bounded_and_report_the_real_provider(self):
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+        self.model_result = [{"content": "Предпочитает выращивать красные кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        errors = [urllib.error.HTTPError("https://example.invalid", code, "retry", {}, None)
+                  for code in (429, 500, 502, 503, 504)]
+        errors += [TimeoutError("private connection detail"), urllib.error.URLError("private host")]
+        for index, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                fetch = Mock(side_effect=error)
+                self.ns["urllib"].request.urlopen = fetch
+                check = {}
+                self.save(202, 2510 + index, "Мне нравится выращивать красные кактусы",
+                          "Gemini", "auto", check)
+                fetch.assert_called_once()
+                self.assertEqual(fetch.call_args.kwargs["timeout"], 15)
+                self.assertEqual(check["extraction_provider"], "Groq")
+                self.assertEqual(check["write_status"], "выполнено")
+                self.assertNotIn("private", str(check))
+        self.assertEqual(self.groq_calls, len(errors))
+        self.assertEqual(len(storage.list_memories(202, db_path=self.db)), 1)
+
+    def test_forced_gemini_and_configuration_errors_do_not_silently_use_backup(self):
+        for index, (mode, code) in enumerate((("gemini", 503), ("auto", 400),
+                                            ("auto", 401), ("auto", 403))):
+            with self.subTest(mode=mode, code=code):
+                self.ns["urllib"].request.urlopen = Mock(side_effect=urllib.error.HTTPError(
+                    "https://example.invalid", code, "failure", {}, None))
+                with self.assertRaises(urllib.error.HTTPError):
+                    self.save(101, 2530 + index, "Я изучаю биологию", "Gemini", mode)
+        self.assertEqual(self.groq_calls, 0)
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+
+    def test_consent_revoked_after_primary_failure_prevents_backup_disclosure(self):
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+
+        def revoke_then_fail(*args, **kwargs):
+            lifecycle.set_memory_consent(202, False, datetime.now(timezone.utc), db_path=self.db)
+            raise urllib.error.HTTPError("https://example.invalid", 503, "overloaded", {}, None)
+
+        self.ns["urllib"].request.urlopen = revoke_then_fail
+        self.assertEqual(self.save(202, 2540, "Мне нравится выращивать красные кактусы"), 0)
+        self.assertEqual(self.groq_calls, 0)
+        self.assertEqual(storage.list_memories(202, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_sources(202, datetime.now(timezone.utc), db_path=self.db), [])
+
+    def test_failed_backup_or_malformed_primary_never_writes_guessed_memory(self):
+        self.ns["urllib"].request.urlopen = Mock(side_effect=TimeoutError())
+        self.ns["request_groq"] = Mock(side_effect=TimeoutError())
+        with self.assertRaises(TimeoutError):
+            self.save(101, 2550, "Я изучаю биологию")
+        self.ns["urllib"].request.urlopen = lambda *a, **kw: io.BytesIO(json.dumps({
+            "candidates": [{"content": {"parts": [{"text": "not JSON"}]}}]
+        }).encode())
+        backup = Mock()
+        self.ns["request_groq"] = backup
+        with self.assertRaises(ValueError):
+            self.save(101, 2551, "Я изучаю биологию")
+        backup.assert_not_called()
+        self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+        self.assertEqual(lifecycle.list_live_sources(101, datetime.now(timezone.utc), db_path=self.db), [])
+
+    def test_real_private_participant_save_reset_recall_survives_extraction_outage(self):
+        self.model_result = [{"content": "Предпочитает выращивать жёлтые кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        self.save(101, 2560, "Мне нравится выращивать жёлтые кактусы")
+        lifecycle.set_memory_consent(202, True, datetime.now(timezone.utc), db_path=self.db)
+        self.model_result = [{"content": "Предпочитает выращивать красные кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        self.ns["urllib"].request.urlopen = Mock(side_effect=urllib.error.HTTPError(
+            "https://example.invalid", 503, "overloaded", {}, None))
+        root = Path(self.tmp.name)
+        replies, checks, requests = [], [], []
+
+        async def reply(text):
+            replies.append(text)
+
+        async def send(message, text):
+            await message.reply_text(text)
+
+        async def fail(*args):
+            raise AssertionError("Successful reply must remain deliverable")
+
+        def respond(question, history, memory, mode, gemini):
+            requests.append((question, history, memory, mode))
+            return "Обычный ответ", "Gemini"
+
+        self.ns.update({
+            "os": os, "asyncio": asyncio, "Update": object,
+            "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
+            "DATA_DIR": root, "DIALOG_STATE_FILE": root / "state.json",
+            "DIALOG_HISTORY_FILE": root / "history.jsonl", "MAX_DIALOG_PAIRS": 30,
+            "MAX_DIALOG_CHARS": 30000, "dialog_lock": asyncio.Lock(),
+            "logger": logging.getLogger(__name__), "request_personal_ai": respond,
+            "request_gemini": Mock(), "send_long_message": send, "send_error_response": fail,
+            "save_diagnostic_record": lambda record: checks.append(dict(record)),
+        })
+        for name in ("has_personal_ai_access", "read_dialog_state", "save_dialog_state",
+                     "get_session_id", "append_dialog_record", "read_recent_dialog",
+                     "private_message", "reset_dialog", "format_diagnostic"):
+            load_function(name, self.ns)
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
+        message = SimpleNamespace(message_id=2561, text="Мне нравится выращивать красные кактусы",
+                                  reply_text=reply)
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=202),
+                                 effective_chat=SimpleNamespace(type="private"),
+                                 effective_message=message, message=message)
+
+        async def cycle():
+            await self.ns["private_message"](update, context)
+            archive_before_reset = self.ns["DIALOG_HISTORY_FILE"].read_bytes()
+            await self.ns["reset_dialog"](update, context)
+            self.assertEqual(self.ns["DIALOG_HISTORY_FILE"].read_bytes(), archive_before_reset)
+            message.text, message.message_id = "Какие кактусы мне нравится выращивать?", 2562
+            await self.ns["private_message"](update, context)
+
+        asyncio.run(cycle())
+        self.assertEqual(requests[-1][1], [])
+        self.assertIn("красные", requests[-1][2])
+        self.assertNotIn("жёлтые", requests[-1][2])
+        self.assertEqual(requests[-1][3], "auto")
+        self.assertEqual(checks[0]["extraction_provider"], "Groq")
+        self.assertEqual(checks[0]["saved_facts"], 1)
+        self.assertEqual(checks[1]["stored_memories"], 1)
+        self.assertEqual(checks[1]["matched_memories"], 1)
+        self.assertEqual(self.groq_calls, 1)  # question cannot re-extract facts
+        for check in checks:
+            text = self.ns["format_diagnostic"](check)
+            self.assertNotIn("кактусы", text)
+            self.assertNotIn("жёлтые", text)
+            self.assertNotIn("красные", text)
+        self.assertIn("жёлтые", self.read(101, message.text))
 
     def test_groq_extraction_never_receives_another_users_facts(self):
         self.seed_old()
