@@ -5,7 +5,7 @@ stored consent and independently verified, live participant sources.
 """
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from memory.extraction import (
     extract_candidates, candidate_to_storage_record, has_statement_for_extraction,
 )
@@ -172,9 +172,12 @@ def _private_source(user_id, source):
         raise PermissionError("Invalid participant source")
 
 
-def _register_source(user_id, source, message_text, moment, kwargs):
+def _register_source(user_id, source, message_text, moment, kwargs, created_at=None):
     _private_source(user_id, source)
-    expiry = lifecycle.register_message(user_id, source, message_text, moment, **kwargs)
+    created = moment if created_at is None else lifecycle._moment(created_at)
+    if created > moment or created + timedelta(days=lifecycle.RETENTION_DAYS) <= moment:
+        raise PermissionError("Source timestamp is outside retention")
+    expiry = lifecycle.register_message(user_id, source, message_text, created, **kwargs)
     verified = [item for item in lifecycle.list_live_sources(user_id, moment, **kwargs)
                 if item["source"] == source and item["expires_at"] == expiry]
     if len(verified) != 1:
@@ -208,14 +211,14 @@ def consolidate_memories(user_id, policy, now, *, db_path=None, diagnostics=None
 
 
 def remember_memory(user_id, content, kind, source, message_text, policy, now, *,
-                    db_path=None):
+                    db_path=None, source_created_at=None):
     """Persist an explicitly supplied memory and its live source linkage."""
     kwargs = {"db_path": db_path} if db_path is not None else {}
     moment = _write_policy(user_id, policy, now, kwargs)
     _private_source(user_id, source)
     raw = [{"content": content, "kind": kind, "source": source, "confidence": 1.0}]
     extract_candidates(raw)  # Validate before registering a source.
-    permission = _register_source(user_id, source, message_text, moment, kwargs)
+    permission = _register_source(user_id, source, message_text, moment, kwargs, source_created_at)
     record = prepare_candidates(user_id, raw, policy, [permission], now)[0]
     for existing in lifecycle.list_live_memories(user_id, moment, **kwargs):
         if (existing["source"].startswith(f"telegram:private:{user_id}:")
@@ -230,7 +233,7 @@ def remember_memory(user_id, content, kind, source, message_text, policy, now, *
 def revise_memory(user_id, memory_id, expected_content, expected_source,
                   new_content, new_source, message_text, policy, now, change_kind,
                   *, explicitly_corrected=False, db_path=None,
-                  allow_existing_source=False):
+                  allow_existing_source=False, source_created_at=None):
     """Apply a confirmed revision atomically, rejecting stale or expired sources."""
     kwargs = {"db_path": db_path} if db_path is not None else {}
     moment = _write_policy(user_id, policy, now, kwargs)
@@ -248,7 +251,7 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
     return lifecycle.revise_memory(
         user_id, memory_id, expected_content, expected_source, new_content,
         new_source, message_text, moment, change_kind,
-        allow_existing_source=allow_existing_source, **kwargs,
+        allow_existing_source=allow_existing_source, source_created_at=source_created_at, **kwargs,
     )
 
 
@@ -265,7 +268,8 @@ def forget_memory(user_id, memory_id, policy, now, *, db_path=None):
 
 
 def save_dialog_candidates(user_id, source, message_text, raw_candidates,
-                           visible_memories, policy, now, *, db_path=None):
+                           visible_memories, policy, now, *, db_path=None,
+                           source_created_at=None):
     """Validate and persist a private extraction response behind one boundary.
 
     The caller supplies only the owned live memories shown to the extractor.
@@ -274,6 +278,9 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
     kwargs = {"db_path": db_path} if db_path is not None else {}
     moment = _write_policy(user_id, policy, now, kwargs)
     _private_source(user_id, source)
+    created = moment if source_created_at is None else lifecycle._moment(source_created_at)
+    if created > moment or created + timedelta(days=lifecycle.RETENTION_DAYS) <= moment:
+        raise PermissionError("Source timestamp is outside retention")
     if not has_statement_for_extraction(message_text):
         return 0
     if not isinstance(raw_candidates, list) or len(raw_candidates) > 5:
@@ -294,7 +301,7 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                    and memory_match_key(r["content"], r["kind"])[:2] == ("preference", "preference")
                    and source_supports_memory(message_text, r["content"], r["kind"])]
         if matches and not any(r["source"] == source for r in lifecycle.list_live_sources(user_id, moment, **kwargs)):
-            _register_source(user_id, source, message_text, moment, kwargs)
+            _register_source(user_id, source, message_text, moment, kwargs, created)
             target = min(matches, key=lambda r: r["id"])
             if lifecycle.confirm_memory(user_id, target, source, moment, **kwargs):
                 consolidate_memories(user_id, policy, now, **kwargs)
@@ -304,7 +311,7 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
     # Retries cannot extend the 365-day expiry, duplicate or resurrect a fact.
     if any(item["source"] == source for item in registered_sources):
         return 0
-    permission = _register_source(user_id, source, message_text, moment, kwargs)
+    permission = _register_source(user_id, source, message_text, moment, kwargs, created)
     approved = prepare_candidates(
         user_id, [dict(content=item.content, kind=item.kind,
                        confidence=item.confidence, source=item.source)
@@ -358,7 +365,8 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
             if revise_memory(
                 user_id, target, old["content"], old["source"],
                 candidate["content"], source, message_text, policy, now, kind,
-                explicitly_corrected=True, allow_existing_source=True, **kwargs,
+                explicitly_corrected=True, allow_existing_source=True,
+                source_created_at=created, **kwargs,
             ):
                 old_key = memory_match_key(old["content"], old["kind"])
                 known.pop(old_key, None)

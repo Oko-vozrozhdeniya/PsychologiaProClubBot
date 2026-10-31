@@ -526,7 +526,8 @@ def list_live_sources(user_id, now, *, db_path=storage.DATABASE_PATH):
 
 def revise_memory(user_id, memory_id, expected_content, expected_source,
                   new_content, new_source, message_text, now, change_kind,
-                  *, db_path=storage.DATABASE_PATH, allow_existing_source=False):
+                  *, db_path=storage.DATABASE_PATH, allow_existing_source=False,
+                  source_created_at=None):
     """Atomically revise an owned live memory while preserving its provenance.
 
     A new authenticated Telegram message becomes the only *current* source.
@@ -554,7 +555,10 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
     if new_source == previous_source:
         raise ValueError("A revision requires a new source")
     moment = _moment(now)
-    expiry = (moment + timedelta(days=RETENTION_DAYS)).isoformat()
+    created = moment if source_created_at is None else _moment(source_created_at)
+    expiry = (created + timedelta(days=RETENTION_DAYS)).isoformat()
+    if created > moment or _moment(expiry) <= moment:
+        raise PermissionError("Revision source timestamp is outside retention")
     with storage._connection(db_path) as db:
         db.execute("BEGIN IMMEDIATE")
         consent = db.execute(
@@ -580,12 +584,14 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
         if not active:
             raise PermissionError("Memory has no live source")
         old_message = db.execute(
-            """SELECT 1 FROM private_messages WHERE user_id=?
+            """SELECT created_at FROM private_messages WHERE user_id=?
                AND message_id=? AND expires_at>?""",
             (user_id, previous_source, moment.isoformat()),
         ).fetchone()
         if not old_message:
             raise PermissionError("Previous primary source expired")
+        if created < _moment(old_message["created_at"]):
+            raise PermissionError("Revision predates the current source")
         registered = db.execute(
             """SELECT content, created_at, expires_at FROM private_messages
                WHERE user_id=? AND message_id=?""",
@@ -595,7 +601,7 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
             if (not allow_existing_source or
                 (registered["content"], registered["created_at"],
                  registered["expires_at"]) != (
-                     message_text, moment.isoformat(), expiry)):
+                     message_text, created.isoformat(), expiry)):
                 raise ValueError("Duplicate or mismatched revision message")
         if previous == new_content:
             return False
@@ -603,7 +609,7 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
             db.execute(
                 """INSERT INTO private_messages(user_id, message_id, content,
                    created_at, expires_at) VALUES (?, ?, ?, ?, ?)""",
-                (user_id, new_source, message_text, moment.isoformat(), expiry),
+                (user_id, new_source, message_text, created.isoformat(), expiry),
             )
         db.execute(
             """INSERT INTO memory_revisions(user_id, memory_id,

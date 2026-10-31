@@ -139,7 +139,9 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.request = Mock(return_value=("Ответ по текущему вопросу", "Gemini"))
         self.extract = Mock(return_value=1)
         self.lookup = Mock(return_value="Разрешённая память")
+        from memory import cleanup_worker
         self.ns = {
+            "retention_worker": cleanup_worker,
             "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
             "OWNER_ID": 101, "TEST_USER_IDS": {202},
             "DATA_DIR": self.root, "DIALOG_STATE_FILE": self.root / "state.json",
@@ -169,7 +171,8 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.history = Mock(wraps=self.ns["read_recent_dialog"])
         self.ns.update(append_dialog_record=self.append, read_recent_dialog=self.history)
         self.reply = AsyncMock()
-        message = SimpleNamespace(text="Мой новый вопрос", message_id=12, reply_text=self.reply)
+        message = SimpleNamespace(text="Мой новый вопрос", message_id=12,
+                                  date=datetime.now(timezone.utc), reply_text=self.reply)
         self.update = SimpleNamespace(
             effective_user=SimpleNamespace(id=202),
             effective_chat=SimpleNamespace(type="private"),
@@ -200,8 +203,10 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[0], "Мой новый вопрос")
         self.assertIn("Моя прежняя реплика", str(args[1]))
         self.assertNotIn("Чужая прежняя реплика", str(args[1]))
-        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ по текущему вопросу")
-        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Gemini", "auto", ANY)
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ по текущему вопросу",
+            question_created_at=self.update.effective_message.date, answer_created_at=ANY)
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Gemini", "auto", ANY,
+            source_created_at=self.update.effective_message.date)
         self.assertEqual(self.request.call_args.args[3], "auto")
         self.assertTrue(self.ns["DIALOG_HISTORY_FILE"].read_bytes().startswith(self.history_before))
 
@@ -246,8 +251,10 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Моя прежняя реплика", str(history))
         self.assertNotIn("Чужая прежняя реплика", str(history))
         self.assertEqual(memory, "Разрешённая память")
-        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ резерва")
-        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Groq", "auto", ANY)
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ резерва",
+            question_created_at=self.update.effective_message.date, answer_created_at=ANY)
+        self.extract.assert_called_once_with(202, 12, "Мой новый вопрос", "Groq", "auto", ANY,
+            source_created_at=self.update.effective_message.date)
         self.ns["send_long_message"].assert_awaited_once()
         self.ns["send_error_response"].assert_not_awaited()
 
@@ -273,7 +280,8 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
         self.extract.side_effect = GroqRequestError("timeout")
         with self.assertLogs(level="ERROR"):
             await self.invoke()
-        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ Groq")
+        self.append.assert_called_once_with(202, 0, "Мой новый вопрос", "Ответ Groq",
+            question_created_at=self.update.effective_message.date, answer_created_at=ANY)
         self.ns["send_long_message"].assert_awaited_once()
         self.assertEqual(self.ns["send_long_message"].await_args.args[1], "Ответ Groq")
         self.ns["send_error_response"].assert_not_awaited()

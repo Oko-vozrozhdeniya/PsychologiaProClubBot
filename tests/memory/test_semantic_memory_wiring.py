@@ -33,7 +33,9 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             if isinstance(n, ast.FunctionDef)
             and n.name == "remember_dialog_facts"
         )
+        from memory import cleanup_worker
         self.ns = {
+            "retention_worker": cleanup_worker,
             "GEMINI_API_KEY": "test-key",
             "OWNER_ID": 101,
             "TEST_USER_IDS": set(),

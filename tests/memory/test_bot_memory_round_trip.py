@@ -17,12 +17,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from memory import coordinator, storage, lifecycle
+from memory import cleanup_worker as retention_worker
 from memory.coordinator import AccessPolicy, SourcePermission, read_context
 from memory.prompt_context import build_memory_context
 from memory.extraction import has_statement_for_extraction
 
 
 def load_function(name, namespace):
+    namespace.setdefault("retention_worker", retention_worker)
     source = (Path(__file__).resolve().parents[2] / "bot.py").read_text(encoding="utf-8")
     node = next(
         item for item in ast.parse(source).body
@@ -120,7 +122,7 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.read = load_function("read_explicit_memory_prompt", ns)
         self.ns = ns
 
-    def command(self, name, args=(), *, user=101, message_id=700, chat_type="private"):
+    def command(self, name, args=(), *, user=101, message_id=700, chat_type="private", created_at=None):
         replies = []
 
         async def reply_text(text):
@@ -142,7 +144,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             effective_chat=SimpleNamespace(type=chat_type),
             effective_user=SimpleNamespace(id=user),
             effective_message=SimpleNamespace(
-                message_id=message_id, text="/command " + " ".join(args), reply_text=reply_text),
+                message_id=message_id, date=created_at if created_at is not None else datetime.now(timezone.utc),
+                text="/command " + " ".join(args), reply_text=reply_text),
         )
         context = SimpleNamespace(args=list(args))
         if name == "revise_command":
@@ -579,7 +582,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                      "private_message", "reset_dialog", "format_diagnostic"):
             load_function(name, self.ns)
         context = SimpleNamespace(application=SimpleNamespace(bot_data={}))
-        message = SimpleNamespace(message_id=2561, text="Мне нравится выращивать красные кактусы",
+        message = SimpleNamespace(message_id=2561, date=datetime.now(timezone.utc),
+                                  text="Мне нравится выращивать красные кактусы",
                                   reply_text=reply)
         update = SimpleNamespace(effective_user=SimpleNamespace(id=202),
                                  effective_chat=SimpleNamespace(type="private"),

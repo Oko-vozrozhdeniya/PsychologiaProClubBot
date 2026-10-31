@@ -20,6 +20,7 @@ from memory.ai_providers import (
     GroqRequestError, request_groq, request_personal_ai, GROQ_DEFAULT_MODEL
 )
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
+from memory import cleanup_worker as retention_worker
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
 from memory.extraction import has_statement_for_extraction
@@ -71,6 +72,7 @@ MAX_ANSWER_CHARS = 3800
 MAX_DIALOG_PAIRS = 30
 MAX_DIALOG_CHARS = 30000
 GEMINI_TIMEOUT = 90
+RETENTION_INTERVAL_SECONDS = 3600
 
 dialog_lock = asyncio.Lock()
 
@@ -264,6 +266,18 @@ def read_diagnostic_records(limit=5):
 
 
 def format_diagnostic(record):
+    if record.get("record_type") == "retention":
+        labels = (
+            ("timestamp", "Время (UTC)"), ("status", "Результат"),
+            ("expired_messages", "Удалено источников SQLite"),
+            ("deleted_memories", "Удалено зависимых фактов"),
+            ("expired_dialog_messages", "Удалено сообщений полной переписки"),
+            ("deleted_dialog_records", "Удалено пустых пар переписки"),
+            ("error_class", "Тип ошибки"),
+        )
+        return "🔧 Очистка сроков хранения: 365 дней\n\n" + "\n".join(
+            f"{label}: {record[key]}" for key, label in labels if key in record
+        )
     if record.get("record_type") == "memory":
         labels = (
             ("timestamp", "Время (UTC)"), ("user_id", "Аккаунт (Telegram ID)"),
@@ -678,35 +692,32 @@ def append_dialog_record(
     user_id,
     session_id,
     question,
-    answer
+    answer,
+    *,
+    question_created_at=None,
+    answer_created_at=None
 ):
     DATA_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
 
+    now = datetime.now(timezone.utc)
+    question_at = retention_worker.message_time(
+        question_created_at if question_created_at is not None else now, now)
+    answer_at = retention_worker.message_time(
+        answer_created_at if answer_created_at is not None else now, now)
     record = {
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "timestamp": answer_at.isoformat(),
+        "question_timestamp": question_at.isoformat(),
+        "answer_timestamp": answer_at.isoformat(),
         "user_id": user_id,
         "session_id": session_id,
         "question": question,
         "answer": answer
     }
 
-    with DIALOG_HISTORY_FILE.open(
-        "a",
-        encoding="utf-8"
-    ) as file:
-        file.write(
-            json.dumps(
-                record,
-                ensure_ascii=False
-            ) + "\n"
-        )
-        file.flush()
-        os.fsync(file.fileno())
+    retention_worker.append_archive_record(DIALOG_HISTORY_FILE, record)
 
 
 def read_recent_dialog(
@@ -719,48 +730,20 @@ def read_recent_dialog(
     recent_pairs = []
 
     try:
-        with DIALOG_HISTORY_FILE.open(
-            "r",
-            encoding="utf-8"
-        ) as file:
-            for line in file:
-                if not line.strip():
-                    continue
-
-                record = json.loads(line)
-
-                if not isinstance(record, dict):
-                    continue
-
-                if record.get("user_id") != user_id:
-                    continue
-
-                if record.get("session_id") != session_id:
-                    continue
-
-                question = record.get("question")
-                answer = record.get("answer")
-
-                if not (
-                    isinstance(question, str)
-                    and isinstance(answer, str)
-                ):
-                    continue
-
-                recent_pairs.append(
-                    (question, answer)
-                )
-
-                if len(recent_pairs) > MAX_DIALOG_PAIRS:
-                    recent_pairs.pop(0)
+        for record in retention_worker.live_dialog_records(
+                DIALOG_HISTORY_FILE, datetime.now(timezone.utc)):
+            if record["user_id"] != user_id or record["session_id"] != session_id:
+                continue
+            recent_pairs.append((record["question"], record["answer"]))
+            if len(recent_pairs) > MAX_DIALOG_PAIRS:
+                recent_pairs.pop(0)
 
     except (
         OSError,
-        json.JSONDecodeError
+        ValueError,
+        KeyError
     ) as error:
-        logger.exception(
-            "Cannot read private dialog history"
-        )
+        logger.error("Cannot read private dialog history: %s", type(error).__name__)
         raise RuntimeError(
             "Не удалось прочитать "
             "историю диалога."
@@ -1398,6 +1381,14 @@ async def private_message(
             question = message.text.strip()
             if not question:
                 return
+            try:
+                message_created_at = retention_worker.message_time(
+                    message.date, datetime.now(timezone.utc))
+            except PermissionError:
+                await message.reply_text(
+                    "Срок обработки этого сообщения истёк. Отправьте его заново."
+                )
+                return
             memory_check = {
                 "record_type": "memory", "timestamp": datetime.now(timezone.utc).isoformat(),
                 "user_id": user_id, "message_id": message.message_id,
@@ -1439,6 +1430,7 @@ async def private_message(
                 mode,
                 request_gemini,
             )
+            answer_created_at = datetime.now(timezone.utc)
             # A request already in flight may outlive the stored consent.
             if not await asyncio.to_thread(
                 personal_lifecycle.has_memory_consent, user_id
@@ -1453,7 +1445,9 @@ async def private_message(
                 user_id,
                 session_id,
                 question,
-                answer
+                answer,
+                question_created_at=message_created_at,
+                answer_created_at=answer_created_at,
             )
             memory_check["answer_provider"] = provider
             try:
@@ -1465,6 +1459,7 @@ async def private_message(
                     provider,
                     mode,
                     memory_check,
+                    source_created_at=message_created_at,
                 )
                 logger.info("Automatic memory saved %s facts", saved_facts)
             except Exception as error:
@@ -1638,7 +1633,7 @@ async def reset_dialog(
 
 
 def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode="auto",
-                          diagnostics=None):
+                          diagnostics=None, *, source_created_at=None):
     """Extract durable facts; auto also reserves a failed extraction request."""
     if provider not in ("Gemini", "Groq"):
         raise ValueError("Unknown memory extraction provider")
@@ -1662,6 +1657,9 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
     source = f"telegram:private:{user_id}:{message_id}"
     personal_lifecycle.initialize_lifecycle()
     now_before_gemini = datetime.now(timezone.utc)
+    created = retention_worker.message_time(
+        source_created_at if source_created_at is not None else now_before_gemini,
+        now_before_gemini)
     consolidate_memories(
         user_id, AccessPolicy(user_id, True, True, True,
             (now_before_gemini + timedelta(minutes=2)).isoformat()),
@@ -1775,6 +1773,7 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
     saved = save_dialog_candidates(
         user_id, source, question, raw, active_before_gemini,
         policy, now.isoformat(),
+        source_created_at=created,
     )
     if diagnostics is not None:
         diagnostics.update(saved_facts=saved, write_status="выполнено")
@@ -1841,6 +1840,7 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             memory_id = remember_memory(
                 user_id, content, "fact", source, content, policy, now.isoformat(),
+                source_created_at=update.effective_message.date,
             )
         except PermissionError:
             await update.effective_message.reply_text(
@@ -1989,6 +1989,7 @@ async def revise_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 user_id, memory_id, old["content"], old["source"],
                 new_content, source, update.effective_message.text,
                 policy, now.isoformat(), change_kind, explicitly_corrected=True,
+                source_created_at=update.effective_message.date,
             )
         except (LookupError, ValueError, PermissionError) as error:
             logger.warning("Memory revision refused: %s", type(error).__name__)
@@ -2118,10 +2119,72 @@ async def groq_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def retention_cleanup_pass(application):
+    """One observable pass, serialized with private handlers and safe on stop."""
+    async with dialog_lock:
+        record = {"record_type": "retention",
+                  "timestamp": datetime.now(timezone.utc).isoformat()}
+        try:
+            operation = asyncio.create_task(asyncio.to_thread(
+                retention_worker.cleanup_once, personal_storage.DATABASE_PATH,
+                now=datetime.now(timezone.utc),
+                archive_path=DIALOG_HISTORY_FILE,
+            ))
+            try:
+                result = await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # to_thread cannot cancel filesystem work. Keep the lock and
+                # wait for it before allowing shutdown to close the loop.
+                try:
+                    await operation
+                except Exception as error:
+                    logger.error("Retention cleanup failed on stop: %s", type(error).__name__)
+                raise
+            record.update(status="выполнено", **result)
+            logger.info("Retention cleanup: %s", result)
+        except Exception as error:
+            record.update(status="ошибка; повтор в следующем цикле",
+                          error_class=type(error).__name__)
+            logger.error("Retention cleanup failed: %s", type(error).__name__)
+        application.bot_data["retention_status"] = record
+        try:
+            save_diagnostic_record(record)
+        except Exception as error:
+            logger.error("Cannot save retention diagnostic: %s", type(error).__name__)
+
+
+async def retention_cleanup_loop(application):
+    while True:
+        await asyncio.sleep(RETENTION_INTERVAL_SECONDS)
+        await retention_cleanup_pass(application)
+
+
+async def start_retention_cleanup(application):
+    """Run before polling, then maintain hourly without another host process."""
+    previous = application.bot_data.get("_retention_task")
+    if previous is not None and not previous.done():
+        return
+    await retention_cleanup_pass(application)
+    application.bot_data["_retention_task"] = asyncio.create_task(
+        retention_cleanup_loop(application), name="private-retention-cleanup")
+
+
+async def stop_retention_cleanup(application):
+    task = application.bot_data.pop("_retention_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def main():
     app = Application.builder().token(
         TOKEN
-    ).build()
+    ).post_init(start_retention_cleanup).post_stop(
+        stop_retention_cleanup
+    ).post_shutdown(stop_retention_cleanup).build()
 
     app.add_handler(
         CommandHandler("start", start)

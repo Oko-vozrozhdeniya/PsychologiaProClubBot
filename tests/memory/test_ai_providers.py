@@ -320,6 +320,9 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
         app = SimpleNamespace(add_handler=add_handler, run_polling=Mock())
         builder = MagicMock()
         builder.token.return_value = builder
+        builder.post_init.return_value = builder
+        builder.post_stop.return_value = builder
+        builder.post_shutdown.return_value = builder
         builder.build.return_value = app
         self.ns.update({
             "Application": SimpleNamespace(builder=lambda: builder), "TOKEN": "FAKE",
@@ -329,10 +332,14 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
         for name in ("start", "analyze", "reset_dialog", "remember_command", "memories_command",
                      "forget_command", "memory_on_command", "memory_off_command", "correct_command",
                      "change_command", "history_command", "diagnostics", "testai", "groq_ping",
-                     "private_message", "save_message", "track_topic_changes"):
+                     "private_message", "save_message", "track_topic_changes",
+                     "start_retention_cleanup", "stop_retention_cleanup"):
             self.ns[name] = Mock()
         exec(compile(ast.Module(body=[self.functions["main"]], type_ignores=[]), "bot.py", "exec"), self.ns)
         self.ns["main"]()
+        builder.post_init.assert_called_once_with(self.ns["start_retention_cleanup"])
+        builder.post_stop.assert_called_once_with(self.ns["stop_retention_cleanup"])
+        builder.post_shutdown.assert_called_once_with(self.ns["stop_retention_cleanup"])
         for command in ("ai_gemini", "ai_groq", "ai_auto"):
             self.assertIs(registered[command][1], self.ns["choose_ai_mode"])
             self.assertIsNotNone(registered[command][2])
