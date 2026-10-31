@@ -266,6 +266,15 @@ def read_diagnostic_records(limit=5):
 
 
 def format_diagnostic(record):
+    if record.get("record_type") == "recovery":
+        labels = (("timestamp", "Время (UTC)"), ("status", "Результат"),
+                  ("verified_files", "Проверено компонентов"),
+                  ("temporary_copies_removed", "Временные копии удалены"),
+                  ("live_data_replaced", "Рабочие данные заменялись"),
+                  ("review_required", "Активация требует сверки удалений/согласия"),
+                  ("error_class", "Тип ошибки"))
+        return "🔧 Резервирование и восстановление: проверка\n\n" + "\n".join(
+            f"{label}: {record[key]}" for key, label in labels if key in record)
     if record.get("record_type") == "retention":
         labels = (
             ("timestamp", "Время (UTC)"), ("status", "Результат"),
@@ -2119,6 +2128,46 @@ async def groq_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def recovery_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner's bounded rehearsal; no participant export or live-data restore."""
+    if not has_memory_test_access(update):
+        return
+    record = {"record_type": "recovery", "timestamp": datetime.now(timezone.utc).isoformat()}
+    async with dialog_lock:
+        try:
+            operation = asyncio.create_task(asyncio.to_thread(
+                retention_worker.check_recovery_quiescent, DATA_DIR,
+                now=datetime.now(timezone.utc), db_path=personal_storage.DATABASE_PATH))
+            try:
+                result = await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # A filesystem thread cannot be cancelled. Drain it, including
+                # temporary-copy removal, before releasing the dialog lock.
+                try:
+                    await operation
+                except Exception as error:
+                    logger.error("Recovery check failed on stop: %s", type(error).__name__)
+                raise
+            record.update(status="выполнено", **result)
+        except Exception as error:
+            record.update(status="ошибка", error_class=type(error).__name__)
+            logger.error("Recovery check failed: %s", type(error).__name__)
+    try:
+        save_diagnostic_record(record)
+    except Exception as error:
+        logger.error("Cannot save recovery diagnostic: %s", type(error).__name__)
+    if record["status"] == "выполнено":
+        await update.effective_message.reply_text(
+            "Проверка резервирования и восстановления выполнена.\n"
+            "Проверены база памяти, переписка и сессии. "
+            "Временные копии удалены; рабочие данные не заменялись.\n"
+            "Это проверка на этом сервере; независимое хранение копий проверяется отдельно.")
+    else:
+        await update.effective_message.reply_text(
+            "Проверка восстановления не завершена. Рабочие данные не заменялись. "
+            "Технический результат: /diagnostics 1")
+
+
 async def retention_cleanup_pass(application):
     """One observable pass, serialized with private handlers and safe on stop."""
     async with dialog_lock:
@@ -2205,6 +2254,7 @@ def main():
     app.add_handler(CommandHandler("correct", correct_command))
     app.add_handler(CommandHandler("change", change_command))
     app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("recovery_check", recovery_check_command))
     for command in ("ai_gemini", "ai_groq", "ai_auto"):
         app.add_handler(CommandHandler(
             command, choose_ai_mode,
@@ -2275,13 +2325,14 @@ def main():
         )
     )
 
-    print(
-        "ИИ-помощник «Психология Pro» "
-        "запущен с Gemini и диагностикой",
-        flush=True
-    )
-
-    app.run_polling()
+    with retention_worker.data_directory_lock(DATA_DIR):
+        retention_worker.ensure_recovery_ready(DATA_DIR)
+        print(
+            "ИИ-помощник «Психология Pro» "
+            "запущен с Gemini и диагностикой",
+            flush=True
+        )
+        app.run_polling()
 
 
 if __name__ == "__main__":

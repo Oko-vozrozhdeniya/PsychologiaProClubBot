@@ -328,12 +328,13 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
             "Application": SimpleNamespace(builder=lambda: builder), "TOKEN": "FAKE",
             "CommandHandler": lambda name, callback, **kw: (name, callback, kw.get("filters")),
             "MessageHandler": lambda *args: None, "filters": MagicMock(),
+            "retention_worker": MagicMock(), "DATA_DIR": "CONTROL_DATA_DIR",
         })
         for name in ("start", "analyze", "reset_dialog", "remember_command", "memories_command",
                      "forget_command", "memory_on_command", "memory_off_command", "correct_command",
                      "change_command", "history_command", "diagnostics", "testai", "groq_ping",
                      "private_message", "save_message", "track_topic_changes",
-                     "start_retention_cleanup", "stop_retention_cleanup"):
+                     "start_retention_cleanup", "stop_retention_cleanup", "recovery_check_command"):
             self.ns[name] = Mock()
         exec(compile(ast.Module(body=[self.functions["main"]], type_ignores=[]), "bot.py", "exec"), self.ns)
         self.ns["main"]()
@@ -345,6 +346,7 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(registered[command][2])
         self.assertIs(registered["ai_mode"][1], self.ns["show_ai_mode"])
         self.assertIsNotNone(registered["ai_mode"][2])
+        self.assertIs(registered["recovery_check"][1], self.ns["recovery_check_command"])
 
 
 if __name__ == "__main__":
