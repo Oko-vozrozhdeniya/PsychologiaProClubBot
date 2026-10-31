@@ -158,6 +158,11 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
                 "DELETE FROM memory_sources WHERE user_id=? AND memory_id=?",
                 (user_id, memory_id),
             )
+        if "memory_merges" in tables:
+            connection.execute(
+                "DELETE FROM memory_merges WHERE user_id=? AND kept_memory_id=?",
+                (user_id, memory_id),
+            )
         cursor = connection.execute("""
             DELETE FROM memories
             WHERE user_id = ? AND id = ?

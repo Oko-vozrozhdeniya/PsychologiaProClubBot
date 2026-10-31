@@ -46,6 +46,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             has_memory_consent=lambda uid: lifecycle.has_memory_consent(uid, db_path=self.db),
             list_live_sources=lambda uid, t: lifecycle.list_live_sources(uid, t, db_path=self.db),
             list_live_memories=lambda uid, t: lifecycle.list_live_memories(uid, t, db_path=self.db),
+            list_memory_revisions=lambda uid, mid, t: lifecycle.list_memory_revisions(uid, mid, t, db_path=self.db),
+            list_memory_merges=lambda uid, mid, t: lifecycle.list_memory_merges(uid, mid, t, db_path=self.db),
             register_message=lambda uid, src, c, t: lifecycle.register_message(
                 uid, src, c, t, db_path=self.db),
             link_memory_sources=lambda uid, mid, sources, t: lifecycle.link_memory_sources(
@@ -92,6 +94,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             "json": json, "datetime": datetime, "timezone": timezone,
             "timedelta": timedelta, "AccessPolicy": AccessPolicy,
             "SourcePermission": SourcePermission,
+            "consolidate_memories": lambda *args, **kw: coordinator.consolidate_memories(
+                *args, db_path=self.db, **kw),
             "save_dialog_candidates": lambda *args, **kw: coordinator.save_dialog_candidates(
                 *args, db_path=self.db, **kw),
             "remember_memory": lambda *args, **kw: coordinator.remember_memory(
@@ -120,10 +124,14 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         async def reply_text(text):
             replies.append(text)
 
+        async def send_long_message(message, text):
+            await message.reply_text(text)
+
         self.ns.update({
             "Update": object, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
             "dialog_lock": asyncio.Lock(),
             "logger": logging.getLogger(__name__),
+            "send_long_message": send_long_message,
         })
         for helper in ("is_owner", "has_personal_ai_access", "has_memory_test_access"):
             load_function(helper, self.ns)
@@ -229,6 +237,76 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         mid = storage.add_memory(101, content, "fact", source, db_path=self.db)
         lifecycle.link_memory_sources(101, mid, [source], now, db_path=self.db)
         return mid
+
+    def seed_live_duplicate_pairs(self):
+        rows = [
+            ("Пользователь теперь предпочитает выращивать жёлтые кактусы вместо фиолетовых",
+             "Раньше мне нравилось выращивать фиолетовые кактусы, а теперь мне нравятся выращивать жёлтые кактусы"),
+            ("Пользователь предпочитает выращивать жёлтые кактусы", "Какие кактусы мне нравится выращивать?"),
+            ("Пользователь раньше предпочитал собирать деревянные модели кораблей, теперь предпочитает собирать металлические модели кораблей",
+             "Раньше мне нравилось собирать деревянные модели кораблей, а теперь я предпочитаю собирать металлические модели кораблей"),
+            ("Пользователь предпочитает собирать металлические модели кораблей", "Какие модели кораблей мне нравятся?"),
+        ]
+        now = datetime.now(timezone.utc)
+        for message_id, (fact, message) in enumerate(rows, 2000):
+            src = f"telegram:private:101:{message_id}"
+            lifecycle.register_message(101, src, message, now, db_path=self.db)
+            mid = storage.add_memory(101, fact, "preference", src, self.db)
+            lifecycle.link_memory_sources(101, mid, [src], now, db_path=self.db)
+
+    def test_real_bot_read_compacts_four_legacy_rows_and_preserves_archive(self):
+        self.seed_live_duplicate_pairs()
+        archive = Path(self.tmp.name) / "private_history.jsonl"
+        archive.write_text('unchanged archive control\n', encoding="utf-8")
+        before = archive.read_bytes()
+        response = self.read(101, "Какие модели кораблей мне нравятся?")
+        self.assertIn("металлические модели кораблей", response)
+        self.assertNotIn("деревянные", response)
+        current = storage.list_memories(101, db_path=self.db)
+        self.assertEqual(len(current), 2)
+        self.assertEqual({r["id"] for r in current}, {1, 3})
+        self.assertEqual(archive.read_bytes(), before)
+        self.assertEqual(self.calls + self.groq_calls, 0)
+        with storage._connection(self.db) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM private_messages").fetchone()[0], 4)
+        self.assertEqual(self.read(202, "Какие модели кораблей мне нравятся?"), "")
+
+    def test_existing_owner_commands_show_compacted_memory_and_original_audit(self):
+        self.seed_live_duplicate_pairs()
+        reply = self.command("memories_command")[0]
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+        self.assertIn("металлические модели кораблей", reply)
+        self.assertNotIn("деревянные", reply)
+        history = self.command("history_command", ["3"])[0]
+        self.assertIn("деревянные", history)
+        self.assertIn("объединён повтор №4", history)
+
+    def test_repeated_preference_is_not_added_again_by_either_provider(self):
+        self.seed_live_duplicate_pairs()
+        self.model_result = [{"content": "Любит собирать металлические модели кораблей",
+                              "kind": "preference", "confidence": 0.99}]
+        for message_id, provider in enumerate(("Gemini", "Groq"), 2100):
+            self.assertEqual(self.save(101, message_id,
+                "Мне нравится собирать металлические модели кораблей", provider), 0)
+            self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(self.groq_calls, 1)
+
+    def test_natural_revision_after_consolidation_preserves_merged_audit(self):
+        self.seed_live_duplicate_pairs()
+        self.read(101, "Какие модели кораблей мне нравятся?")
+        old = storage.get_memory(101, 3, self.db)
+        self.model_result = [{"content": "Предпочитает собирать пластиковые модели кораблей",
+                              "kind": "preference", "confidence": 0.99,
+                              "replaces_memory_id": 3, "replaces_content": old["content"],
+                              "revision_kind": "change"}]
+        self.assertEqual(self.save(101, 2200,
+            "Раньше мне нравились металлические модели кораблей, теперь предпочитаю собирать пластиковые модели кораблей", "Groq"), 1)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+        self.assertIn("пластиковые модели", self.read(101, "Какие модели кораблей мне нравятся?"))
+        self.assertEqual(len(lifecycle.list_memory_revisions(
+            101, 3, datetime.now(timezone.utc), db_path=self.db)), 1)
+        self.assertTrue(lifecycle.list_memory_merges(101, 3, datetime.now(timezone.utc), db_path=self.db))
 
     def test_groq_saves_and_recalls_without_gemini_key_or_request(self):
         self.ns["GEMINI_API_KEY"] = ""

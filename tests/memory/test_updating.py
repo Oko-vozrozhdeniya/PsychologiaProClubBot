@@ -7,10 +7,64 @@ from memory.updating import (
     UpdateDecision,
     decision_to_record,
     make_update_decision,
+    memory_match_key, preference_key, source_supports_memory, current_memory_content,
 )
 
 
 class TestMemoryUpdating(unittest.TestCase):
+
+    def test_preference_paraphrases_match_without_sorting_objects(self):
+        first = "Пользователь теперь предпочитает выращивать жёлтые кактусы вместо фиолетовых"
+        second = "Пользователь увлекается выращиванием желтых кактусов."
+        self.assertEqual(memory_match_key(first, "preference"),
+                         memory_match_key(second, "preference"))
+        self.assertTrue(source_supports_memory("Мне нравится выращивать жёлтые кактусы",
+                                              first, "preference"))
+
+    def test_temporal_ship_preference_matches_only_current_value(self):
+        old = ("Пользователь раньше предпочитал собирать деревянные модели кораблей, "
+               "теперь предпочитает собирать металлические модели кораблей")
+        current = "Пользователь предпочитает собирать металлические модели кораблей"
+        self.assertEqual(memory_match_key(old, "preference"), memory_match_key(current, "preference"))
+        self.assertNotEqual(memory_match_key(old, "preference"),
+                            memory_match_key("Любит собирать деревянные модели кораблей", "preference"))
+
+    def test_conflicts_subjects_negations_and_numbers_are_not_equivalent(self):
+        base = memory_match_key("Любит выращивать жёлтые кактусы", "preference")
+        for other in ("Не любит выращивать жёлтые кактусы", "Мама любит выращивать жёлтые кактусы",
+                      "Любит выращивать фиолетовые кактусы", "Любит поливать жёлтые кактусы",
+                      "Любит выращивать 2 жёлтых кактуса", "Любит выращивать кактусы и розы",
+                      "Возможно любит выращивать жёлтые кактусы"):
+            with self.subTest(other=other):
+                self.assertNotEqual(base, memory_match_key(other, "preference"))
+        self.assertNotEqual(memory_match_key("Живёт в доме 12", "fact"),
+                            memory_match_key("Живёт в доме 21", "fact"))
+        self.assertNotEqual(memory_match_key("Любит Анну больше Марии", "preference"),
+                            memory_match_key("Любит Марию больше Анны", "preference"))
+
+    def test_question_or_other_person_is_not_support_for_reconfirmation(self):
+        fact = "Предпочитает собирать металлические модели кораблей"
+        for text in ("Какие модели кораблей мне нравятся?", "Брат любит собирать металлические модели кораблей",
+                     "Сегодня я ел апельсин", "Я не люблю собирать металлические модели кораблей"):
+            with self.subTest(text=text):
+                self.assertFalse(source_supports_memory(text, fact, "preference"))
+
+    def test_names_and_brands_do_not_enter_inflection_matching(self):
+        for left, right in (("Любит рассказы Полины", "Любит рассказы Полин"),
+                            ("Любит модели Airbus", "Любит модели Airbu")):
+            with self.subTest(left=left):
+                self.assertIsNone(preference_key(left))
+                self.assertNotEqual(memory_match_key(left, "preference"),
+                                    memory_match_key(right, "preference"))
+
+    def test_separating_old_wording_preserves_identity_and_source_support(self):
+        for text in ("Раньше мне нравилось собирать деревянные модели кораблей, теперь я предпочитаю собирать металлические модели кораблей",
+                     "Пользователь раньше любил собирать деревянные модели кораблей, теперь пользователь предпочитает собирать металлические модели кораблей"):
+            with self.subTest(text=text):
+                current = current_memory_content(text, "preference")
+                self.assertNotIn("деревянные", current)
+                self.assertEqual(memory_match_key(text, "preference"), memory_match_key(current, "preference"))
+                self.assertTrue(source_supports_memory("Я предпочитаю собирать металлические модели кораблей", current, "preference"))
 
     def test_unchanged_content(self):
         result = make_update_decision(

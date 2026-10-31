@@ -45,6 +45,7 @@ class SemanticMemoryWiringTests(unittest.TestCase):
             "timedelta": timedelta,
             "AccessPolicy": AccessPolicy,
             "has_statement_for_extraction": has_statement_for_extraction,
+            "consolidate_memories": lambda *args: coordinator.consolidate_memories(*args, db_path=self.db),
             "save_dialog_candidates": lambda *args, **kw: coordinator.save_dialog_candidates(
                 *args, db_path=self.db, **kw),
             "personal_storage": SimpleNamespace(

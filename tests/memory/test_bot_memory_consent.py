@@ -52,6 +52,7 @@ class PrivateMemoryConsentTests(unittest.TestCase):
             "AccessPolicy": coordinator.AccessPolicy,
             "SourcePermission": coordinator.SourcePermission,
             "read_context": verified, "build_memory_context": build_memory_context,
+            "consolidate_memories": lambda *args: coordinator.consolidate_memories(*args, db_path=self.db),
             "datetime": datetime, "timezone": timezone, "timedelta": timedelta,
         }
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "bot.py", "exec"), ns)

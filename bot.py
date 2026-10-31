@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from memory.coordinator import (
     AccessPolicy, SourcePermission, read_context, save_dialog_candidates,
     remember_memory, revise_memory, forget_memory,
+    consolidate_memories,
 )
 from pathlib import Path
 
@@ -1623,6 +1624,11 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
     source = f"telegram:private:{user_id}:{message_id}"
     personal_lifecycle.initialize_lifecycle()
     now_before_gemini = datetime.now(timezone.utc)
+    consolidate_memories(
+        user_id, AccessPolicy(user_id, True, True, True,
+            (now_before_gemini + timedelta(minutes=2)).isoformat()),
+        now_before_gemini.isoformat(),
+    )
     active_before_gemini = [
         item for item in personal_lifecycle.list_live_memories(
             user_id, now_before_gemini
@@ -1631,7 +1637,7 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini"):
     ][:20]
     # Only this user's live memories enter the extraction prompt.
     memory_reference = [
-        {"id": item["id"], "content": item["content"][:240],
+        {"id": item["id"], "content": item["content"],
          "kind": item["kind"]}
         for item in active_before_gemini
     ]
@@ -1722,6 +1728,9 @@ def read_explicit_memory_prompt(user_id, query):
         return ""
     now = datetime.now(timezone.utc)
     personal_lifecycle.purge_expired(now)
+    policy = AccessPolicy(user_id, True, True, True,
+                          (now + timedelta(minutes=2)).isoformat())
+    consolidate_memories(user_id, policy, now.isoformat())
     live = personal_lifecycle.list_live_memories(user_id, now)
     allowed_sources = {
         item["source"] for item in live
@@ -1733,10 +1742,6 @@ def read_explicit_memory_prompt(user_id, query):
         for item in independently_verified
         if item["source"] in allowed_sources
     ]
-    policy = AccessPolicy(
-        user_id=user_id, consent=True, entitled=True, verified=True,
-        expires_at=(now + timedelta(minutes=2)).isoformat(),
-    )
     context = read_context(
         user_id, query, policy, permissions, now.isoformat(),
         enforce_lifecycle=True,
@@ -1789,6 +1794,11 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         personal_lifecycle.initialize_lifecycle()
         now = datetime.now(timezone.utc)
         personal_lifecycle.purge_expired(now)
+        if personal_lifecycle.has_memory_consent(user_id):
+            consolidate_memories(
+                user_id, AccessPolicy(user_id, True, True, True,
+                    (now + timedelta(minutes=2)).isoformat()), now.isoformat(),
+            )
         items = [
             item for item in personal_lifecycle.list_live_memories(user_id, now)
             if item["source"].startswith(f"telegram:private:{user_id}:")
@@ -1940,19 +1950,29 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         versions = personal_lifecycle.list_memory_revisions(
             user_id, memory_id, datetime.now(timezone.utc)
         )
-    if not versions:
+        merges = personal_lifecycle.list_memory_merges(
+            user_id, memory_id, datetime.now(timezone.utc)
+        )
+    if not versions and not merges:
         await update.effective_message.reply_text(
             "Истории изменений для этой записи нет."
         )
         return
     rows = [
-        f"{item['changed_at']} ({'исправление' if item['change_kind'] == 'correction' else 'изменение'}): "
-        f"{item['previous_content']} → {item['new_content']}"
+        (item['changed_at'],
+         f"{item['changed_at']} ({'исправление' if item['change_kind'] == 'correction' else 'изменение'}): "
+         f"{item['previous_content']} → {item['new_content']}")
         for item in versions
     ]
+    rows.extend(
+        (item['merged_at'], f"{item['merged_at']} "
+        f"({'выделено актуальное состояние' if item['operation'] == 'current_state' else 'объединён повтор №' + str(item['removed_memory_id'])}): "
+        f"{item['content']}")
+        for item in merges
+    )
     await send_long_message(
         update.effective_message,
-        f"История записи №{memory_id}:\n" + "\n".join(rows),
+        f"История записи №{memory_id}:\n" + "\n".join(text for _, text in sorted(rows)),
     )
 
 

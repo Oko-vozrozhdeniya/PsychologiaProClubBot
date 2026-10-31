@@ -7,6 +7,7 @@ automatically and does not call Gemini.
 
 from dataclasses import dataclass
 from typing import Optional
+import re
 
 VALID_ACTIONS = frozenset({
     "keep",
@@ -14,6 +15,131 @@ VALID_ACTIONS = frozenset({
     "conflict",
     "review",
 })
+
+
+def _preference_clause(text, *, self_statement=False, past=False):
+    """Parse one unambiguous, positive preference, preserving object order."""
+    text = text.strip()
+    subject = None
+    for _ in range(2):
+        match = re.match(r"^(пользователь|я|мне)\s+", text)
+        if match:
+            if subject is not None and subject != match[1]:
+                return None
+            subject, text = match[1], text[match.end():]
+        text = re.sub(r"^(?:теперь|сейчас)\s+", "", text)
+    forms = (r"нравилось|нравились|предпочитал|предпочитала|любил|любила|"
+             r"увлекался|увлекалась") if past else (
+             r"предпочитаю|предпочитает|нравится|нравятся|люблю|любит|"
+             r"увлекаюсь|увлекается")
+    match = re.match(r"^(" + forms + r")\s+(.+)$", text)
+    if not match:
+        return None
+    if self_statement and not (
+        subject in ("я", "мне")
+        or subject is None and match[1] in ("предпочитаю", "люблю", "увлекаюсь")
+    ):
+        return None
+    obj = match[2]
+    if (not re.fullmatch(r"[а-яa-z0-9\s-]+", obj)
+            or re.search(r"\b(не|ни|без|кроме|если|или|и|возможно|наверное|"
+                         r"больше|меньше|чем|раньше|теперь|сейчас|вместо)\b", obj)):
+        return None
+    activity = {
+        "выращивать": "выращивание", "выращиванием": "выращивание",
+        "собирать": "сборка", "сборкой": "сборка", "сборку": "сборка",
+        "читать": "чтение", "чтением": "чтение",
+    }
+    words = []
+    for word in obj.split():
+        if word in activity:
+            word = activity[word]
+        elif len(word) > 5 and re.fullmatch(r"[а-я]+", word):
+            # Only explicit plural inflections; no fuzzy prefix/substring match.
+            word = re.sub(r"(?:ыми|ими|ами|ями|ые|ие|ых|их|ей|ов|ев|ах|ях|ы|и)$", "", word)
+        words.append(word)
+    return tuple(words) if words else None
+
+
+def preference_key(content, *, self_statement=False):
+    """A bounded equivalence rule, never an open-ended semantic similarity score.
+
+    Unknown relations, negation, different subjects and compound/ambiguous
+    claims fail closed. Historical text is retained in storage, not rewritten.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return None
+    # Inflection rules must never collapse names, brands or abbreviations.
+    capitalized = re.findall(r"\b[А-ЯЁA-Z][а-яёa-zА-ЯЁA-Z0-9-]*", content)
+    grammatical = {"пользователь", "я", "мне", "раньше", "прежде", "теперь", "сейчас", "а",
+                   "люблю", "любит", "любил", "любила", "предпочитаю", "предпочитает",
+                   "предпочитал", "предпочитала", "нравится", "нравятся", "нравилось", "нравились",
+                   "увлекаюсь", "увлекается", "увлекался", "увлекалась"}
+    if any(word.casefold() not in grammatical for word in capitalized):
+        return None
+    text = " ".join(content.casefold().replace("ё", "е").split()).rstrip(".! ")
+    base = re.sub(r"^пользователь\s+", "", text)
+    if re.match(r"^(?:раньше|прежде)\s+", base):
+        parts = re.split(r",\s*(?:а\s+)?(?:теперь|сейчас)\s+", base, maxsplit=1)
+        if len(parts) != 2:
+            return None
+        previous = re.sub(r"^(?:раньше|прежде)\s+", "", parts[0])
+        if _preference_clause(previous, self_statement=self_statement, past=True) is None:
+            return None
+        text = parts[1]
+    elif " вместо " in text:
+        if not re.match(r"^(?:пользователь\s+)?(?:теперь|сейчас)\s+", text):
+            return None
+        text, old = text.split(" вместо ", 1)
+        if not re.fullmatch(r"[а-яa-z0-9\s-]+", old):
+            return None
+    return _preference_clause(text, self_statement=self_statement)
+
+
+def memory_match_key(content, kind):
+    """Group exact facts and supported paraphrases without merging conflicts."""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Non-empty memory required")
+    if kind not in ("fact", "preference", "hypothesis"):
+        raise ValueError("Invalid memory kind")
+    if kind == "preference":
+        key = preference_key(content)
+        if key is not None:
+            return kind, "preference", key
+    return kind, "literal", " ".join(content.casefold().split()).rstrip(". ")
+
+
+def current_memory_content(content, kind):
+    """Separate supported old/current preference text without inventing values.
+
+    Historical wording must not gain a longer life when only the current
+    preference is reaffirmed by another source. The lifecycle audits the
+    original representation before applying this lossless separation.
+    """
+    if kind != "preference" or preference_key(content) is None:
+        return content
+    text = " ".join(content.split()).rstrip(".! ")
+    base = re.sub(r"^пользователь\s+", "", text, flags=re.IGNORECASE)
+    if re.match(r"^(?:раньше|прежде)\s+", base, flags=re.IGNORECASE):
+        current = re.split(
+            r",\s*(?:а\s+)?(?:теперь|сейчас)\s+", base, maxsplit=1,
+            flags=re.IGNORECASE,
+        )[1]
+        return current[0].upper() + current[1:]
+    if re.search(r"\sвместо\s", text, flags=re.IGNORECASE):
+        return re.split(r"\sвместо\s", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return content
+
+
+def source_supports_memory(message_text, content, kind):
+    """Only a direct self-statement can refresh a paraphrased preference."""
+    if kind == "preference":
+        key = preference_key(content)
+        return key is not None and preference_key(message_text, self_statement=True) == key
+    # Exact facts may be consolidated; no guessed subject/verb transformations.
+    from memory.extraction import has_statement_for_extraction
+    return (has_statement_for_extraction(message_text)
+            and memory_match_key(message_text, kind) == memory_match_key(content, kind))
 
 
 @dataclass(frozen=True)

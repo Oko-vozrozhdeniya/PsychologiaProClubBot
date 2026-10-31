@@ -178,6 +178,81 @@ class CoordinatorPersistenceTests(unittest.TestCase):
         self.assertEqual(lifecycle.list_live_sources(1, NOW, db_path=self.db), sources)
         self.assertEqual(len(storage.list_memories(1, db_path=self.db)), 1)
 
+    def test_repeated_preference_paraphrase_confirms_same_id_without_new_version(self):
+        mid = self.remember()
+        before = storage.get_memory(1, mid, db_path=self.db)
+        self.assertEqual(self.automatic(
+            message_text="Мне нравится выращивать фиолетовые кактусы",
+            raw_candidates=[{"content": "Пользователь увлекается выращиванием фиолетовых кактусов",
+                             "kind": "preference", "confidence": 0.99}],
+            visible_memories=[before],
+        ), 0)
+        current = storage.list_memories(1, db_path=self.db)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["id"], mid)
+        self.assertEqual(current[0]["updated_at"], before["updated_at"])
+        self.assertEqual(lifecycle.list_memory_revisions(1, mid, NOW, db_path=self.db), [])
+        with storage._connection(self.db) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM memory_sources").fetchone()[0], 2)
+
+    def test_same_fact_paraphrases_in_one_extraction_create_one_memory(self):
+        self.assertEqual(self.automatic(raw_candidates=[
+            {"content": "Любит выращивать фиолетовые кактусы", "kind": "preference", "confidence": 0.99},
+            {"content": "Увлекается выращиванием фиолетовых кактусов", "kind": "preference", "confidence": 0.99},
+        ]), 1)
+        self.assertEqual(len(storage.list_memories(1, db_path=self.db)), 1)
+
+    def test_compaction_is_scoped_and_idempotent_with_real_sources(self):
+        first = self.remember(message_text="Мне нравится выращивать фиолетовые кактусы")
+        src = "telegram:private:1:11"
+        lifecycle.register_message(1, src, "Мне нравится выращивать фиолетовые кактусы", NOW, db_path=self.db)
+        second = lifecycle.add_memory(1, "Пользователь любит выращивать фиолетовые кактусы",
+                                      "preference", src, NOW, db_path=self.db)
+        lifecycle.set_memory_consent(2, True, NOW, db_path=self.db)
+        foreign_src = "telegram:private:2:10"
+        lifecycle.register_message(2, foreign_src, "Мне нравятся фиолетовые кактусы", NOW, db_path=self.db)
+        foreign = lifecycle.add_memory(2, self.content, "preference", foreign_src, NOW, db_path=self.db)
+        self.assertEqual(coordinator.consolidate_memories(1, policy(), NOW, db_path=self.db), 1)
+        self.assertIsNone(storage.get_memory(1, second, db_path=self.db))
+        self.assertIsNotNone(storage.get_memory(1, first, db_path=self.db))
+        self.assertIsNotNone(storage.get_memory(2, foreign, db_path=self.db))
+        self.assertEqual(coordinator.consolidate_memories(1, policy(), NOW, db_path=self.db), 0)
+
+    def test_compaction_requires_valid_policy_and_persistent_consent(self):
+        for pol in (policy(consent=False), policy(verified=False), policy(entitled=False), policy(2)):
+            with self.subTest(policy=pol), self.assertRaises(PermissionError):
+                coordinator.consolidate_memories(1, pol, NOW, db_path=self.db)
+        lifecycle.set_memory_consent(1, False, NOW, db_path=self.db)
+        with self.assertRaises(PermissionError):
+            coordinator.consolidate_memories(1, policy(), NOW, db_path=self.db)
+
+    def test_legacy_unlinked_records_are_not_implicitly_merged(self):
+        for _ in range(2):
+            storage.add_memory(1, self.content, "preference", "legacy", self.db)
+        self.assertEqual(coordinator.consolidate_memories(1, policy(), NOW, db_path=self.db), 0)
+        self.assertEqual(len(storage.list_memories(1, db_path=self.db)), 2)
+
+    def test_old_value_in_same_extraction_cannot_reappear_after_confirmed_change(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                self.db = Path(self.tmp.name) / ("reverse.db" if reverse else "forward.db")
+                lifecycle.initialize_lifecycle(self.db)
+                lifecycle.set_memory_consent(1, True, NOW, db_path=self.db)
+                mid = self.remember(message_text="Мне нравится выращивать фиолетовые кактусы")
+                old = storage.get_memory(1, mid, self.db)
+                replacement = {"content": "Теперь любит выращивать жёлтые кактусы",
+                               "kind": "preference", "confidence": 0.99,
+                               "replaces_memory_id": mid, "replaces_content": old["content"],
+                               "revision_kind": "change"}
+                previous = {"content": self.content, "kind": "preference", "confidence": 0.99}
+                candidates = [replacement, previous] if reverse else [previous, replacement]
+                self.assertEqual(self.automatic(message_text=("Раньше мне нравилось выращивать фиолетовые кактусы, "
+                    "а теперь мне нравятся выращивать жёлтые кактусы"),
+                    raw_candidates=candidates, visible_memories=[old]), 1)
+                current = storage.list_memories(1, db_path=self.db)
+                self.assertEqual(len(current), 1)
+                self.assertIn("жёлтые", current[0]["content"])
+
     def test_question_cannot_persist_a_rephrased_recalled_fact(self):
         mid = self.remember()
         before_sources = lifecycle.list_live_sources(1, NOW, db_path=self.db)

@@ -12,7 +12,7 @@ from memory.extraction import (
 from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
-from memory.updating import make_update_decision
+from memory.updating import make_update_decision, memory_match_key
 from memory import storage, lifecycle
 
 
@@ -182,6 +182,28 @@ def _register_source(user_id, source, message_text, moment, kwargs):
     return SourcePermission(source, expiry)
 
 
+def consolidate_memories(user_id, policy, now, *, db_path=None):
+    """Bounded, source-verified consolidation through the existing lifecycle.
+
+    Only exact facts and unambiguous supported preference paraphrases group.
+    The transaction independently rechecks snapshots, consent and sources.
+    """
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    moment = _write_policy(user_id, policy, now, kwargs)
+    groups = {}
+    for record in lifecycle.list_live_memories(user_id, moment, **kwargs)[:500]:
+        if not record["source"].startswith(f"telegram:private:{user_id}:"):
+            continue
+        key = memory_match_key(record["content"], record["kind"])
+        groups.setdefault(key, []).append(record)
+    merged = 0
+    for records in groups.values():
+        if len(records) < 2:
+            continue
+        merged += lifecycle.merge_memories(user_id, records[:20], moment, **kwargs)
+    return merged
+
+
 def remember_memory(user_id, content, kind, source, message_text, policy, now, *,
                     db_path=None):
     """Persist an explicitly supplied memory and its live source linkage."""
@@ -192,6 +214,12 @@ def remember_memory(user_id, content, kind, source, message_text, policy, now, *
     extract_candidates(raw)  # Validate before registering a source.
     permission = _register_source(user_id, source, message_text, moment, kwargs)
     record = prepare_candidates(user_id, raw, policy, [permission], now)[0]
+    for existing in lifecycle.list_live_memories(user_id, moment, **kwargs):
+        if (existing["source"].startswith(f"telegram:private:{user_id}:")
+                and memory_match_key(existing["content"], existing["kind"])
+                == memory_match_key(record["content"], record["kind"])):
+            lifecycle.confirm_memory(user_id, existing, source, moment, **kwargs)
+            return existing["id"]
     return lifecycle.add_memory(user_id, record["content"], record["kind"],
                                 source, moment, **kwargs)
 
@@ -275,7 +303,9 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
     visible = {item["id"]: item for item in visible_memories}
     live_by_id = {item["id"]: item for item in existing}
     live_sources = {item["source"] for item in registered_sources}
-    known = {item["content"].casefold().strip() for item in existing}
+    known = {memory_match_key(item["content"], item["kind"]): item for item in existing
+             if item["source"].startswith(f"telegram:private:{user_id}:")}
+    retired = set()
     saved = 0
     for candidate in approved:
         key = candidate["content"].casefold().strip()
@@ -313,18 +343,24 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                 candidate["content"], source, message_text, policy, now, kind,
                 explicitly_corrected=True, allow_existing_source=True, **kwargs,
             ):
-                known.discard(old["content"].casefold().strip())
-                known.add(key)
+                old_key = memory_match_key(old["content"], old["kind"])
+                known.pop(old_key, None)
+                retired.add(old_key)
                 live_by_id[target] = {**old, "content": candidate["content"],
                                       "source": source}
+                known[memory_match_key(candidate["content"], candidate["kind"])] = live_by_id[target]
                 saved += 1
             continue
-        if key in known:
+        identity = memory_match_key(candidate["content"], candidate["kind"])
+        if identity in retired:
+            continue
+        if identity in known:
+            lifecycle.confirm_memory(user_id, known[identity], source, moment, **kwargs)
             continue
         if not lifecycle.has_memory_consent(user_id, **kwargs):
             break
-        lifecycle.add_memory(user_id, candidate["content"], candidate["kind"],
-                             source, moment, **kwargs)
-        known.add(key)
+        memory_id = lifecycle.add_memory(user_id, candidate["content"], candidate["kind"],
+                                         source, moment, **kwargs)
+        known[identity] = storage.get_memory(user_id, memory_id, **kwargs)
         saved += 1
     return saved
