@@ -72,8 +72,7 @@ MAX_ANSWER_CHARS = 3800
 MAX_DIALOG_PAIRS = 30
 MAX_DIALOG_CHARS = 30000
 GEMINI_TIMEOUT = 90
-# Temporary interval for the hosted scheduling acceptance test; restore 3600 afterwards.
-RETENTION_INTERVAL_SECONDS = 60
+RETENTION_INTERVAL_SECONDS = 3600
 
 dialog_lock = asyncio.Lock()
 
