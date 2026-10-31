@@ -66,6 +66,33 @@ class TestMemoryUpdating(unittest.TestCase):
                 self.assertEqual(memory_match_key(text, "preference"), memory_match_key(current, "preference"))
                 self.assertTrue(source_supports_memory("Я предпочитаю собирать металлические модели кораблей", current, "preference"))
 
+    def test_confirmed_preference_is_same_despite_fact_preference_label(self):
+        first = "Пользователь предпочитает собирать металлические модели кораблей."
+        second = ("Пользователь раньше предпочитал собирать деревянные модели кораблей, "
+                  "теперь предпочитает собирать металлические модели кораблей.")
+        self.assertEqual(memory_match_key(first, "fact"), memory_match_key(second, "preference"))
+        self.assertNotEqual(memory_match_key(first, "hypothesis"), memory_match_key(second, "preference"))
+        self.assertTrue(source_supports_memory("Мне нравится собирать металлические модели кораблей", first, "fact"))
+
+    def test_explicit_old_context_resolves_omitted_noun_in_current_preference(self):
+        message = ("Раньше мне нравилось выращивать фиолетовые кактусы, "
+                   "а теперь мне нравится выращивать жёлтые.")
+        fact = "Пользователь предпочитает выращивать жёлтые кактусы."
+        self.assertTrue(source_supports_memory(message, fact, "preference"))
+        self.assertEqual(memory_match_key(message, "preference"), memory_match_key(fact, "preference"))
+        current = current_memory_content(message, "preference")
+        self.assertIn("кактусы", current)
+        self.assertNotIn("фиолетовые", current)
+
+    def test_ellipsis_does_not_invent_topic_without_same_explicit_activity(self):
+        fact = "Предпочитает выращивать жёлтые кактусы"
+        for message in ("Теперь мне нравятся жёлтые", "Мне нравится выращивать жёлтые",
+                        "Раньше мне нравилось выращивать фиолетовые кактусы, теперь мне нравится рисовать жёлтые",
+                        "Раньше мне нравилось выращивать фиолетовые кактусы, теперь мне нравятся выращивать жёлтые розы",
+                        "Раньше маме нравилось выращивать фиолетовые кактусы, теперь мне нравятся выращивать жёлтые"):
+            with self.subTest(message=message):
+                self.assertFalse(source_supports_memory(message, fact, "preference"))
+
     def test_unchanged_content(self):
         result = make_update_decision(
             "Живу в Москве",

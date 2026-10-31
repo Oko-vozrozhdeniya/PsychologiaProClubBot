@@ -12,7 +12,7 @@ from memory.extraction import (
 from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
-from memory.updating import make_update_decision, memory_match_key
+from memory.updating import make_update_decision, memory_match_key, source_supports_memory
 from memory import storage, lifecycle
 
 
@@ -182,7 +182,7 @@ def _register_source(user_id, source, message_text, moment, kwargs):
     return SourcePermission(source, expiry)
 
 
-def consolidate_memories(user_id, policy, now, *, db_path=None):
+def consolidate_memories(user_id, policy, now, *, db_path=None, diagnostics=None):
     """Bounded, source-verified consolidation through the existing lifecycle.
 
     Only exact facts and unambiguous supported preference paraphrases group.
@@ -190,6 +190,8 @@ def consolidate_memories(user_id, policy, now, *, db_path=None):
     """
     kwargs = {"db_path": db_path} if db_path is not None else {}
     moment = _write_policy(user_id, policy, now, kwargs)
+    if diagnostics is not None and not isinstance(diagnostics, list):
+        raise ValueError("Diagnostics must be a list")
     groups = {}
     for record in lifecycle.list_live_memories(user_id, moment, **kwargs)[:500]:
         if not record["source"].startswith(f"telegram:private:{user_id}:"):
@@ -200,7 +202,8 @@ def consolidate_memories(user_id, policy, now, *, db_path=None):
     for records in groups.values():
         if len(records) < 2:
             continue
-        merged += lifecycle.merge_memories(user_id, records[:20], moment, **kwargs)
+        merged += lifecycle.merge_memories(user_id, records[:20], moment,
+                                          diagnostics=diagnostics, **kwargs)
     return merged
 
 
@@ -283,6 +286,18 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
         for item in raw_candidates
     ], min_confidence=0.85)
     if not validated:
+        # An extractor may correctly return [] for a repetition. A direct,
+        # unambiguous self-confirmation of an already stored preference is
+        # still a real source; it never creates or guesses a new fact.
+        matches = [r for r in lifecycle.list_live_memories(user_id, moment, **kwargs)
+                   if r["source"].startswith(f"telegram:private:{user_id}:")
+                   and memory_match_key(r["content"], r["kind"])[:2] == ("preference", "preference")
+                   and source_supports_memory(message_text, r["content"], r["kind"])]
+        if matches and not any(r["source"] == source for r in lifecycle.list_live_sources(user_id, moment, **kwargs)):
+            _register_source(user_id, source, message_text, moment, kwargs)
+            target = min(matches, key=lambda r: r["id"])
+            if lifecycle.confirm_memory(user_id, target, source, moment, **kwargs):
+                consolidate_memories(user_id, policy, now, **kwargs)
         return 0
     existing = lifecycle.list_live_memories(user_id, moment, **kwargs)
     registered_sources = lifecycle.list_live_sources(user_id, moment, **kwargs)
@@ -330,7 +345,9 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                 and old["content"] == matching["replaces_content"]
                 and visible[target]["content"] == old["content"]
                 and visible[target]["source"] == old["source"]
-                and candidate["kind"] == old["kind"]
+                and (candidate["kind"] == old["kind"] or (
+                    memory_match_key(candidate["content"], candidate["kind"])[:2] == ("preference", "preference")
+                    and memory_match_key(old["content"], old["kind"])[:2] == ("preference", "preference")))
                 and old["source"] in live_sources
                 and matching["confidence"] >= 0.95
                 and re.search(marker, message_text.casefold())

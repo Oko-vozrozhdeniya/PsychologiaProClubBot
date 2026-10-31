@@ -281,6 +281,71 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
         self.assertIn("деревянные", history)
         self.assertIn("объединён повтор №4", history)
 
+    def test_real_elliptical_message_and_mixed_labels_compact_via_owner_command(self):
+        self.seed_live_duplicate_pairs()
+        with storage._connection(self.db) as db:
+            db.execute("UPDATE memories SET kind='fact' WHERE id IN (1, 4)")
+            db.execute("UPDATE private_messages SET content=? WHERE message_id=?", (
+                "Раньше мне нравилось выращивать фиолетовые кактусы, а теперь мне нравится выращивать жёлтые.",
+                "telegram:private:101:2000"))
+            before = [dict(r) for r in db.execute("SELECT * FROM private_messages ORDER BY message_id")]
+        reply = self.command("memories_command")[0]
+        self.assertIn("Проверка дублей выполнена: объединено 2", reply)
+        current = storage.list_memories(101, db_path=self.db)
+        self.assertEqual({r["id"] for r in current}, {1, 3})
+        self.assertEqual({r["kind"] for r in current}, {"preference"})
+        self.assertNotIn("фиолетовых", reply)
+        self.assertNotIn("деревянные", reply)
+        self.assertIn("объединено 0", self.command("memories_command")[0])
+        with storage._connection(self.db) as db:
+            self.assertEqual([dict(r) for r in db.execute("SELECT * FROM private_messages ORDER BY message_id")], before)
+        history = self.command("history_command", ["3"])[0]
+        self.assertIn("объединён повтор №4", history)
+
+    def test_owner_diagnostic_reports_missing_support_without_echoing_source_body(self):
+        self.seed_live_duplicate_pairs()
+        with storage._connection(self.db) as db:
+            db.execute("UPDATE private_messages SET content=?", ("Вспомни PRIVATE_SOURCE_NO_ECHO?",))
+        reply = self.command("memories_command")[0]
+        self.assertIn("объединено 0", reply)
+        self.assertIn("нет прямого подтверждения из исходного сообщения", reply)
+        self.assertNotIn("PRIVATE_SOURCE_NO_ECHO", reply)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 4)
+
+    def test_preference_labeled_as_fact_can_be_revised_and_reconfirmed(self):
+        self.model_result = [{"content": "Пользователь предпочитает выращивать фиолетовые кактусы",
+                              "kind": "fact", "confidence": 0.99}]
+        self.assertEqual(self.save(101, 2300, "Мне нравится выращивать фиолетовые кактусы"), 1)
+        old = storage.list_memories(101, db_path=self.db)[0]
+        self.model_result = [{"content": "Предпочитает выращивать жёлтые кактусы",
+                              "kind": "preference", "confidence": 0.99,
+                              "replaces_memory_id": old["id"], "replaces_content": old["content"],
+                              "revision_kind": "change"}]
+        self.assertEqual(self.save(101, 2301, "Теперь мне нравится выращивать жёлтые кактусы", "Groq"), 1)
+        self.model_result = [{"content": "Любит выращивать жёлтые кактусы",
+                              "kind": "preference", "confidence": 0.99}]
+        self.assertEqual(self.save(101, 2302, "Мне нравятся выращивать жёлтые кактусы", "Groq"), 0)
+        current = storage.list_memories(101, db_path=self.db)
+        self.assertEqual(len(current), 1)
+        self.assertEqual(current[0]["kind"], "preference")
+        self.assertIn("жёлтые", current[0]["content"])
+
+    def test_empty_extraction_can_confirm_existing_preference_without_inventing_new_fact(self):
+        self.seed_live_duplicate_pairs()
+        with storage._connection(self.db) as db:
+            db.execute("UPDATE private_messages SET content='Что мне нравится?'")
+        self.model_result = []
+        self.assertEqual(self.save(101, 2400, "Мне нравится собирать металлические модели кораблей", "Groq"), 0)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 3)
+        self.assertEqual(self.save(101, 2401, "Мне нравится выращивать жёлтые кактусы", "Groq"), 0)
+        current = storage.list_memories(101, db_path=self.db)
+        self.assertEqual({r["id"] for r in current}, {1, 3})
+        self.assertEqual(self.save(101, 2402, "Мне нравится выращивать розы", "Groq"), 0)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+        with storage._connection(self.db) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM private_messages WHERE message_id=?",
+                                       ("telegram:private:101:2402",)).fetchone())
+
     def test_repeated_preference_is_not_added_again_by_either_provider(self):
         self.seed_live_duplicate_pairs()
         self.model_result = [{"content": "Любит собирать металлические модели кораблей",

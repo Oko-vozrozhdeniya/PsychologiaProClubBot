@@ -163,18 +163,20 @@ def confirm_memory(user_id, expected, source, now, *, db_path=storage.DATABASE_P
         if not message or not source_supports_memory(message["content"], current["content"], current["kind"]):
             return False
         content = current_memory_content(current["content"], current["kind"])
-        if content != current["content"]:
+        kind = memory_match_key(current["content"], current["kind"])[0]
+        if content != current["content"] or kind != current["kind"]:
             _archive_merged_memory(db, user_id, current["id"], current, links,
                                    [source], moment, "current_state")
         db.execute("INSERT OR IGNORE INTO memory_sources VALUES (?, ?, ?)",
                    (user_id, current["id"], source))
         freshest = max([*links, dict(message)], key=lambda r: (r["created_at"], r["message_id"]))
-        db.execute("UPDATE memories SET source=?, content=? WHERE user_id=? AND id=?",
-                   (freshest["message_id"], content, user_id, current["id"]))
+        db.execute("UPDATE memories SET source=?, content=?, kind=? WHERE user_id=? AND id=?",
+                   (freshest["message_id"], content, kind, user_id, current["id"]))
     return True
 
 
-def merge_memories(user_id, expected_memories, now, *, db_path=storage.DATABASE_PATH):
+def merge_memories(user_id, expected_memories, now, *, db_path=storage.DATABASE_PATH,
+                   diagnostics=None):
     """Atomically consolidate proven duplicates, preserving source-bound audit.
 
     Stale snapshots, unsupported claims and ambiguous matches do nothing.
@@ -184,31 +186,39 @@ def merge_memories(user_id, expected_memories, now, *, db_path=storage.DATABASE_
     storage._validate_user_id(user_id)
     if not isinstance(expected_memories, (list, tuple)) or not 2 <= len(expected_memories) <= 20:
         raise ValueError("Between two and twenty snapshots required")
+    if diagnostics is not None and not isinstance(diagnostics, list):
+        raise ValueError("Diagnostics must be a list")
+    def outcome(status, count=0):
+        if diagnostics is not None:
+            diagnostics.append({"ids": [r["id"] for r in expected_memories],
+                                "status": status, "merged": count})
+        return count
     moment = _iso(now)
     with storage._connection(db_path) as db:
         db.execute("BEGIN IMMEDIATE")
         _merge_consent(db, user_id)
         records = [_snapshot_memory(db, user_id, r) for r in expected_memories]
         if any(r is None for r in records):
-            return 0
+            return outcome("stale")
         if len({r["id"] for r in records}) != len(records):
             raise ValueError("Duplicate memory id")
         if len({memory_match_key(r["content"], r["kind"]) for r in records}) != 1:
-            return 0
+            return outcome("different")
         links = {r["id"]: _memory_links(db, user_id, r["id"], moment) for r in records}
         if any(not any(s["message_id"] == r["source"] for s in links[r["id"]]) for r in records):
-            return 0
+            return outcome("source_unavailable")
         supports = {r["id"]: [s for s in links[r["id"]]
                     if source_supports_memory(s["content"], r["content"], r["kind"])]
                     for r in records}
         grounded = [r for r in records if supports[r["id"]]]
         if not grounded:
-            return 0
+            return outcome("no_direct_support")
         kept = min(grounded, key=lambda r: r["id"])
         current_sources = {s["message_id"]: s for r in records for s in supports[r["id"]]}
         freshest = max(current_sources.values(), key=lambda r: (r["created_at"], r["message_id"]))
         content = current_memory_content(kept["content"], kept["kind"])
-        if content != kept["content"]:
+        kind = memory_match_key(kept["content"], kept["kind"])[0]
+        if content != kept["content"] or kind != kept["kind"]:
             _archive_merged_memory(db, user_id, kept["id"], kept, links[kept["id"]],
                                    current_sources, moment, "current_state")
         for removed in records:
@@ -225,9 +235,9 @@ def merge_memories(user_id, expected_memories, now, *, db_path=storage.DATABASE_
         db.execute("DELETE FROM memory_sources WHERE user_id=? AND memory_id=?", (user_id, kept["id"]))
         for source in current_sources:
             db.execute("INSERT INTO memory_sources VALUES (?, ?, ?)", (user_id, kept["id"], source))
-        db.execute("UPDATE memories SET source=?, content=? WHERE user_id=? AND id=?",
-                   (freshest["message_id"], content, user_id, kept["id"]))
-    return len(records) - 1
+        db.execute("UPDATE memories SET source=?, content=?, kind=? WHERE user_id=? AND id=?",
+                   (freshest["message_id"], content, kind, user_id, kept["id"]))
+    return outcome("merged", len(records) - 1)
 
 
 def _merge_sources_live(db, user_id, sources_json, now=None):

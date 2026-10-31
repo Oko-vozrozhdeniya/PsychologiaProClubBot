@@ -61,6 +61,33 @@ def _preference_clause(text, *, self_statement=False, past=False):
     return tuple(words) if words else None
 
 
+def _resolve_preference_ellipsis(previous, current, *, self_statement=False):
+    """Reuse an explicit noun only in a same-activity old/current comparison.
+
+    For example, 'grow purple cacti, now grow yellow [cacti]'. Do not infer
+    a topic from an isolated colour, another actor, or a different activity.
+    """
+    before = _preference_clause(previous.casefold().replace("ё", "е"),
+                                self_statement=self_statement, past=True)
+    after = _preference_clause(current.casefold().replace("ё", "е"),
+                               self_statement=self_statement)
+    if (before is None or after is None or len(after) < 2
+            or before[0] != after[0] or before[0] not in ("выращивание", "сборка", "чтение")):
+        return current
+    old_words, new_words = previous.split()[-len(before):], current.split()[-len(after):]
+    def adjective(word):
+        return re.fullmatch(r"[а-яё]+(?:ые|ие|ых|их|ыми|ими)", word.casefold()) is not None
+    if not all(adjective(word) for word in new_words[1:]):
+        return current
+    first_noun = 1
+    while first_noun < len(old_words) and adjective(old_words[first_noun]):
+        first_noun += 1
+    if (first_noun <= 1 or first_noun == len(old_words)
+            or not re.fullmatch(r"[а-яё]{3,}", old_words[first_noun].casefold())):
+        return current
+    return current + " " + " ".join(old_words[first_noun:])
+
+
 def preference_key(content, *, self_statement=False):
     """A bounded equivalence rule, never an open-ended semantic similarity score.
 
@@ -86,7 +113,7 @@ def preference_key(content, *, self_statement=False):
         previous = re.sub(r"^(?:раньше|прежде)\s+", "", parts[0])
         if _preference_clause(previous, self_statement=self_statement, past=True) is None:
             return None
-        text = parts[1]
+        text = _resolve_preference_ellipsis(previous, parts[1], self_statement=self_statement)
     elif " вместо " in text:
         if not re.match(r"^(?:пользователь\s+)?(?:теперь|сейчас)\s+", text):
             return None
@@ -102,10 +129,10 @@ def memory_match_key(content, kind):
         raise ValueError("Non-empty memory required")
     if kind not in ("fact", "preference", "hypothesis"):
         raise ValueError("Invalid memory kind")
-    if kind == "preference":
+    if kind in ("fact", "preference"):
         key = preference_key(content)
         if key is not None:
-            return kind, "preference", key
+            return "preference", "preference", key
     return kind, "literal", " ".join(content.casefold().split()).rstrip(". ")
 
 
@@ -116,15 +143,17 @@ def current_memory_content(content, kind):
     preference is reaffirmed by another source. The lifecycle audits the
     original representation before applying this lossless separation.
     """
-    if kind != "preference" or preference_key(content) is None:
+    if kind not in ("fact", "preference") or preference_key(content) is None:
         return content
     text = " ".join(content.split()).rstrip(".! ")
     base = re.sub(r"^пользователь\s+", "", text, flags=re.IGNORECASE)
     if re.match(r"^(?:раньше|прежде)\s+", base, flags=re.IGNORECASE):
-        current = re.split(
+        parts = re.split(
             r",\s*(?:а\s+)?(?:теперь|сейчас)\s+", base, maxsplit=1,
             flags=re.IGNORECASE,
-        )[1]
+        )
+        previous = re.sub(r"^(?:раньше|прежде)\s+", "", parts[0], flags=re.IGNORECASE)
+        current = _resolve_preference_ellipsis(previous, parts[1])
         return current[0].upper() + current[1:]
     if re.search(r"\sвместо\s", text, flags=re.IGNORECASE):
         return re.split(r"\sвместо\s", text, maxsplit=1, flags=re.IGNORECASE)[0]
@@ -133,9 +162,11 @@ def current_memory_content(content, kind):
 
 def source_supports_memory(message_text, content, kind):
     """Only a direct self-statement can refresh a paraphrased preference."""
-    if kind == "preference":
+    if kind in ("fact", "preference") and preference_key(content) is not None:
         key = preference_key(content)
         return key is not None and preference_key(message_text, self_statement=True) == key
+    if kind == "preference":
+        return False
     # Exact facts may be consolidated; no guessed subject/verb transformations.
     from memory.extraction import has_statement_for_extraction
     return (has_statement_for_extraction(message_text)

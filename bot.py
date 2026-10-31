@@ -1789,15 +1789,18 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_memory_test_access(update):
         return
     user_id = update.effective_user.id
+    merged = None
+    merge_checks = []
     async with dialog_lock:
         personal_storage.initialize_database()
         personal_lifecycle.initialize_lifecycle()
         now = datetime.now(timezone.utc)
         personal_lifecycle.purge_expired(now)
         if personal_lifecycle.has_memory_consent(user_id):
-            consolidate_memories(
+            merged = consolidate_memories(
                 user_id, AccessPolicy(user_id, True, True, True,
                     (now + timedelta(minutes=2)).isoformat()), now.isoformat(),
+                diagnostics=merge_checks,
             )
         items = [
             item for item in personal_lifecycle.list_live_memories(user_id, now)
@@ -1806,11 +1809,21 @@ async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.effective_message.reply_text("Сохранённых записей нет.")
         return
+    check_text = (f"Проверка дублей выполнена: объединено {merged}."
+                  if merged is not None else "Проверка дублей: нет согласия на обработку.")
+    reasons = {"stale": "записи изменились во время проверки",
+               "different": "разный смысл или уровень подтверждения",
+               "source_unavailable": "источник недоступен или истёк",
+               "no_direct_support": "нет прямого подтверждения из исходного сообщения"}
+    for check in merge_checks:
+        if check["status"] in reasons:
+            ids = ", ".join(str(mid) for mid in check["ids"])
+            check_text += f"\nЗаписи {ids}: {reasons[check['status']]} — оставлены раздельно."
     await send_long_message(
         update.effective_message,
         "Твоя память:\n" + "\n".join(
-            f'{item["id"]}. {item["content"]}' for item in items
-        )
+            f'{item["id"]}. [{item["kind"]}] {item["content"]}' for item in items
+        ) + "\n\n" + check_text
     )
 
 
