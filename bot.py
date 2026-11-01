@@ -1521,6 +1521,14 @@ async def testai(
     try:
         async with dialog_lock:
             user_id = update.effective_user.id
+            if not await asyncio.to_thread(
+                personal_lifecycle.has_memory_consent, user_id
+            ):
+                await message.reply_text(
+                    "Для проверки личного диалога требуется согласие на обработку "
+                    "информации. Его можно дать командой /memory_on."
+                )
+                return
             state = read_dialog_state()
             session_id = get_session_id(state, user_id)
             history = read_recent_dialog(user_id, session_id)
@@ -1542,6 +1550,20 @@ async def testai(
         ("БЕЗ ИСТОРИИ", []),
         ("С ИСТОРИЕЙ", history),
     ):
+        # Consent may be revoked while the first diagnostic request is running.
+        try:
+            consent = await asyncio.to_thread(
+                personal_lifecycle.has_memory_consent, user_id
+            )
+        except Exception as error:
+            await send_error_response(update, error, "Проверка согласия для /testai")
+            return
+        if not consent:
+            await message.reply_text(
+                "Проверка личного диалога приостановлена: согласие "
+                "на обработку информации больше не действует."
+            )
+            return
         stats = {}
         try:
             answer = await asyncio.to_thread(
