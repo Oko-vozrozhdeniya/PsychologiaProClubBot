@@ -14,7 +14,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from memory import coordinator, storage, lifecycle
 from memory import cleanup_worker as retention_worker
@@ -378,13 +378,247 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
             101, 3, datetime.now(timezone.utc), db_path=self.db)), 1)
         self.assertTrue(lifecycle.list_memory_merges(101, 3, datetime.now(timezone.utc), db_path=self.db))
 
+    def relationship_response(self, *, facts=True, left=None, right=None, **overrides):
+        left = left or "Пользователь изучает биологию"
+        right = right or "Пользователь готовится к экзамену по биологии"
+        quote = "Я изучаю биологию и готовлюсь к экзамену по биологии"
+        link = dict(source_content=left, target_content=right, relation_type="same_topic",
+                    evidence_quote=quote, confidence=0.99)
+        link.update(overrides)
+        return dict(memories=[dict(content=value, kind="fact", confidence=0.99)
+                              for value in (left, right)] if facts else [],
+                    relationships=[link])
+
+    def stored_relationships(self):
+        with storage._connection(self.db) as db:
+            return [dict(row) for row in db.execute("SELECT * FROM memory_relationships ORDER BY id")]
+
+    def test_each_provider_extracts_and_recalls_links_in_the_existing_request(self):
+        for provider in ("Gemini", "Groq"):
+            with self.subTest(provider=provider):
+                self.model_result = self.relationship_response(
+                    evidence="confirmed", explicitly_confirmed=True)
+                diagnostic = {}
+                self.assertEqual(self.save(101, 4000 if provider == "Gemini" else 4001,
+                    "Я изучаю биологию и готовлюсь к экзамену по биологии", provider,
+                    diagnostics=diagnostic), 2 if provider == "Gemini" else 0)
+                self.assertEqual(diagnostic["saved_relationships"], 1)
+                rows = self.stored_relationships()
+                self.assertTrue(all(row["evidence"] == "hypothesis" for row in rows))
+                prompt = self.read(101, "биологии")
+                self.assertIn("СВЯЗИ МЕЖДУ ЭТИМИ СВЕДЕНИЯМИ", prompt)
+                self.assertIn("гипотеза, не установленный факт", prompt)
+                self.assertNotIn("подтверждена пользователем", prompt)
+        self.assertEqual((self.calls, self.groq_calls), (1, 1))
+
+    def test_relationship_only_message_uses_its_own_source_during_real_recall(self):
+        self.model_result = self.relationship_response()
+        self.model_result["relationships"] = []
+        self.assertEqual(self.save(101, 4010, "Я изучаю биологию и готовлюсь к экзамену"), 2)
+        self.model_result = self.relationship_response(facts=False)
+        diagnostics = {}
+        self.assertEqual(self.save(101, 4011,
+            "Я изучаю биологию и готовлюсь к экзамену по биологии", diagnostics=diagnostics), 0)
+        self.assertEqual(diagnostics["saved_relationships"], 1)
+        edge = self.stored_relationships()[0]
+        self.assertEqual(edge["message_id"], "telegram:private:101:4011")
+        self.assertIn("СВЯЗИ МЕЖДУ ЭТИМИ СВЕДЕНИЯМИ", self.read(101, "биологии"))
+        lifecycle.delete_message(101, edge["message_id"], db_path=self.db)
+        prompt = self.read(101, "биологии")
+        self.assertIn("Пользователь изучает биологию", prompt)
+        self.assertNotIn("СВЯЗИ МЕЖДУ ЭТИМИ СВЕДЕНИЯМИ", prompt)
+
+    def test_natural_revision_deactivates_old_links_without_rewriting_source(self):
+        self.model_result = self.relationship_response()
+        original_text = "Я изучаю биологию и готовлюсь к экзамену по биологии"
+        self.assertEqual(self.save(101, 4020, original_text), 2)
+        left = next(row for row in storage.list_memories(101, db_path=self.db)
+                    if row["content"] == self.model_result["memories"][0]["content"])
+        self.model_result = [dict(content="Пользователь теперь изучает ботанику",
+            kind="fact", confidence=0.99, replaces_memory_id=left["id"],
+            replaces_content=left["content"], revision_kind="change")]
+        self.assertEqual(self.save(101, 4021,
+            "Раньше я изучал биологию, теперь изучаю ботанику"), 1)
+        self.assertEqual(self.stored_relationships()[0]["status"], "review_required")
+        prompt = self.read(101, "ботанику")
+        self.assertIn("теперь изучает ботанику", prompt)
+        self.assertNotIn("СВЯЗИ МЕЖДУ ЭТИМИ СВЕДЕНИЯМИ", prompt)
+        with storage._connection(self.db) as db:
+            self.assertEqual(db.execute("SELECT content FROM private_messages WHERE message_id=?",
+                ("telegram:private:101:4020",)).fetchone()[0], original_text)
+        revisions = lifecycle.list_memory_revisions(101, left["id"], datetime.now(timezone.utc), db_path=self.db)
+        self.assertEqual(len(revisions), 1)
+
+    def test_revision_can_link_only_the_new_accepted_version_with_a_new_witness(self):
+        self.model_result = self.relationship_response()
+        self.save(101, 4030, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        old = storage.list_memories(101, db_path=self.db)[0]
+        if old["content"] != "Пользователь изучает биологию":
+            old = storage.list_memories(101, db_path=self.db)[1]
+        revised = "Пользователь теперь изучает ботанику"
+        quote = "Раньше я изучал биологию, теперь изучаю ботанику для экзамена по биологии"
+        self.model_result = self.relationship_response(facts=False, left=revised, evidence_quote=quote)
+        self.model_result["memories"] = [dict(content=revised, kind="fact", confidence=0.99,
+            replaces_memory_id=old["id"], replaces_content=old["content"], revision_kind="change")]
+        self.assertEqual(self.save(101, 4031, quote), 1)
+        rows = self.stored_relationships()
+        self.assertEqual([row["status"] for row in rows], ["review_required", "active"])
+        self.assertEqual(rows[1]["message_id"], "telegram:private:101:4031")
+
+    def test_replayed_extraction_cannot_resurrect_a_forgotten_link_or_fact(self):
+        self.model_result = self.relationship_response()
+        question = "Я изучаю биологию и готовлюсь к экзамену по биологии"
+        self.save(101, 4040, question)
+        removed = storage.list_memories(101, db_path=self.db)[0]["id"]
+        storage.delete_memory(101, removed, db_path=self.db)
+        self.assertEqual(self.save(101, 4040, question), 0)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 1)
+        self.assertEqual(self.stored_relationships(), [])
+
+    def test_missing_quote_unsupported_type_or_low_confidence_cannot_create_a_link(self):
+        for index, bad in enumerate((dict(evidence_quote="Придуманное утверждение"),
+                dict(relation_type="psychological_cause"), dict(relation_type="family_relation"),
+                dict(confidence=0.94), dict(confidence=True), dict(confidence=float("nan")),
+                dict(source_content="Факт которого нет"))):
+            with self.subTest(bad=bad):
+                self.model_result = self.relationship_response(**bad)
+                self.save(101, 4050 + index, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+                self.assertEqual(self.stored_relationships(), [])
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+
+    def test_question_does_not_trigger_relationship_extraction(self):
+        self.model_result = self.relationship_response()
+        self.assertEqual(self.save(101, 4060, "Я изучаю биологию и готовлюсь к экзамену по биологии?"), 0)
+        self.assertEqual(self.calls, 0)
+        self.assertEqual(self.stored_relationships(), [])
+
+    def test_invalid_envelope_is_rejected_before_any_new_fact_or_source(self):
+        for payload in (dict(memories=[], relationships=[{}] * 6),
+                        dict(memories=self.relationship_response()["memories"], relationships="bad"),
+                        dict(memories=[], relationships=[], unexpected=True)):
+            self.model_result = payload
+            with self.assertRaises(ValueError):
+                self.save(101, 4070, "Я изучаю биологию")
+            self.assertEqual(storage.list_memories(101, db_path=self.db), [])
+            self.assertEqual(lifecycle.list_live_sources(101, datetime.now(timezone.utc), db_path=self.db), [])
+
+    def test_consent_revoked_between_fact_save_and_edge_transaction_blocks_link(self):
+        self.model_result = self.relationship_response()
+        original = coordinator.remember_relationship
+        def revoke_then_save(*args, **kwargs):
+            lifecycle.set_memory_consent(101, False, datetime.now(timezone.utc), db_path=self.db)
+            return original(*args, **kwargs)
+        with patch.object(coordinator, "remember_relationship", side_effect=revoke_then_save):
+            diagnostics = {}
+            self.save(101, 4080, "Я изучаю биологию и готовлюсь к экзамену по биологии", diagnostics=diagnostics)
+        self.assertEqual(diagnostics["saved_relationships"], 0)
+        self.assertEqual(self.stored_relationships(), [])
+        self.assertEqual(self.read(101, "биология экзамен"), "")
+
+    def test_stale_model_endpoint_snapshot_cannot_link_changed_claim(self):
+        self.model_result = self.relationship_response()
+        self.model_result["relationships"] = []
+        self.save(101, 4090, "Я изучаю биологию и готовлюсь к экзамену")
+        self.model_result = self.relationship_response(facts=False)
+        original = self.ns["urllib"].request.urlopen
+        def changed_during_request(request, timeout):
+            reply = original(request, timeout)
+            left = next(row for row in storage.list_memories(101, db_path=self.db)
+                        if row["content"] == "Пользователь изучает биологию")
+            storage.update_memory(101, left["id"], "Пользователь изучает ботанику", db_path=self.db)
+            return reply
+        self.ns["urllib"].request.urlopen = changed_during_request
+        self.save(101, 4091, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        self.assertEqual(self.stored_relationships(), [])
+
+    def test_relation_cannot_resolve_another_users_fact_from_model_output(self):
+        now = datetime.now(timezone.utc)
+        source = "telegram:private:202:4000"
+        lifecycle.set_memory_consent(202, True, now, db_path=self.db)
+        lifecycle.register_message(202, source, "Я готовлюсь к экзамену по биологии", now, db_path=self.db)
+        lifecycle.add_memory(202, "Пользователь готовится к экзамену по биологии", "fact", source, now, db_path=self.db)
+        self.model_result = self.relationship_response()
+        self.model_result["memories"] = self.model_result["memories"][:1]
+        self.save(101, 4100, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        self.assertEqual(self.stored_relationships(), [])
+        self.assertNotIn("готовится к экзамену", self.last_extraction_prompt)
+
     def test_groq_saves_and_recalls_without_gemini_key_or_request(self):
         self.ns["GEMINI_API_KEY"] = ""
         self.assertEqual(self.save(101, 1000, "Я изучаю биологию", "Groq"), 1)
         self.assertEqual(self.calls, 0)
         self.assertEqual(self.groq_calls, 1)
         self.assertIn("Пользователь изучает биологию", self.read(101, "изучает биологию"))
-        self.assertIn("JSON-массив", self.last_groq_instruction)
+        self.assertIn("JSON-объект", self.last_groq_instruction)
+        self.assertIn("relationships", self.last_groq_instruction)
+
+    def test_relation_extraction_uses_the_existing_auto_fallback(self):
+        self.model_result = self.relationship_response()
+        self.ns["urllib"].request.urlopen = Mock(side_effect=urllib.error.HTTPError(
+            "https://test.invalid", 503, "unavailable", {}, None))
+        diagnostics = {}
+        self.assertEqual(self.save(101, 4110,
+            "Я изучаю биологию и готовлюсь к экзамену по биологии", diagnostics=diagnostics), 2)
+        self.assertEqual(diagnostics["extraction_provider"], "Groq")
+        self.assertEqual(diagnostics["saved_relationships"], 1)
+        self.assertEqual(self.groq_calls, 1)
+        self.assertIn("гипотеза", self.read(101, "биологии"))
+
+    def test_link_cannot_select_a_known_fact_outside_the_shown_snapshot(self):
+        self.model_result = self.relationship_response()
+        self.model_result["relationships"] = []
+        self.save(101, 4120, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        all_facts = lifecycle.list_live_memories(101, datetime.now(timezone.utc), db_path=self.db)
+        shown = all_facts[:1]
+        now = datetime.now(timezone.utc)
+        diagnostics = {}
+        # Repeating both candidate texts must not expose the unseen stored fact.
+        coordinator.save_dialog_candidates(101, "telegram:private:101:4121",
+            "Я изучаю биологию и готовлюсь к экзамену по биологии",
+            self.relationship_response(), shown,
+            AccessPolicy(101, True, True, True, (now + timedelta(minutes=2)).isoformat()),
+            now.isoformat(), db_path=self.db, relationship_diagnostics=diagnostics)
+        self.assertEqual(diagnostics["saved_relationships"], 0)
+        self.assertEqual(self.stored_relationships(), [])
+
+    def test_rejected_new_fact_cannot_become_a_relationship_endpoint(self):
+        self.model_result = self.relationship_response()
+        self.model_result["memories"][1]["confidence"] = 0.5
+        diagnostics = {}
+        self.assertEqual(self.save(101, 4130,
+            "Я изучаю биологию и готовлюсь к экзамену по биологии", diagnostics=diagnostics), 1)
+        self.assertEqual(diagnostics["saved_relationships"], 0)
+        self.assertEqual(self.stored_relationships(), [])
+
+    def test_relationship_witness_expires_from_original_message_date(self):
+        self.model_result = self.relationship_response()
+        self.model_result["relationships"] = []
+        self.save(101, 4140, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        self.model_result = self.relationship_response(facts=False)
+        created = datetime.now(timezone.utc) - timedelta(days=364)
+        self.save(101, 4141, "Я изучаю биологию и готовлюсь к экзамену по биологии",
+                  source_created_at=created)
+        self.assertEqual(len(self.stored_relationships()), 1)
+        with storage._connection(self.db) as db:
+            expiry = db.execute("SELECT expires_at FROM private_messages WHERE message_id=?",
+                ("telegram:private:101:4141",)).fetchone()[0]
+        self.assertEqual(expiry, (created + timedelta(days=365)).isoformat())
+        lifecycle.purge_expired(created + timedelta(days=365), db_path=self.db)
+        self.assertEqual(self.stored_relationships(), [])
+        self.assertEqual(len(lifecycle.list_live_memories(101, created + timedelta(days=365), db_path=self.db)), 2)
+
+    def test_relationship_only_response_can_reaffirm_a_preference_without_losing_link(self):
+        left = "Любит выращивать фиолетовые кактусы"
+        right = "Готовится к выставке фиолетовых кактусов"
+        self.model_result = [dict(content=left, kind="preference", confidence=0.99),
+                             dict(content=right, kind="fact", confidence=0.99)]
+        self.save(101, 4150, "Мне нравится выращивать фиолетовые кактусы. Я готовлюсь к выставке кактусов")
+        quote = "Мне нравится выращивать фиолетовые кактусы для выставки"
+        self.model_result = self.relationship_response(facts=False, left=left, right=right, evidence_quote=quote)
+        self.save(101, 4151, quote)
+        self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
+        self.assertEqual(len(self.stored_relationships()), 1)
+        self.assertIn("гипотеза", self.read(101, "фиолетовые кактусы"))
 
     def test_recall_questions_never_reextract_or_duplicate_existing_memory(self):
         original = "Пользователь теперь предпочитает жёлтые кактусы вместо фиолетовых"

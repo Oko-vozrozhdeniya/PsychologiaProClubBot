@@ -13,6 +13,59 @@ VALID_KINDS = frozenset({"fact", "preference", "hypothesis"})
 MAX_CONTENT_LENGTH = 2000
 MAX_SOURCE_LENGTH = 500
 MAX_CANDIDATES = 30
+AUTOMATIC_RELATION_TYPES = frozenset({"same_topic", "same_event", "related_event"})
+
+
+def split_dialog_extraction(raw):
+    """Accept legacy fact lists and the bounded fact/relationship envelope."""
+    if isinstance(raw, list):
+        facts, links = raw, []
+    elif isinstance(raw, dict) and set(raw) == {"memories", "relationships"}:
+        facts, links = raw["memories"], raw["relationships"]
+    else:
+        raise ValueError("Invalid memory extraction response")
+    if (not isinstance(facts, list) or len(facts) > 5
+            or not isinstance(links, list) or len(links) > 5):
+        raise ValueError("Invalid memory extraction response")
+    return facts, links
+
+
+def extract_relationship_candidates(raw, message_text):
+    """Validate model proposals, never treating model confidence as confirmation.
+
+    Endpoint texts must later resolve against the extractor's actual visible
+    snapshots or facts accepted from this message. A verbatim witness is
+    required, but even a quoted model proposal remains a hypothesis.
+    """
+    if not isinstance(raw, list) or len(raw) > 5:
+        raise ValueError("Invalid relationship extraction response")
+    if not isinstance(message_text, str):
+        raise ValueError("Message must be text")
+    source_text = " ".join(message_text[:6000].split())
+    result, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            left = _clean_text(item.get("source_content"), "source_content", MAX_CONTENT_LENGTH)
+            right = _clean_text(item.get("target_content"), "target_content", MAX_CONTENT_LENGTH)
+            quote = _clean_text(item.get("evidence_quote"), "evidence_quote", 500)
+        except ValueError:
+            continue
+        confidence = item.get("confidence")
+        relation_type = item.get("relation_type")
+        if (not isinstance(relation_type, str) or relation_type not in AUTOMATIC_RELATION_TYPES
+                or type(confidence) not in (int, float) or not 0.95 <= confidence <= 1
+                or left == right or quote not in source_text
+                or not has_statement_for_extraction(quote)):
+            continue
+        key = (*sorted((left, right)), relation_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(dict(source_content=left, target_content=right,
+                           relation_type=relation_type, evidence_quote=quote))
+    return result
 
 
 def has_statement_for_extraction(message_text):

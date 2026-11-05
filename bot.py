@@ -309,6 +309,7 @@ def format_diagnostic(record):
             ("extraction_fallback", "Причина перехода к резерву"),
             ("write_stage", "Этап сохранения"), ("offered_candidates", "Предложено фактов"),
             ("saved_facts", "Новых или изменённых записей"),
+            ("saved_relationships", "Предполагаемых связей сохранено"),
             ("write_status", "Результат сохранения"), ("write_error", "Ошибка сохранения"),
         )
         return "🔧 Проверка личной памяти\n\n" + "\n".join(
@@ -1732,7 +1733,7 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
         "Источником новых фактов служат только утверждения в СООБЩЕНИИ "
         "ПОЛЬЗОВАТЕЛЯ, а не вопрос и не ЗАПИСИ ДЛЯ СВЕРКИ. "
         "Не возвращай уже известный факт заново даже при другой формулировке; "
-        "если новых утверждений нет, верни []. "
+        "если новых утверждений нет, оставь memories пустым. "
         "Если пользователь ПРЯМО сообщил об изменении ранее сохранённого "
         "обстоятельства (раньше/теперь/сейчас) или явно исправляет "
         "ошибку, можно предложить замену только одной ТОЧНО подходящей "
@@ -1742,10 +1743,20 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
         "Не замещай запись по догадке, при неясности оставь эти поля пустыми. "
         "Для замены укажи в content только актуальное состояние. "
         "Прежняя версия сохраняется отдельно в истории изменений. "
-        "Ответ — только JSON-массив до пяти объектов: "
-        "content (факт на русском), kind (fact или preference), "
-        "confidence (число от 0 до 1), необязательные поля замены. "
-        "Если фактов нет, верни []."
+        "Ответ — только JSON-объект с массивами memories и relationships. "
+        "В memories до пяти объектов: content (факт на русском), "
+        "kind (fact или preference), confidence (число от 0 до 1), "
+        "необязательные поля замены. "
+        "В relationships до пяти предложений связей только между фактами "
+        "из ЗАПИСЕЙ ДЛЯ СВЕРКИ или memories этого ответа. Поля: "
+        "source_content и target_content (точные тексты соответствующих "
+        "фактов), relation_type (same_topic, same_event или related_event), "
+        "confidence (число от 0 до 1), evidence_quote (дословная цитата "
+        "утверждения из СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЯ, до 500 символов). "
+        "Связь должна опираться на новое утверждение пользователя, "
+        "а не на совпадение записей или вопрос. Все предложения связей "
+        "считаются гипотезами. Не выводи причины, диагнозы, родство "
+        "или личность упомянутых людей. Если данных нет, оба массива пустые."
     )
     extraction_text = (
         "СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ:\n" + question[:6000] +
@@ -1762,7 +1773,7 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
             "contents": [{"role": "user", "parts": [{"text": extraction_text}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 700,
+                "maxOutputTokens": 1600,
                 "responseMimeType": "application/json",
             },
         }
@@ -1803,10 +1814,11 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
                                    extraction_fallback=f"Gemini HTTP {code}" if code else type(error).__name__)
             raw_text = request_groq(extraction_text, system_instruction=instruction)
     raw = json.loads(raw_text)
-    if not isinstance(raw, list) or len(raw) > 5:
+    fact_candidates = raw.get("memories") if isinstance(raw, dict) else raw
+    if not isinstance(fact_candidates, list) or len(fact_candidates) > 5:
         raise ValueError("Invalid memory extraction response")
     if diagnostics is not None:
-        diagnostics.update(offered_candidates=len(raw), write_stage="проверка и сохранение")
+        diagnostics.update(offered_candidates=len(fact_candidates), write_stage="проверка и сохранение")
     # Consent may have been revoked while the provider extracted candidates.
     if not personal_lifecycle.has_memory_consent(user_id):
         if diagnostics is not None:
@@ -1821,6 +1833,7 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
         user_id, source, question, raw, active_before_gemini,
         policy, now.isoformat(),
         source_created_at=created,
+        relationship_diagnostics=diagnostics,
     )
     if diagnostics is not None:
         diagnostics.update(saved_facts=saved, write_status="выполнено")
@@ -1843,19 +1856,15 @@ def read_explicit_memory_prompt(user_id, query, diagnostics=None):
     live = personal_lifecycle.list_live_memories(user_id, now)
     if diagnostics is not None:
         diagnostics["stored_memories"] = len(live)
-    allowed_sources = {
-        item["source"] for item in live
-        if item["source"].startswith(f"telegram:private:{user_id}:")
-    }
     independently_verified = personal_lifecycle.list_live_sources(user_id, now)
     permissions = [
         SourcePermission(source=item["source"], expires_at=item["expires_at"])
         for item in independently_verified
-        if item["source"] in allowed_sources
+        if item["source"].startswith(f"telegram:private:{user_id}:")
     ]
     context = read_context(
         user_id, query, policy, permissions, now.isoformat(),
-        enforce_lifecycle=True,
+        enforce_lifecycle=True, include_relationships=True,
     )
     if diagnostics is not None:
         diagnostics.update(matched_memories=len(context["memories"]), read_status="выполнено")

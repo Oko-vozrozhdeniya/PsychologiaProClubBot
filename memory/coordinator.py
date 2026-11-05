@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from memory.extraction import (
     extract_candidates, candidate_to_storage_record, has_statement_for_extraction,
+    split_dialog_extraction, extract_relationship_candidates,
 )
 from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
@@ -303,7 +304,88 @@ def forget_memory(user_id, memory_id, policy, now, *, db_path=None):
 
 def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                            visible_memories, policy, now, *, db_path=None,
-                           source_created_at=None):
+                           source_created_at=None, relationship_diagnostics=None):
+    """Save ordinary-dialogue facts and conservative source-backed links.
+
+    Models cannot provide permissions, arbitrary endpoint IDs, or explicit
+    confirmation. Every automatic link remains a hypothesis. Fact-only legacy
+    responses retain the existing return value and persistence path.
+    """
+    facts, proposed = split_dialog_extraction(raw_candidates)
+    if relationship_diagnostics is not None:
+        if not isinstance(relationship_diagnostics, dict):
+            raise ValueError("Diagnostics must be a dictionary")
+        relationship_diagnostics["saved_relationships"] = 0
+    links = extract_relationship_candidates(proposed, message_text)
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    if not links:
+        return _save_dialog_facts(user_id, source, message_text, facts,
+                                  visible_memories, policy, now,
+                                  source_created_at=source_created_at, **kwargs)
+    moment = _write_policy(user_id, policy, now, kwargs)
+    _private_source(user_id, source)
+    if not has_statement_for_extraction(message_text):
+        return 0
+    initial = {row["id"]: row for row in lifecycle.list_live_memories(user_id, moment, **kwargs)}
+    replay = any(row["source"] == source for row in
+                 lifecycle.list_live_sources(user_id, moment, **kwargs))
+    saved = _save_dialog_facts(user_id, source, message_text, facts,
+                               visible_memories, policy, now,
+                               source_created_at=source_created_at, **kwargs)
+    # A retry never recreates a deleted/reviewed edge with the old witness.
+    if replay or not lifecycle.has_memory_consent(user_id, **kwargs):
+        return saved
+    shown = {row["id"]: row for row in visible_memories
+             if isinstance(row, dict) and type(row.get("id")) is int
+             and row == initial.get(row["id"])}
+    accepted = {(row.content, row.kind) for row in extract_candidates([
+        dict(content=row["content"], kind=row["kind"], confidence=row["confidence"], source=source)
+        for row in facts], min_confidence=0.85)}
+    eligible = {}
+    for row in lifecycle.list_live_memories(user_id, moment, **kwargs):
+        if not row["source"].startswith(f"telegram:private:{user_id}:"):
+            continue
+        unchanged = row == shown.get(row["id"])
+        accepted_here = (row["source"] == source and (row["content"], row["kind"]) in accepted
+                         and (row["id"] not in initial or row["id"] in shown))
+        reaffirmed_here = (row["source"] == source and row["id"] in shown
+                           and (row["content"], row["kind"]) == (
+                               shown[row["id"]]["content"], shown[row["id"]]["kind"]))
+        if unchanged or accepted_here or reaffirmed_here:
+            eligible.setdefault(row["content"], []).append(row)
+    pairs = []
+    for link in links:
+        left, right = (eligible.get(link[name], []) for name in ("source_content", "target_content"))
+        if len(left) == len(right) == 1 and left[0]["id"] != right[0]["id"]:
+            pairs.append((link, left[0], right[0]))
+    if not pairs:
+        return saved
+    # Relationship-only messages also retain their original date and consent.
+    _write_policy(user_id, policy, now, kwargs)
+    _register_source(user_id, source, message_text, moment, kwargs, source_created_at)
+    permissions = [SourcePermission(row["source"], row["expires_at"])
+                   for row in lifecycle.list_live_sources(user_id, moment, **kwargs)
+                   if row["source"].startswith(f"telegram:private:{user_id}:")]
+    count = 0
+    for link, left, right in pairs:
+        relationship = relationships.MemoryRelationship(
+            user_id, left["id"], right["id"], link["relation_type"], "hypothesis",
+            source, link["evidence_quote"])
+        try:
+            remember_relationship(user_id, relationship, left, right, policy,
+                                  permissions, now, **kwargs)
+        except (ValueError, PermissionError):
+            # A concurrent correction/deletion/revocation fails closed.
+            continue
+        count += 1
+    if relationship_diagnostics is not None:
+        relationship_diagnostics["saved_relationships"] = count
+    return saved
+
+
+def _save_dialog_facts(user_id, source, message_text, raw_candidates,
+                       visible_memories, policy, now, *, db_path=None,
+                       source_created_at=None):
     """Validate and persist a private extraction response behind one boundary.
 
     The caller supplies only the owned live memories shown to the extractor.
