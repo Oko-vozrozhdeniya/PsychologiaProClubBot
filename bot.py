@@ -21,6 +21,7 @@ from memory.ai_providers import (
 )
 from memory import storage as personal_storage, lifecycle as personal_lifecycle
 from memory import cleanup_worker as retention_worker
+from memory import backup as independent_backup
 from memory.retrieval import rank_memories
 from memory.prompt_context import build_memory_context
 from memory.extraction import has_statement_for_extraction
@@ -225,7 +226,7 @@ def create_error_record(error, operation):
 def save_diagnostic_record(record):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    with DIAGNOSTICS_FILE.open(
+    with retention_worker.archive_lock(DIAGNOSTICS_FILE), DIAGNOSTICS_FILE.open(
         "a",
         encoding="utf-8"
     ) as file:
@@ -266,6 +267,17 @@ def read_diagnostic_records(limit=5):
 
 
 def format_diagnostic(record):
+    if record.get("record_type") == "backup":
+        labels = (("timestamp", "Время (UTC)"), ("status", "Результат"),
+                  ("verified_files", "Файлов данных"), ("source_bytes", "Размер данных, байт"),
+                  ("uploaded_bytes", "Добавлено в резерв, байт"),
+                  ("free_bytes", "Свободно на Диске, байт"),
+                  ("snapshot_id", "Версия копии"), ("restore_verified", "Проверено восстановление"),
+                  ("prune_status", "Очистка старых версий"),
+                  ("maintenance_error", "Ошибка обслуживания"),
+                  ("duration_seconds", "Длительность, секунд"), ("error_class", "Тип ошибки"))
+        return "🔧 Независимый резерв на Яндекс Диске\n\n" + "\n".join(
+            f"{label}: {record[key]}" for key, label in labels if key in record)
     if record.get("record_type") == "recovery":
         labels = (("timestamp", "Время (UTC)"), ("status", "Результат"),
                   ("verified_files", "Проверено компонентов"),
@@ -545,26 +557,28 @@ async def track_topic_changes(
     ):
         return
 
-    if message.forum_topic_created:
-        save_topic_name(
-            message.message_thread_id,
-            message.forum_topic_created.name
-        )
+    async with dialog_lock:
+        if message.forum_topic_created:
+            save_topic_name(
+                message.message_thread_id,
+                message.forum_topic_created.name
+            )
 
-    elif (
-        message.forum_topic_edited
-        and message.forum_topic_edited.name is not None
-    ):
-        save_topic_name(
-            message.message_thread_id,
-            message.forum_topic_edited.name
-        )
+        elif (
+            message.forum_topic_edited
+            and message.forum_topic_edited.name is not None
+        ):
+            save_topic_name(
+                message.message_thread_id,
+                message.forum_topic_edited.name
+            )
 
-    elif (
-        message.general_forum_topic_unhidden
-        or message.general_forum_topic_hidden
-    ):
-        save_topic_name(0, "General")
+        elif (
+            message.general_forum_topic_unhidden
+            or message.general_forum_topic_hidden
+        ):
+            save_topic_name(0, "General")
+
 
 
 def read_archive():
@@ -1237,59 +1251,61 @@ async def save_message(
     ):
         return
 
-    timestamp = datetime.now(
-        timezone.utc
-    ).isoformat()
+    async with dialog_lock:
+        timestamp = datetime.now(
+            timezone.utc
+        ).isoformat()
 
-    topic_id = message.message_thread_id or 0
+        topic_id = message.message_thread_id or 0
 
-    sender_id = (
-        message.from_user.id
-        if message.from_user
-        else 0
-    )
-
-    record = {
-        "timestamp": timestamp,
-        "chat_id": chat.id,
-        "topic_id": topic_id,
-        "user_id": sender_id,
-        "message_id": message.id,
-        "text": message.text
-    }
-
-    DATA_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    with TEXT_FILE.open(
-        "a",
-        encoding="utf-8"
-    ) as file:
-        file.write(
-            f"{timestamp} | chat={chat.id} "
-            f"| topic={topic_id} "
-            f"| user={sender_id} "
-            f"| message={message.id}\n"
-            f"{message.text}\n\n"
+        sender_id = (
+            message.from_user.id
+            if message.from_user
+            else 0
         )
 
-    with JSON_FILE.open(
-        "a",
-        encoding="utf-8"
-    ) as file:
-        file.write(
-            json.dumps(
-                record,
-                ensure_ascii=False
-            ) + "\n"
+        record = {
+            "timestamp": timestamp,
+            "chat_id": chat.id,
+            "topic_id": topic_id,
+            "user_id": sender_id,
+            "message_id": message.id,
+            "text": message.text
+        }
+
+        DATA_DIR.mkdir(
+            parents=True,
+            exist_ok=True
         )
 
-    logger.info(
-        "GROUP_MESSAGE_SAVED message_id=%s",
-        message.id
-    )
+        with TEXT_FILE.open(
+            "a",
+            encoding="utf-8"
+        ) as file:
+            file.write(
+                f"{timestamp} | chat={chat.id} "
+                f"| topic={topic_id} "
+                f"| user={sender_id} "
+                f"| message={message.id}\n"
+                f"{message.text}\n\n"
+            )
+
+        with JSON_FILE.open(
+            "a",
+            encoding="utf-8"
+        ) as file:
+            file.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False
+                ) + "\n"
+            )
+
+        logger.info(
+            "GROUP_MESSAGE_SAVED message_id=%s",
+            message.id
+        )
+
 
 
 async def answer_archive_question(
@@ -2238,9 +2254,20 @@ async def start_retention_cleanup(application):
     await retention_cleanup_pass(application)
     application.bot_data["_retention_task"] = asyncio.create_task(
         retention_cleanup_loop(application), name="private-retention-cleanup")
+    if os.environ.get("BACKUP_ENABLED", "0") == "1":
+        try:
+            await independent_backup.start_runtime(application, data_dir=DATA_DIR,
+                db_path=personal_storage.DATABASE_PATH, dialog_lock=dialog_lock,
+                record=save_diagnostic_record)
+        except Exception as error:
+            save_diagnostic_record({"record_type": "backup", "status": "ошибка настройки",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error_class": type(error).__name__})
 
 
 async def stop_retention_cleanup(application):
+    if "_backup_task" in application.bot_data:
+        await independent_backup.stop_runtime(application)
     task = application.bot_data.pop("_retention_task", None)
     if task is not None:
         task.cancel()
@@ -2248,6 +2275,23 @@ async def stop_retention_cleanup(application):
             await task
         except asyncio.CancelledError:
             pass
+
+
+async def backup_now_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only export to the configured private backup repository."""
+    if not has_memory_test_access(update):
+        return
+    await update.effective_message.reply_text("Сохраняю зашифрованный резерв и проверяю восстановление.")
+    result = await independent_backup.run_backup_pass(context.application, data_dir=DATA_DIR,
+        db_path=personal_storage.DATABASE_PATH, dialog_lock=dialog_lock,
+        record=save_diagnostic_record, prove=True)
+    if result["status"] == "выполнено":
+        await update.effective_message.reply_text(
+            "Семь файлов сохранены в зашифрованном резерве. Восстановление отдельной копии проверено. "
+            "Рабочие данные не заменялись. Технический результат: /diagnostics 1")
+    else:
+        await update.effective_message.reply_text(
+            "Резерв не подтверждён. Технический результат: /diagnostics 1")
 
 
 def main():
@@ -2277,6 +2321,7 @@ def main():
     app.add_handler(CommandHandler("change", change_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("recovery_check", recovery_check_command))
+    app.add_handler(CommandHandler("backup_now", backup_now_command))
     for command in ("ai_gemini", "ai_groq", "ai_auto"):
         app.add_handler(CommandHandler(
             command, choose_ai_mode,

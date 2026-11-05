@@ -251,13 +251,14 @@ def _read_only_database(path):
     return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
-def _validate_private_dataset(directory, now):
+def _validate_private_dataset(directory, now, *, max_file_bytes=None):
     """Validate a closed copy without initialization, migration or AI calls."""
     directory, moment = Path(directory), _moment(now)
+    maximum = MAX_SNAPSHOT_FILE_BYTES if max_file_bytes is None else max_file_bytes
     for name in SNAPSHOT_FILES:
         path = directory / name
         _regular_file(path)
-        if path.stat().st_size > MAX_SNAPSHOT_FILE_BYTES:
+        if path.stat().st_size > maximum:
             raise ValueError("Private snapshot component is too large")
     state_file = directory / SNAPSHOT_FILES[2]
     if state_file.stat().st_size > 8 * 1024 * 1024:
@@ -272,7 +273,7 @@ def _validate_private_dataset(directory, now):
         raise ValueError("Invalid private session state")
     dialogs = 0
     with (directory / SNAPSHOT_FILES[1]).open(encoding="utf-8") as archive:
-        for line in archive:
+        for line in iter(lambda: archive.readline(1024 * 1024 + 1), ""):
             if not line.strip():
                 continue
             if len(line) > 1024 * 1024:
@@ -314,6 +315,133 @@ def _validate_private_dataset(directory, now):
     finally:
         db.close()
     return counts
+
+
+FULL_BACKUP_FILES = (*SNAPSHOT_FILES, "messages.jsonl", "messages.txt",
+                     "topics.json", "diagnostics.jsonl")
+FULL_BACKUP_MANIFEST = "backup_manifest.json"
+FULL_COMPONENT_LIMIT = 256 * 1024 ** 3
+
+
+def validate_full_dataset(directory, now, *, maximum=FULL_COMPONENT_LIMIT,
+                          verify_manifest=True):
+    """Stream validation of the seven-file set; no network or live writes."""
+    directory, moment = Path(directory), _moment(now)
+    for name in FULL_BACKUP_FILES:
+        path = directory / name
+        _regular_file(path)
+        if path.stat().st_size > maximum:
+            raise ValueError("Backup component exceeds its configured limit")
+    counts = _validate_private_dataset(directory, moment, max_file_bytes=maximum)
+    for name in ("messages.jsonl", "diagnostics.jsonl"):
+        with (directory / name).open(encoding="utf-8") as stream:
+            for line in iter(lambda: stream.readline(4 * 1024 ** 2 + 1), ""):
+                if len(line) > 4 * 1024 ** 2:
+                    raise ValueError("Backup record is too large")
+                if line.strip() and not isinstance(json.loads(line), dict):
+                    raise ValueError("Invalid auxiliary archive record")
+    with (directory / "messages.txt").open(encoding="utf-8") as stream:
+        while stream.read(1024 * 1024):
+            pass
+    topics_path = directory / "topics.json"
+    if topics_path.stat().st_size > 8 * 1024 ** 2:
+        raise ValueError("Topics file is too large")
+    topics = json.loads(topics_path.read_text(encoding="utf-8"))
+    if not isinstance(topics, dict) or any(not isinstance(v, str) for v in topics.values()):
+        raise ValueError("Invalid topics file")
+    if verify_manifest:
+        manifest_path = directory / FULL_BACKUP_MANIFEST
+        _regular_file(manifest_path)
+        if manifest_path.stat().st_size > 65536:
+            raise ValueError("Backup manifest is too large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("format") != "psychologia-full-backup"
+                or type(manifest.get("version")) is not int or manifest.get("version") != 1
+                or manifest.get("retention_days") != RETENTION_DAYS
+                or _moment(manifest.get("created_at")) > moment
+                or set(manifest.get("files", {})) != set(FULL_BACKUP_FILES)):
+            raise ValueError("Unsupported full backup manifest")
+        for name in FULL_BACKUP_FILES:
+            spec, path = manifest["files"][name], directory / name
+            if spec != {"size": path.stat().st_size, "sha256": _file_digest(path)}:
+                raise ValueError("Full backup checksum mismatch")
+    return counts
+
+
+def capture_full_dataset_quiescent(data_dir, destination, now=None, *, db_path=None,
+                                   maximum=FULL_COMPONENT_LIMIT):
+    """Caller holds runtime lease and bot dialog_lock, or an offline lease.
+
+    Group/topic handlers also use dialog_lock. Diagnostics use archive_lock.
+    The live SQLite is read via its backup API (including committed WAL).
+    Expiry is applied only on the private copy. Only the seven named files
+    enter the backup; keys, caches, environment and binaries are excluded.
+    """
+    data_dir, target = Path(data_dir).resolve(), Path(destination)
+    moment = _moment(now if now is not None else datetime.now(timezone.utc))
+    ensure_recovery_ready(data_dir)
+    database = Path(db_path).resolve() if db_path is not None else data_dir / "memory.db"
+    if database.parent != data_dir or database.name != "memory.db":
+        raise ValueError("Full backup requires the leased memory database")
+    if (os.path.lexists(target) or target.resolve() == data_dir
+            or data_dir.is_relative_to(target.resolve())):
+        raise FileExistsError("Backup destination must be a new staging directory")
+    source_files = [data_dir / name for name in FULL_BACKUP_FILES]
+    for path in source_files:
+        _regular_file(path)
+        if path.stat().st_size > maximum:
+            raise ValueError("Backup component is too large")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    required = sum(path.stat().st_size for path in source_files)
+    wal = data_dir / "memory.db-wal"
+    if wal.exists():
+        _regular_file(wal)
+        required += wal.stat().st_size
+    if shutil.disk_usage(target.parent).free < required + max(required // 10, 64 * 1024 ** 2):
+        raise OSError("Insufficient local staging space")
+    target.mkdir(mode=0o700)
+    try:
+        with archive_lock(data_dir / "diagnostics.jsonl", shared=True):
+            with archive_lock(data_dir / "private_history.jsonl", shared=True):
+                source = _read_only_database(database)
+                output = sqlite3.connect(target / "memory.db")
+                try:
+                    source.backup(output)
+                    output.commit()
+                finally:
+                    output.close()
+                    source.close()
+                for name in FULL_BACKUP_FILES:
+                    if name != "memory.db":
+                        shutil.copyfile(data_dir / name, target / name)
+        validate_full_dataset(target, moment, maximum=maximum, verify_manifest=False)
+        cleanup_once(target / "memory.db", moment,
+                     archive_path=target / "private_history.jsonl")
+        # Only this private staging directory has ever used this sidecar.
+        # The live stable lock is never removed or replaced.
+        (target / "private_history.jsonl.lock").unlink(missing_ok=True)
+        counts = validate_full_dataset(target, moment, maximum=maximum, verify_manifest=False)
+        files = {}
+        for name in FULL_BACKUP_FILES:
+            path = target / name
+            path.chmod(0o600)
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            files[name] = {"size": path.stat().st_size, "sha256": _file_digest(path)}
+        manifest = {"format": "psychologia-full-backup", "version": 1,
+                    "created_at": moment.isoformat(), "retention_days": RETENTION_DAYS,
+                    "files": files}
+        marker = target / FULL_BACKUP_MANIFEST
+        marker.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+        marker.chmod(0o600)
+        with marker.open("rb") as stream:
+            os.fsync(stream.fileno())
+        _sync_directory(target)
+        return {"verified_files": len(files), "counts": counts,
+                "source_bytes": sum(spec["size"] for spec in files.values())}
+    except BaseException:
+        shutil.rmtree(target)
+        raise
 
 
 def _capture_snapshot_quiescent(data_dir, destination, now, *, db_path=None):

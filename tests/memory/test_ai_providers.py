@@ -334,7 +334,8 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
                      "forget_command", "memory_on_command", "memory_off_command", "correct_command",
                      "change_command", "history_command", "diagnostics", "testai", "groq_ping",
                      "private_message", "save_message", "track_topic_changes",
-                     "start_retention_cleanup", "stop_retention_cleanup", "recovery_check_command"):
+                     "start_retention_cleanup", "stop_retention_cleanup", "recovery_check_command",
+                     "backup_now_command"):
             self.ns[name] = Mock()
         exec(compile(ast.Module(body=[self.functions["main"]], type_ignores=[]), "bot.py", "exec"), self.ns)
         self.ns["main"]()

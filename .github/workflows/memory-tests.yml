@@ -9,6 +9,7 @@ on:
       - "test_bot.py"
       - "memory/**"
       - "tests/memory/**"
+      - "tools/install_backup_tools.py"
       - ".github/workflows/memory-tests.yml"
   pull_request:
     paths:
@@ -16,6 +17,7 @@ on:
       - "test_bot.py"
       - "memory/**"
       - "tests/memory/**"
+      - "tools/install_backup_tools.py"
       - ".github/workflows/memory-tests.yml"
   workflow_dispatch:
 
@@ -36,9 +38,15 @@ jobs:
           python-version: "3.11"
 
       - name: Check memory module syntax
-        run: python -m compileall -q bot.py test_bot.py memory tests/memory
+        run: python -m compileall -q bot.py test_bot.py memory tests/memory tools
+
+      - name: Install verified backup tools
+        run: python tools/install_backup_tools.py --directory /tmp/psychologia-backup-tools
 
       - name: Run every memory unit test
+        env:
+          TEST_BACKUP_TOOLS_DIR: /tmp/psychologia-backup-tools
+          REQUIRE_NATIVE_BACKUP_TESTS: "1"
         run: python -m unittest discover -s tests/memory -p "test_*.py" -v
 
       - name: Publish run summary
