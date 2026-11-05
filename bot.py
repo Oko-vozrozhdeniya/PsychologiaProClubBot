@@ -310,6 +310,7 @@ def format_diagnostic(record):
             ("write_stage", "Этап сохранения"), ("offered_candidates", "Предложено фактов"),
             ("saved_facts", "Новых или изменённых записей"),
             ("saved_relationships", "Предполагаемых связей сохранено"),
+            ("saved_communication_preferences", "Явных предпочтений общения сохранено"),
             ("write_status", "Результат сохранения"), ("write_error", "Ошибка сохранения"),
         )
         return "🔧 Проверка личной памяти\n\n" + "\n".join(
@@ -1865,6 +1866,7 @@ def read_explicit_memory_prompt(user_id, query, diagnostics=None):
     context = read_context(
         user_id, query, policy, permissions, now.isoformat(),
         enforce_lifecycle=True, include_relationships=True,
+        include_communication_preferences=True,
     )
     if diagnostics is not None:
         diagnostics.update(matched_memories=len(context["memories"]), read_status="выполнено")

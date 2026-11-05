@@ -10,7 +10,9 @@ from memory.extraction import (
     extract_candidates, candidate_to_storage_record, has_statement_for_extraction,
     split_dialog_extraction, extract_relationship_candidates,
 )
-from memory.personalization import build_personalization
+from memory.personalization import (
+    build_personalization, communication_length, PersonalizationItem, LENGTH_CONTENT,
+)
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
 from memory.updating import make_update_decision, memory_match_key, source_supports_memory
@@ -94,7 +96,7 @@ def _sources(permissions, now):
 def read_context(user_id, query, policy, source_permissions, now, *,
                  db_path=None, limit=5, personalization_items=(),
                  checkpoint=None, topic_invited=False, enforce_lifecycle=False,
-                 include_relationships=False):
+                 include_relationships=False, include_communication_preferences=False):
     """Return only explicitly authorized, unexpired source-backed context.
 
     The source list must be independently verified by the caller; a memory's
@@ -103,6 +105,8 @@ def read_context(user_id, query, policy, source_permissions, now, *,
     moment = _allowed(user_id, policy, now)
     if type(include_relationships) is not bool:
         raise ValueError("Invalid relationship context flag")
+    if type(include_communication_preferences) is not bool:
+        raise ValueError("Invalid communication context flag")
     allowed_sources = _sources(source_permissions, moment)
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Query required")
@@ -128,8 +132,20 @@ def read_context(user_id, query, policy, source_permissions, now, *,
     for item in personalization_items:
         if item.source not in allowed_sources:
             raise PermissionError("Unverified personalization source")
-    personalization = (build_personalization(user_id, personalization_items,
-                       topic_invited=topic_invited) if personalization_items else None)
+    items = list(personalization_items)
+    preference = (storage.get_communication_preference(user_id, allowed_sources, moment,
+                  **({"db_path":db_path} if db_path is not None else {}))
+                  if include_communication_preferences else None)
+    if preference and len(items) < 30:
+        items.append(PersonalizationItem(user_id, "communication",
+            LENGTH_CONTENT[preference["response_length"]], preference["source"],
+            confirmed=True, explicit=True))
+    personalization = (build_personalization(user_id, items,
+                       topic_invited=topic_invited, current_request=query,
+                       communication_preference=preference["response_length"] if preference else None)
+                       if items or preference else None)
+    if preference and preference["source"] not in personalization["sources"]:
+        personalization["sources"].append(preference["source"])
     progress = None
     if checkpoint is not None:
         if checkpoint.source not in allowed_sources:
@@ -316,9 +332,11 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
         if not isinstance(relationship_diagnostics, dict):
             raise ValueError("Diagnostics must be a dictionary")
         relationship_diagnostics["saved_relationships"] = 0
+        relationship_diagnostics["saved_communication_preferences"] = 0
     links = extract_relationship_candidates(proposed, message_text)
+    length = communication_length(message_text, persistent=True)
     kwargs = {"db_path": db_path} if db_path is not None else {}
-    if not links:
+    if not links and length is None:
         return _save_dialog_facts(user_id, source, message_text, facts,
                                   visible_memories, policy, now,
                                   source_created_at=source_created_at, **kwargs)
@@ -334,6 +352,14 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                                source_created_at=source_created_at, **kwargs)
     # A retry never recreates a deleted/reviewed edge with the old witness.
     if replay or not lifecycle.has_memory_consent(user_id, **kwargs):
+        return saved
+    if length is not None:
+        _write_policy(user_id, policy, now, kwargs)
+        _register_source(user_id, source, message_text, moment, kwargs, source_created_at)
+        saved_preference = storage.save_communication_preference(user_id, source, length, moment, **kwargs)
+        if relationship_diagnostics is not None:
+            relationship_diagnostics["saved_communication_preferences"] = int(saved_preference)
+    if not links:
         return saved
     shown = {row["id"]: row for row in visible_memories
              if isinstance(row, dict) and type(row.get("id")) is int

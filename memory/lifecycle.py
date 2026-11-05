@@ -111,6 +111,16 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
             ON memory_relationships(user_id, source_memory_id, target_memory_id)""")
         db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_relationships_source
             ON memory_relationships(user_id, message_id)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS communication_preferences (
+            user_id INTEGER NOT NULL CHECK(user_id > 0),
+            message_id TEXT NOT NULL,
+            response_length TEXT NOT NULL CHECK(response_length IN ('brief','detailed')),
+            status TEXT NOT NULL CHECK(status IN ('active','superseded')),
+            PRIMARY KEY(user_id,message_id),
+            FOREIGN KEY(user_id,message_id) REFERENCES private_messages(user_id,message_id) ON DELETE CASCADE
+        )""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_communication_preference_active
+            ON communication_preferences(user_id) WHERE status='active'""")
 
 
 def _merge_consent(db, user_id):
@@ -472,6 +482,7 @@ def purge_expired(now, *, db_path=storage.DATABASE_PATH):
                 _refresh_primary_source(db, row["user_id"], row["memory_id"])
         _prune_merges(db, moment)
         storage._prune_memory_relationships(db, moment)
+        storage._prune_communication_preferences(db, moment)
     return {"expired_messages": expired, "deleted_memories": removed}
 
 
@@ -502,6 +513,7 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
                 _refresh_primary_source(db, user_id, row["memory_id"])
         _prune_merges(db)
         storage._prune_memory_relationships(db)
+        storage._prune_communication_preferences(db)
     return {"deleted_messages": deleted, "deleted_memories": removed}
 
     

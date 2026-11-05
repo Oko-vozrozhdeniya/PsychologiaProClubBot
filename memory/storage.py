@@ -16,6 +16,75 @@ DATABASE_PATH = Path(os.environ.get("MEMORY_DB_PATH", "/app/data/memory.db"))
 VALID_KINDS = frozenset({"fact", "preference", "hypothesis"})
 
 
+def _prune_communication_preferences(db, now=None):
+    # Explicit cleanup also works on connections with foreign keys disabled.
+    db.execute("""DELETE FROM communication_preferences WHERE NOT EXISTS (
+        SELECT 1 FROM private_messages pm WHERE pm.user_id=communication_preferences.user_id
+        AND pm.message_id=communication_preferences.message_id"""
+        + (" AND pm.expires_at>?" if now is not None else "") + ")",
+        (now,) if now is not None else ())
+
+
+def save_communication_preference(user_id, source, response_length, now, *, db_path=DATABASE_PATH):
+    """Store only a source-verified explicit setting; superseded history stays inert."""
+    from memory import lifecycle
+    from memory.personalization import communication_length, RESPONSE_LENGTHS
+    _validate_user_id(user_id)
+    if not isinstance(source, str) or not source.startswith(f"telegram:private:{user_id}:"):
+        raise PermissionError("Invalid participant source")
+    if not isinstance(response_length, str) or response_length not in RESPONSE_LENGTHS:
+        raise ValueError("Invalid communication preference")
+    moment = lifecycle._iso(now)
+    with _connection(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        lifecycle._merge_consent(db, user_id)
+        witness = db.execute("""SELECT content,created_at FROM private_messages WHERE user_id=?
+            AND message_id=? AND created_at<=? AND expires_at>?""", (user_id,source,moment,moment)).fetchone()
+        if not witness or communication_length(witness["content"], persistent=True) != response_length:
+            raise PermissionError("Explicit live communication preference required")
+        if db.execute("SELECT 1 FROM communication_preferences WHERE user_id=? AND message_id=?",
+                      (user_id,source)).fetchone():
+            return False
+        current = db.execute("""SELECT p.message_id,m.created_at FROM communication_preferences p
+            JOIN private_messages m ON m.user_id=p.user_id AND m.message_id=p.message_id
+            WHERE p.user_id=? AND p.status='active'""", (user_id,)).fetchone()
+        def event_key(created, message_id):
+            suffix = message_id.rsplit(":", 1)[-1]
+            return (created, int(suffix) if suffix.isdecimal() else 0, message_id)
+        if current and event_key(witness["created_at"],source) <= event_key(current["created_at"],current["message_id"]):
+            return False
+        db.execute("UPDATE communication_preferences SET status='superseded' WHERE user_id=? AND status='active'",
+                   (user_id,))
+        db.execute("INSERT INTO communication_preferences VALUES (?,?,?,'active')", (user_id,source,response_length))
+        return True
+
+
+def get_communication_preference(user_id, allowed_sources, now, *, db_path=DATABASE_PATH):
+    """Read the active setting without falling back to superseded preferences."""
+    from memory import lifecycle
+    from memory.personalization import communication_length
+    _validate_user_id(user_id)
+    if not isinstance(allowed_sources, (set, frozenset, list, tuple)):
+        raise ValueError("Verified sources required")
+    moment = lifecycle._iso(now)
+    with _connection(db_path) as db:
+        db.execute("BEGIN")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='communication_preferences'").fetchone():
+            return None
+        consent = db.execute("SELECT enabled FROM memory_consents WHERE user_id=?", (user_id,)).fetchone()
+        if not consent or consent["enabled"] != 1:
+            return None
+        row = db.execute("""SELECT p.message_id,p.response_length,m.content FROM communication_preferences p
+            JOIN private_messages m ON m.user_id=p.user_id AND m.message_id=p.message_id
+            WHERE p.user_id=? AND p.status='active' AND m.created_at<=? AND m.expires_at>?""",
+            (user_id,moment,moment)).fetchone()
+        if (not row or row["message_id"] not in allowed_sources
+                or not row["message_id"].startswith(f"telegram:private:{user_id}:")
+                or communication_length(row["content"], persistent=True) != row["response_length"]):
+            return None
+        return {"source":row["message_id"], "response_length":row["response_length"]}
+
+
 def _timestamp():
     return datetime.now(timezone.utc).isoformat()
 
@@ -202,6 +271,12 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
         tables = {row["name"] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
+        if "communication_preferences" in tables:
+            # Forgetting a fact extracted from an explicit style statement
+            # must also remove the setting derived from that same source.
+            connection.execute("""DELETE FROM communication_preferences WHERE user_id=?
+                AND message_id=(SELECT source FROM memories WHERE user_id=? AND id=?)""",
+                (user_id,user_id,memory_id))
         _delete_memory_relationships(connection, user_id, memory_id)
         if "memory_revisions" in tables:
             connection.execute(
