@@ -13,7 +13,7 @@ from memory.personalization import build_personalization
 from memory.progress import summary as progress_summary
 from memory.retrieval import rank_memories
 from memory.updating import make_update_decision, memory_match_key, source_supports_memory
-from memory import storage, lifecycle
+from memory import storage, lifecycle, relationships
 
 
 def _utc(value):
@@ -92,18 +92,24 @@ def _sources(permissions, now):
 
 def read_context(user_id, query, policy, source_permissions, now, *,
                  db_path=None, limit=5, personalization_items=(),
-                 checkpoint=None, topic_invited=False, enforce_lifecycle=False):
+                 checkpoint=None, topic_invited=False, enforce_lifecycle=False,
+                 include_relationships=False):
     """Return only explicitly authorized, unexpired source-backed context.
 
     The source list must be independently verified by the caller; a memory's
     own source string alone is never proof of validity or retention.
     """
     moment = _allowed(user_id, policy, now)
+    if type(include_relationships) is not bool:
+        raise ValueError("Invalid relationship context flag")
     allowed_sources = _sources(source_permissions, moment)
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Query required")
     if not allowed_sources:
-        return {"memories": [], "personalization": None, "progress": None}
+        result = {"memories": [], "personalization": None, "progress": None}
+        if include_relationships:
+            result["relationships"] = []
+        return result
     # Filter at the database boundary, before ranking or result limits.
     # The source permissions must have been independently verified.
     records = storage.list_authorized_memories(
@@ -131,8 +137,36 @@ def read_context(user_id, query, policy, source_permissions, now, *,
                checkpoint.actions + checkpoint.results):
             raise PermissionError("Unverified checkpoint event")
         progress = progress_summary(checkpoint, user_id)
-    return {"memories": safe, "personalization": personalization,
-            "progress": progress}
+    result = {"memories": safe, "personalization": personalization,
+              "progress": progress}
+    if include_relationships:
+        result["relationships"] = relationships.list_live_relationships(
+            user_id, [row["id"] for row in safe], allowed_sources, moment,
+            limit=10, **({"db_path":db_path} if db_path is not None else {}))
+    return result
+
+
+def remember_relationship(user_id, relationship, source_snapshot, target_snapshot,
+                          policy, source_permissions, now, *, explicitly_confirmed=False,
+                          db_path=None):
+    """Persist an explicitly supplied relationship through the existing coordinator.
+
+    This is a source-verified API, not automatic relation extraction from a
+    conversation. It neither produces new conclusions nor promotes guesses.
+    """
+    moment = _allowed(user_id, policy, now)
+    if not isinstance(relationship, relationships.MemoryRelationship) or relationship.user_id != user_id:
+        raise PermissionError("Cross-user relationship")
+    allowed_sources = _sources(source_permissions, moment)
+    if relationship.source not in allowed_sources:
+        raise PermissionError("Unverified relationship source")
+    for snapshot in (source_snapshot, target_snapshot):
+        if not isinstance(snapshot, dict) or snapshot.get("source") not in allowed_sources:
+            raise PermissionError("Unverified relationship endpoint source")
+    kwargs = {"db_path":db_path} if db_path is not None else {}
+    _write_policy(user_id, policy, now, kwargs)
+    return relationships.save_relationship(relationship, source_snapshot, target_snapshot,
+        moment, explicitly_confirmed=explicitly_confirmed, **kwargs)
 
 
 def prepare_candidates(user_id, raw_candidates, policy, source_permissions,

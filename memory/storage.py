@@ -6,6 +6,8 @@ No database is created on import. Call initialize_database() explicitly.
 
 import os
 import sqlite3
+import hashlib
+import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +73,54 @@ def initialize_database(db_path=DATABASE_PATH):
             CREATE INDEX IF NOT EXISTS idx_memories_user_id
             ON memories(user_id, id)
         """)
+        connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_owner_id
+            ON memories(user_id, id)""")
+
+
+def _relationship_table_exists(connection):
+    return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                              "AND name='memory_relationships'").fetchone() is not None
+
+
+def _memory_relationship_version(content, kind):
+    """Bind an edge to the actual claim, without copying its body into the edge."""
+    value = json.dumps([content, kind], ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _review_memory_relationships(connection, user_id, memory_id):
+    if _relationship_table_exists(connection):
+        connection.execute("""UPDATE memory_relationships SET status='review_required'
+            WHERE user_id=? AND (source_memory_id=? OR target_memory_id=?)""",
+            (user_id, memory_id, memory_id))
+
+
+def _delete_memory_relationships(connection, user_id, memory_id):
+    if _relationship_table_exists(connection):
+        connection.execute("""DELETE FROM memory_relationships
+            WHERE user_id=? AND (source_memory_id=? OR target_memory_id=?)""",
+            (user_id, memory_id, memory_id))
+
+
+def _prune_memory_relationships(connection, now=None):
+    """Expire edge provenance and missing endpoints, even with SQLite FKs off."""
+    if not _relationship_table_exists(connection):
+        return
+    expiry = " AND pm.expires_at>?" if now is not None else ""
+    parameters = (now, now, now) if now is not None else ()
+    connection.execute("""DELETE FROM memory_relationships AS r WHERE
+        NOT EXISTS (SELECT 1 FROM private_messages pm
+            WHERE pm.user_id=r.user_id AND pm.message_id=r.message_id""" + expiry + """)
+        OR NOT EXISTS (SELECT 1 FROM memories m WHERE m.user_id=r.user_id
+            AND m.id=r.source_memory_id AND EXISTS (
+                SELECT 1 FROM memory_sources ms JOIN private_messages pm
+                ON pm.user_id=ms.user_id AND pm.message_id=ms.message_id
+                WHERE ms.user_id=m.user_id AND ms.memory_id=m.id""" + expiry + """))
+        OR NOT EXISTS (SELECT 1 FROM memories m WHERE m.user_id=r.user_id
+            AND m.id=r.target_memory_id AND EXISTS (
+                SELECT 1 FROM memory_sources ms JOIN private_messages pm
+                ON pm.user_id=ms.user_id AND pm.message_id=ms.message_id
+                WHERE ms.user_id=m.user_id AND ms.memory_id=m.id""" + expiry + "))", parameters)
 
 
 def add_memory(user_id, content, kind, source, db_path=DATABASE_PATH):
@@ -130,11 +180,15 @@ def update_memory(user_id, memory_id, content, db_path=DATABASE_PATH):
     content = _validate_text(content, "content")
 
     with _connection(db_path) as connection:
+        previous = connection.execute("SELECT content FROM memories WHERE user_id=? AND id=?",
+                                      (user_id, memory_id)).fetchone()
         cursor = connection.execute("""
             UPDATE memories
             SET content = ?, updated_at = ?
             WHERE user_id = ? AND id = ?
         """, (content, _timestamp(), user_id, memory_id))
+        if previous is not None and previous["content"] != content:
+            _review_memory_relationships(connection, user_id, memory_id)
         return cursor.rowcount == 1
 
 
@@ -148,6 +202,7 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
         tables = {row["name"] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
+        _delete_memory_relationships(connection, user_id, memory_id)
         if "memory_revisions" in tables:
             connection.execute(
                 "DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",

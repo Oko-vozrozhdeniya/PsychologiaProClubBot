@@ -88,6 +88,29 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
         )""")
         db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_merges_owner
             ON memory_merges(user_id, kept_memory_id, id)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS memory_relationships (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL CHECK(user_id > 0),
+            source_memory_id INTEGER NOT NULL,
+            target_memory_id INTEGER NOT NULL CHECK(target_memory_id != source_memory_id),
+            relation_type TEXT NOT NULL CHECK(relation_type IN
+                ('same_topic','same_event','related_event','involves_person','family_relation','social_relation')),
+            evidence TEXT NOT NULL CHECK(evidence IN ('confirmed','hypothesis')),
+            message_id TEXT NOT NULL,
+            description TEXT NOT NULL CHECK(length(description) <= 500),
+            source_version TEXT NOT NULL,
+            target_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('active','review_required')),
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, source_memory_id, target_memory_id, relation_type, evidence, message_id),
+            FOREIGN KEY(user_id, source_memory_id) REFERENCES memories(user_id,id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id, target_memory_id) REFERENCES memories(user_id,id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id, message_id) REFERENCES private_messages(user_id,message_id) ON DELETE CASCADE
+        )""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_relationships_owner
+            ON memory_relationships(user_id, source_memory_id, target_memory_id)""")
+        db.execute("""CREATE INDEX IF NOT EXISTS idx_memory_relationships_source
+            ON memory_relationships(user_id, message_id)""")
 
 
 def _merge_consent(db, user_id):
@@ -165,6 +188,7 @@ def confirm_memory(user_id, expected, source, now, *, db_path=storage.DATABASE_P
         content = current_memory_content(current["content"], current["kind"])
         kind = memory_match_key(current["content"], current["kind"])[0]
         if content != current["content"] or kind != current["kind"]:
+            storage._review_memory_relationships(db, user_id, current["id"])
             _archive_merged_memory(db, user_id, current["id"], current, links,
                                    [source], moment, "current_state")
         db.execute("INSERT OR IGNORE INTO memory_sources VALUES (?, ?, ?)",
@@ -219,11 +243,14 @@ def merge_memories(user_id, expected_memories, now, *, db_path=storage.DATABASE_
         content = current_memory_content(kept["content"], kept["kind"])
         kind = memory_match_key(kept["content"], kept["kind"])[0]
         if content != kept["content"] or kind != kept["kind"]:
+            storage._review_memory_relationships(db, user_id, kept["id"])
             _archive_merged_memory(db, user_id, kept["id"], kept, links[kept["id"]],
                                    current_sources, moment, "current_state")
         for removed in records:
             if removed["id"] == kept["id"]:
                 continue
+            # Do not invent a new relation by silently retargeting an old edge.
+            storage._delete_memory_relationships(db, user_id, removed["id"])
             _archive_merged_memory(db, user_id, kept["id"], removed, links[removed["id"]],
                                    current_sources, moment, "merge")
             db.execute("UPDATE memory_revisions SET memory_id=? WHERE user_id=? AND memory_id=?",
@@ -444,6 +471,7 @@ def purge_expired(now, *, db_path=storage.DATABASE_PATH):
             else:
                 _refresh_primary_source(db, row["user_id"], row["memory_id"])
         _prune_merges(db, moment)
+        storage._prune_memory_relationships(db, moment)
     return {"expired_messages": expired, "deleted_memories": removed}
 
 
@@ -473,6 +501,7 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
             else:
                 _refresh_primary_source(db, user_id, row["memory_id"])
         _prune_merges(db)
+        storage._prune_memory_relationships(db)
     return {"deleted_messages": deleted, "deleted_memories": removed}
 
     
@@ -625,6 +654,7 @@ def revise_memory(user_id, memory_id, expected_content, expected_source,
         )
         # Previous versions are audit history only; do not expose them as
         # competing current facts through the active coordinator.
+        storage._review_memory_relationships(db, user_id, memory_id)
         db.execute("DELETE FROM memory_sources WHERE user_id=? AND memory_id=?",
                    (user_id, memory_id))
         db.execute(

@@ -1,12 +1,14 @@
 
 """Relationships between memory records and people.
 
-This module validates relationships. It does not write to a database,
-infer psychological causes, or grant access to another user's data.
+Pure validators are preserved. Persistent edges require owned live endpoint
+snapshots, explicit stored consent and an independently registered source.
+No psychological causes or relations are inferred by this module.
 """
 
 from dataclasses import asdict, dataclass
 from typing import Optional
+from memory import storage, lifecycle
 
 RELATION_TYPES = frozenset({
     "same_topic",
@@ -168,3 +170,129 @@ def filter_user_relationships(user_id, relationships):
             result.append(relationship)
 
     return result
+
+
+def save_relationship(relationship, source_snapshot, target_snapshot, now, *,
+                      explicitly_confirmed=False, db_path=storage.DATABASE_PATH):
+    """Save one source-backed edge, atomically rechecking both endpoint versions.
+
+    A confirmed edge requires an explicit confirmation from the upstream
+    trusted caller; a model guess must remain a hypothesis. Replaying an old
+    witness cannot reactivate an edge invalidated by a correction.
+    """
+    if not isinstance(relationship, MemoryRelationship):
+        raise ValueError("Expected MemoryRelationship")
+    if type(explicitly_confirmed) is not bool:
+        raise ValueError("Invalid confirmation flag")
+    if relationship.evidence == "confirmed" and not explicitly_confirmed:
+        raise PermissionError("Explicit relationship confirmation required")
+    if len(relationship.description) > 500:
+        raise ValueError("Relationship description is too long")
+    user = relationship.user_id
+    prefix = f"telegram:private:{user}:"
+    if not relationship.source.startswith(prefix) or not relationship.source[len(prefix):]:
+        raise PermissionError("Invalid relationship source")
+    moment = lifecycle._iso(now)
+    with storage._connection(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        lifecycle._merge_consent(db, user)
+        left = lifecycle._snapshot_memory(db, user, source_snapshot)
+        right = lifecycle._snapshot_memory(db, user, target_snapshot)
+        if (left is None or right is None or left["id"] != relationship.source_memory_id
+                or right["id"] != relationship.target_memory_id):
+            raise ValueError("Stale or mismatched relationship endpoints")
+        if relationship.evidence == "confirmed" and "hypothesis" in (left["kind"], right["kind"]):
+            raise PermissionError("Hypothetical endpoints cannot form a confirmed claim")
+        for endpoint in (left, right):
+            links = lifecycle._memory_links(db, user, endpoint["id"], moment)
+            if not any(link["message_id"] == endpoint["source"]
+                       and link["created_at"] <= moment for link in links):
+                raise PermissionError("Relationship endpoint has no live current source")
+        witness = db.execute("""SELECT 1 FROM private_messages
+            WHERE user_id=? AND message_id=? AND created_at<=? AND expires_at>?""",
+            (user, relationship.source, moment, moment)).fetchone()
+        if not witness:
+            raise PermissionError("Relationship source is missing or expired")
+        versions = (storage._memory_relationship_version(left["content"], left["kind"]),
+                    storage._memory_relationship_version(right["content"], right["kind"]))
+        db.execute("""INSERT OR IGNORE INTO memory_relationships
+            (user_id,source_memory_id,target_memory_id,relation_type,evidence,message_id,
+             description,source_version,target_version,status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,'active',?)""",
+            (user,left["id"],right["id"],relationship.relation_type,relationship.evidence,
+             relationship.source,relationship.description,*versions,moment))
+        row = db.execute("""SELECT * FROM memory_relationships WHERE user_id=?
+            AND source_memory_id=? AND target_memory_id=? AND relation_type=?
+            AND evidence=? AND message_id=?""", (user,left["id"],right["id"],
+            relationship.relation_type,relationship.evidence,relationship.source)).fetchone()
+        if (row["status"] != "active" or row["source_version"] != versions[0]
+                or row["target_version"] != versions[1]
+                or row["description"] != relationship.description):
+            raise ValueError("Relationship witness already used for another version")
+        return row["id"]
+
+
+def list_live_relationships(user_id, memory_ids, allowed_sources, now, *,
+                            limit=100, db_path=storage.DATABASE_PATH):
+    """Read edges only between already selected, owned and source-allowed facts.
+
+    Consent, witness lifetime, both current endpoints and their registered
+    primary sources are rechecked in one database snapshot. Read does not
+    initialize/migrate old schemas or reactivate reviewed edges.
+    """
+    _positive_id(user_id, "user_id")
+    if not isinstance(memory_ids, (list, tuple, set, frozenset)) or len(memory_ids) > 50:
+        raise ValueError("At most fifty selected memory IDs required")
+    ids = sorted({_positive_id(value, "memory_id") for value in memory_ids})
+    if not isinstance(allowed_sources, (list, tuple, set, frozenset)):
+        raise ValueError("Verified source set required")
+    sources = {_text(value, "source") for value in allowed_sources}
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Invalid relationship limit")
+    moment = lifecycle._iso(now)
+    if not ids or not sources:
+        return []
+    with storage._connection(db_path) as db:
+        # A stable read transaction also covers the persistent consent check.
+        db.execute("BEGIN")
+        if not storage._relationship_table_exists(db):
+            return []
+        consent = db.execute("SELECT enabled FROM memory_consents WHERE user_id=?", (user_id,)).fetchone()
+        if not consent or consent["enabled"] != 1:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute("""SELECT r.*, a.content AS left_content,a.kind AS left_kind,
+            a.source AS left_source,b.content AS right_content,b.kind AS right_kind,
+            b.source AS right_source FROM memory_relationships r
+            JOIN memories a ON a.user_id=r.user_id AND a.id=r.source_memory_id
+            JOIN memories b ON b.user_id=r.user_id AND b.id=r.target_memory_id
+            JOIN private_messages witness ON witness.user_id=r.user_id
+                AND witness.message_id=r.message_id
+            WHERE r.user_id=? AND r.status='active' AND r.created_at<=?
+                AND witness.created_at<=? AND witness.expires_at>?
+                AND r.source_memory_id IN (""" + placeholders + ")"
+                " AND r.target_memory_id IN (" + placeholders + ")" + """
+                AND EXISTS (SELECT 1 FROM memory_sources ms JOIN private_messages pm
+                    ON pm.user_id=ms.user_id AND pm.message_id=ms.message_id
+                    WHERE ms.user_id=r.user_id AND ms.memory_id=a.id AND ms.message_id=a.source
+                    AND pm.created_at<=? AND pm.expires_at>?)
+                AND EXISTS (SELECT 1 FROM memory_sources ms JOIN private_messages pm
+                    ON pm.user_id=ms.user_id AND pm.message_id=ms.message_id
+                    WHERE ms.user_id=r.user_id AND ms.memory_id=b.id AND ms.message_id=b.source
+                    AND pm.created_at<=? AND pm.expires_at>?)
+            ORDER BY r.id""", (user_id,moment,moment,moment,*ids,*ids,moment,moment,moment,moment))
+        result = []
+        for row in rows:
+            if any(row[key] not in sources or not row[key].startswith(f"telegram:private:{user_id}:")
+                   for key in ("message_id", "left_source", "right_source")):
+                continue
+            if (row["source_version"] != storage._memory_relationship_version(row["left_content"], row["left_kind"])
+                    or row["target_version"] != storage._memory_relationship_version(row["right_content"], row["right_kind"])):
+                continue
+            result.append({"id":row["id"],"user_id":row["user_id"],
+                "source_memory_id":row["source_memory_id"],"target_memory_id":row["target_memory_id"],
+                "relation_type":row["relation_type"],"evidence":row["evidence"],
+                "source":row["message_id"],"description":row["description"],"created_at":row["created_at"]})
+            if len(result) == limit:
+                break
+        return result
