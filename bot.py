@@ -304,7 +304,8 @@ def format_diagnostic(record):
             ("timestamp", "Время (UTC)"), ("user_id", "Аккаунт (Telegram ID)"),
             ("message_id", "Номер сообщения"), ("read_status", "Поиск памяти"),
             ("stored_memories", "Активных записей"),
-            ("matched_memories", "Подобрано записей"), ("read_error", "Ошибка поиска"),
+            ("matched_memories", "Подобрано записей"),
+            ("matched_relationships", "Подобрано связей"), ("read_error", "Ошибка поиска"),
             ("answer_provider", "Кто ответил"), ("extraction_provider", "Кто извлекал факты"),
             ("extraction_fallback", "Причина перехода к резерву"),
             ("write_stage", "Этап сохранения"), ("offered_candidates", "Предложено фактов"),
@@ -895,6 +896,13 @@ def request_gemini(
             "из переданной истории, "
             "чтобы понимать контекст, "
             "уточнения и продолжение темы. "
+            "Справочная личная память — отдельный источник сведений о текущем "
+            "пользователе и сохраняет значение после начала нового разговора. "
+            "Если пользователь спрашивает, что ты помнишь о нём или его делах, "
+            "используй найденные личные сведения; не заменяй их общими знаниями "
+            "по теме и не отрицай их наличие из-за пустой текущей истории. "
+            "Сохранённые связи учитывай только в указанном статусе: "
+            "гипотезу нельзя выдавать за подтверждённый факт. "
             "Переданная история относится "
             "только к текущему пользователю. "
             "Различай прежнее и текущее состояние: если пользователь явно "
@@ -1869,7 +1877,9 @@ def read_explicit_memory_prompt(user_id, query, diagnostics=None):
         include_communication_preferences=True,
     )
     if diagnostics is not None:
-        diagnostics.update(matched_memories=len(context["memories"]), read_status="выполнено")
+        diagnostics.update(matched_memories=len(context["memories"]),
+                           matched_relationships=len(context.get("relationships", [])),
+                           read_status="выполнено")
     return build_memory_context(context)
 
 async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

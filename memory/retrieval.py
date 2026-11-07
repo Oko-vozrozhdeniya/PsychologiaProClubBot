@@ -30,7 +30,7 @@ STOP_WORDS = frozenset({
     "чем", "чему", "кого", "кому", "кем", "кто", "где", "когда", "куда",
     "почему", "зачем", "какого", "какому", "какую", "каком", "какими",
     "помнишь", "помните", "вспомни", "вспомните", "расскажи", "расскажите",
-    "пожалуйста",
+    "пожалуйста", "моем", "моей", "моими", "связаны", "связано",
 })
 
 # These phrases describe the same preference relation. Topic words must still
@@ -114,8 +114,8 @@ def _parse_timestamp(value):
         return None
 
 
-def _score_memory(memory, query_tokens):
-    """Require every topic term, preferring exact words over word-form matches."""
+def _score_memory(memory, query_tokens, *, recall=False):
+    """Score lexical evidence, preferring exact words over word-form matches."""
     content = memory.get("content", "")
     memory_tokens = _tokens(content)
 
@@ -125,17 +125,28 @@ def _score_memory(memory, query_tokens):
             word_forms.setdefault(word[:4], []).append(word)
 
     match_quality = []
+    topic_matches = 0
+    # An activity/preference verb alone is not evidence for its object.
+    def topic_word(word):
+        return word != PREFERENCE_TOKEN and not word.endswith(("ть", "ться"))
+
     for word in query_tokens:
         if word in memory_tokens:
             match_quality.append(2)
+            topic_matches += topic_word(word)
         elif re.fullmatch(r"[а-я]+", word) and any(
             _same_russian_word_form(word, candidate)
             for candidate in word_forms.get(word[:4], ())
         ):
             match_quality.append(1)
-        else:
+            topic_matches += topic_word(word)
+        elif (not recall or not re.fullmatch(r"[а-я]+", word)
+              or re.search(r"(?:ый|ий|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ым|им|ых|их|ую|юю|ыми|ими)$", word)):
+            # IDs, numbers and Latin names remain exact even in recall mode.
             return 0
 
+    if not match_quality or (recall and not topic_matches):
+        return 0
     score = sum(match_quality) * 10 + 10
 
     kind = memory.get("kind")
@@ -151,8 +162,9 @@ def _score_memory(memory, query_tokens):
 def rank_memories(query, memories, limit=DEFAULT_LIMIT):
     """Rank supplied memory records without modifying them.
 
-    Every meaningful query term must have an exact, normalized preference,
-    or bounded Russian word-form match. Unrelated records are not a fallback.
+    Explicit recall requests rank topic overlap across separate facts; other
+    queries require every meaningful term. Identifiers stay exact, and a
+    preference verb alone cannot match a recall request. No unrelated fallback.
     This function does not perform user authorization; use
     retrieve_memories() for user-scoped database retrieval.
     """
@@ -165,6 +177,11 @@ def rank_memories(query, memories, limit=DEFAULT_LIMIT):
         raise ValueError("memories must be a list or tuple")
 
     query_tokens = _tokens(query)
+    # A recall request can ask about several independent memories at once.
+    # Rank their topic overlap instead of requiring the entire question in
+    # each individual fact. Other searches retain conjunctive matching.
+    recall = bool(re.search(r"\b(?:помнишь|помните|вспомни|вспомните)\b",
+                            query.casefold().replace("ё", "е")))
 
     if not query_tokens:
         return []
@@ -175,7 +192,7 @@ def rank_memories(query, memories, limit=DEFAULT_LIMIT):
         if not isinstance(memory, dict):
             raise ValueError("each memory must be a dictionary")
 
-        score = _score_memory(memory, query_tokens)
+        score = _score_memory(memory, query_tokens, recall=recall)
 
         if score <= 0:
             continue

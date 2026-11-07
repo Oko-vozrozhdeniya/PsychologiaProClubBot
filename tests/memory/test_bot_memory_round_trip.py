@@ -79,7 +79,8 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
 
         def fake_urlopen(req, timeout):
             self.calls += 1
-            self.last_extraction_prompt = json.loads(req.data.decode("utf-8"))[
+            self.last_payload = json.loads(req.data.decode("utf-8"))
+            self.last_extraction_prompt = self.last_payload[
                 "contents"
             ][0]["parts"][0]["text"]
             content = getattr(self, "model_result", [
@@ -392,6 +393,47 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
     def stored_relationships(self):
         with storage._connection(self.db) as db:
             return [dict(row) for row in db.execute("SELECT * FROM memory_relationships ORDER BY id")]
+
+    def test_live_compound_recall_reaches_both_provider_payloads_without_history(self):
+        from memory.ai_providers import request_groq
+        from memory.gemini_prompt_adapter import append_private_memory
+        self.model_result = self.relationship_response()
+        self.save(101, 4100, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        query = "Что ты помнишь о моём изучении биологии и подготовке к экзамену? Как они связаны?"
+        diagnostic = {}
+        prompt = self.read(101, query, diagnostic)
+        self.assertEqual(diagnostic["matched_memories"], 2)
+        self.assertEqual(diagnostic["matched_relationships"], 1)
+        self.assertIn("гипотеза, не установленный факт", prompt)
+        self.ns.update(logger=logging.getLogger(__name__), append_private_memory=append_private_memory)
+        gemini = load_function("request_gemini", self.ns)
+        gemini(query, history=[], personal_memory_context=prompt)
+        gemini_question = self.last_extraction_prompt
+        self.assertIn("не заменяй их общими знаниями",
+                      self.last_payload["system_instruction"]["parts"][0]["text"])
+        # The fake transport captures the actual Gemini request payload.
+        self.assertIn("Пользователь изучает биологию", gemini_question)
+        self.assertIn("Пользователь готовится к экзамену", gemini_question)
+        self.assertIn("СВЯЗИ МЕЖДУ ЭТИМИ СВЕДЕНИЯМИ", gemini_question)
+        self.assertTrue(gemini_question.endswith(query))
+        ok = {"choices": [{"message": {"content": "OK"}}]}
+        with patch.dict(os.environ, {"GROQ_API_KEY": "fake", "GROQ_MODEL": "openai/gpt-oss-20b"}), patch(
+                "urllib.request.urlopen", return_value=io.BytesIO(json.dumps(ok).encode())) as fetch:
+            request_groq(query, history=[], personal_memory_context=prompt)
+        messages = json.loads(fetch.call_args.args[0].data)["messages"]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[-1]["content"], gemini_question)
+        self.assertIn("не заменяй их общими знаниями", messages[0]["content"])
+
+    def test_compound_recall_does_not_bypass_source_deletion(self):
+        self.model_result = self.relationship_response()
+        self.save(101, 4101, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+        lifecycle.delete_message(101, "telegram:private:101:4101", db_path=self.db)
+        diagnostic = {}
+        prompt = self.read(101, "Что ты помнишь о биологии и экзамене?", diagnostic)
+        self.assertEqual(diagnostic["matched_memories"], 0)
+        self.assertEqual(diagnostic["matched_relationships"], 0)
+        self.assertNotIn("биологи", prompt)
 
     def test_each_provider_extracts_and_recalls_links_in_the_existing_request(self):
         for provider in ("Gemini", "Groq"):
