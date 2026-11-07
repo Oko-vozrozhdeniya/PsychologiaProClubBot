@@ -524,7 +524,11 @@ class ActualMemoryRoundTripTests(unittest.TestCase):
                 dict(source_content="Факт которого нет"))):
             with self.subTest(bad=bad):
                 self.model_result = self.relationship_response(**bad)
-                self.save(101, 4050 + index, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+                if isinstance(bad.get("confidence"), float) and bad["confidence"] != bad["confidence"]:
+                    with self.assertRaises(ValueError):
+                        self.save(101, 4050 + index, "Я изучаю биологию и готовлюсь к экзамену по биологии")
+                else:
+                    self.save(101, 4050 + index, "Я изучаю биологию и готовлюсь к экзамену по биологии")
                 self.assertEqual(self.stored_relationships(), [])
         self.assertEqual(len(storage.list_memories(101, db_path=self.db)), 2)
 
