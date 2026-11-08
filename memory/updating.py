@@ -335,7 +335,7 @@ def blocked_conclusions(db, user_id, now, allowed_sources=None):
 
 
 def save_dependency(user_id, premise, conclusion, source, now, *, db_path):
-    """Attach an explicitly verified dependency; no promotion to fact.
+    """Attach a source-backed dependency without changing either endpoint kind.
 
     Caller must verify the participant explicitly supplied this relationship.
     Snapshots, consent, source lifetime and acyclicity are rechecked atomically.
@@ -353,8 +353,8 @@ def save_dependency(user_id, premise, conclusion, source, now, *, db_path):
         right=lifecycle._snapshot_memory(db,user_id,conclusion)
         if left is None or right is None or left['id']==right['id']:
             raise ValueError('Stale or invalid dependency endpoints')
-        if right['kind']!='hypothesis':
-            raise PermissionError('A derived conclusion must remain a hypothesis')
+        # A dependency is a tentative relation, not the epistemic kind of
+        # either endpoint. A user's stated need remains a preference/fact.
         blocked=blocked_conclusions(db,user_id,moment)
         if left['id'] in blocked or right['id'] in blocked:
             raise ValueError('Dependency requires reviewed endpoints')

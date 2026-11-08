@@ -335,9 +335,16 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
     if relationship_diagnostics is not None:
         if not isinstance(relationship_diagnostics, dict):
             raise ValueError("Diagnostics must be a dictionary")
+        relationship_diagnostics["offered_relationships"] = len(proposed)
+        relationship_diagnostics["validated_relationships"] = 0
+        relationship_diagnostics["resolved_relationships"] = 0
+        relationship_diagnostics["rejected_relationships"] = 0
+        relationship_diagnostics["saved_dependencies"] = 0
         relationship_diagnostics["saved_relationships"] = 0
         relationship_diagnostics["saved_communication_preferences"] = 0
     links = extract_relationship_candidates(proposed, message_text)
+    if relationship_diagnostics is not None:
+        relationship_diagnostics["validated_relationships"] = len(links)
     length = communication_length(message_text, persistent=True)
     kwargs = {"db_path": db_path} if db_path is not None else {}
     if not links and length is None:
@@ -410,6 +417,8 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
         left, right = (resolve_endpoint(link, side) for side in ("source", "target"))
         if left is not None and right is not None and left["id"] != right["id"]:
             pairs.append((link, left, right))
+    if relationship_diagnostics is not None:
+        relationship_diagnostics["resolved_relationships"] = len(pairs)
     if not pairs:
         return saved
     # Relationship-only messages also retain their original date and consent.
@@ -423,11 +432,13 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
         try:
             if link["relation_type"] == "depends_on":
                 # A model-suggested dependency stays tentative. It can only
-                # restrict a hypothesis, never alter a participant fact.
+                # trigger review, never alter a participant claim or its kind.
                 _write_policy(user_id, policy, now, kwargs)
                 from memory.updating import save_dependency
                 save_dependency(user_id, left, right, source, moment,
                                 db_path=db_path or storage.DATABASE_PATH)
+                if relationship_diagnostics is not None:
+                    relationship_diagnostics["saved_dependencies"] += 1
             else:
                 relationship = relationships.MemoryRelationship(
                     user_id, left["id"], right["id"], link["relation_type"], "hypothesis",
@@ -436,6 +447,8 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                                       permissions, now, **kwargs)
         except (ValueError, PermissionError):
             # A concurrent correction/deletion/revocation fails closed.
+            if relationship_diagnostics is not None:
+                relationship_diagnostics["rejected_relationships"] += 1
             continue
         count += 1
     if relationship_diagnostics is not None:

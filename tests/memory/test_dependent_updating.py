@@ -45,11 +45,13 @@ class DependentUpdating(unittest.TestCase):
         self.save();self.revise(self.a,'Новая цель')
         self.assertNotIn(self.b,self.blocked())
 
-    def test_cycle_and_fact_promotion_are_rejected(self):
+    def test_cycle_rejected_without_changing_endpoint_kinds(self):
         b=self.conclusion('b2');c=self.conclusion('c2')
         self.dependency(b,c,'bc')
         with self.assertRaises(ValueError):self.dependency(c,b,'cb')
-        with self.assertRaises(PermissionError):self.dependency(b,self.a,'ba')
+        self.dependency(b,self.a,'ba')
+        self.assertEqual(self.snapshot(b)['kind'],'hypothesis')
+        self.assertEqual(self.snapshot(self.a)['kind'],'fact')
 
     def test_missing_confirmation_and_cross_user_rejected(self):
         b=self.conclusion()
@@ -210,13 +212,59 @@ class DependentUpdating(unittest.TestCase):
             self.assertEqual(saved,0)
             self.assertEqual(self.snapshot(self.a)['content'],row['content'])
 
+    def test_observed_geography_payload_preserves_preference_and_dependency(self):
+        premise='Пользователь готовится к экзамену по географии.'
+        need='Пользователю нужен план повторения материала по географии на каждый вечер.'
+        message='Я готовлюсь к экзамену по географии. Из-за этой подготовки мне нужен план повторения материала на каждый вечер.'
+        payload={'memories':[dict(content=premise,kind='fact',confidence=0.99),
+                             dict(content=need,kind='preference',confidence=0.99)],
+                 'relationships':[dict(source_candidate_index=0,target_candidate_index=1,
+                     relation_type='depends_on',confidence=0.99,evidence_quote=message)]}
+        diag={}
+        self.assertEqual(coordinator.save_dialog_candidates(101,'telegram:private:101:geography',
+            message,payload,[],policy(),NOW.isoformat(),db_path=self.db,relationship_diagnostics=diag),2)
+        self.assertEqual([diag[k] for k in ('offered_relationships','validated_relationships',
+            'resolved_relationships','saved_dependencies','saved_relationships')],[1,1,1,1,1])
+        goal,target=[next(r for r in lifecycle.list_live_memories(101,NOW,db_path=self.db)
+            if r['content']==text) for text in (premise,need)]
+        self.assertEqual(target['kind'],'preference')
+        self.revise(goal['id'],'Экзамен отменён')
+        self.assertIn(target['id'],self.blocked())
+        self.assertEqual(self.snapshot(target['id'])['kind'],'preference')
+
+    def test_diagnostics_distinguishes_no_proposal_from_rejection(self):
+        diag={}
+        coordinator.save_dialog_candidates(101,'telegram:private:101:no-links',
+            'Я интересуюсь географией.',{'memories':[],'relationships':[]},[],policy(),
+            NOW.isoformat(),db_path=self.db,relationship_diagnostics=diag)
+        self.assertEqual([diag[k] for k in ('offered_relationships','validated_relationships',
+            'resolved_relationships','rejected_relationships','saved_dependencies')],[0,0,0,0,0])
+
+    def test_diagnostics_records_unresolvable_reference(self):
+        diag=self.save_natural('Для подготовки мне нужен график.',identity=self.b)
+        self.assertEqual([diag[k] for k in ('offered_relationships','validated_relationships',
+            'resolved_relationships','saved_dependencies')],[1,1,0,0])
+
+    def test_existing_goal_and_preference_can_be_linked_without_duplicate_facts(self):
+        need=self.fact('Мне нужен вечерний план повторения','need',kind='preference')
+        message='Этот план нужен из-за подготовки к экзамену.'
+        payload={'memories':[],'relationships':[dict(source_memory_id=self.a,
+            target_memory_id=need,relation_type='depends_on',confidence=0.99,evidence_quote=message)]}
+        diag={}
+        self.assertEqual(coordinator.save_dialog_candidates(101,'telegram:private:101:link-existing',
+            message,payload,[self.snapshot(self.a),self.snapshot(need)],policy(),NOW.isoformat(),
+            db_path=self.db,relationship_diagnostics=diag),0)
+        self.assertEqual(diag['saved_dependencies'],1)
+        self.revise(self.a,'Цель отменена')
+        self.assertIn(need,self.blocked())
+
 
 del PersistentRelationships
 
 
 class NaturalProviderPathTests(unittest.TestCase):
     """Real bot functions, supplied model outputs; no live AI understanding claim."""
-    def provider_path(self, provider):
+    def provider_path(self, provider, kind='hypothesis'):
         import test_bot_memory_round_trip as harness
         from datetime import datetime, timezone
         b=harness.ActualMemoryRoundTripTests(methodName='runTest')
@@ -228,7 +276,7 @@ class NaturalProviderPathTests(unittest.TestCase):
         self.assertEqual(b.save(101,9101,'Готовлюсь сдавать биологию.',provider),1)
         row=lifecycle.list_live_memories(101,datetime.now(timezone.utc),db_path=b.db)[0]
         message='Раз скоро проверят знания, придётся распределить повторение по дням.'
-        b.model_result={'memories':[dict(content=conclusion,kind='hypothesis',confidence=0.99)],
+        b.model_result={'memories':[dict(content=conclusion,kind=kind,confidence=0.99)],
             'relationships':[dict(source_memory_id=row['id'],target_candidate_index=0,
                 relation_type='depends_on',confidence=0.99,evidence_quote=message)]}
         diag={}
@@ -246,3 +294,9 @@ class NaturalProviderPathTests(unittest.TestCase):
 
     def test_groq_natural_dependency_uses_same_contract(self):
         self.provider_path('Groq')
+
+    def test_gemini_preference_can_depend_on_goal(self):
+        self.provider_path('Gemini','preference')
+
+    def test_groq_preference_can_depend_on_goal(self):
+        self.provider_path('Groq','preference')
