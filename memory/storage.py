@@ -158,6 +158,8 @@ def _memory_relationship_version(content, kind):
 
 
 def _review_memory_relationships(connection, user_id, memory_id):
+    from memory.updating import review_dependents
+    review_dependents(connection, user_id, memory_id)
     if _relationship_table_exists(connection):
         connection.execute("""UPDATE memory_relationships SET status='review_required'
             WHERE user_id=? AND (source_memory_id=? OR target_memory_id=?)""",
@@ -165,6 +167,8 @@ def _review_memory_relationships(connection, user_id, memory_id):
 
 
 def _delete_memory_relationships(connection, user_id, memory_id):
+    from memory.updating import review_dependents
+    review_dependents(connection, user_id, memory_id)
     if _relationship_table_exists(connection):
         connection.execute("""DELETE FROM memory_relationships
             WHERE user_id=? AND (source_memory_id=? OR target_memory_id=?)""",
@@ -297,6 +301,8 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
             DELETE FROM memories
             WHERE user_id = ? AND id = ?
         """, (user_id, memory_id))
+        from memory.updating import prune_dependencies
+        prune_dependencies(connection)
         return cursor.rowcount == 1
 
 

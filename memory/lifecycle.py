@@ -32,6 +32,8 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
     """Initialize alongside the existing memories table, without altering it."""
     storage.initialize_database(db_path)
     with storage._connection(db_path) as db:
+        from memory.updating import initialize_dependencies
+        initialize_dependencies(db)
         db.execute("""CREATE TABLE IF NOT EXISTS private_messages (
             user_id INTEGER NOT NULL CHECK(user_id > 0),
             message_id TEXT NOT NULL,
@@ -401,7 +403,9 @@ def list_live_memories(user_id, now, *, db_path=storage.DATABASE_PATH):
                 WHERE ms.user_id=m.user_id AND ms.memory_id=m.id
                   AND pm.expires_at>?
             ) ORDER BY m.id DESC""", (user_id, moment)).fetchall()
-        return [dict(row) for row in rows]
+        from memory.updating import blocked_conclusions
+        blocked = blocked_conclusions(db, user_id, moment)
+        return [dict(row) for row in rows if row["id"] not in blocked]
 
 
 def add_memory(user_id, content, kind, source, now, *, db_path=storage.DATABASE_PATH):
@@ -475,12 +479,15 @@ def purge_expired(now, *, db_path=storage.DATABASE_PATH):
             if not remaining:
                 db.execute("DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",
                            (row["user_id"], row["memory_id"]))
+                storage._review_memory_relationships(db, row["user_id"], row["memory_id"])
                 removed += db.execute(
                     "DELETE FROM memories WHERE user_id=? AND id=?",
                     (row["user_id"], row["memory_id"])).rowcount
             else:
                 _refresh_primary_source(db, row["user_id"], row["memory_id"])
         _prune_merges(db, moment)
+        from memory.updating import prune_dependencies
+        prune_dependencies(db, moment)
         storage._prune_memory_relationships(db, moment)
         storage._prune_communication_preferences(db, moment)
     return {"expired_messages": expired, "deleted_memories": removed}
@@ -507,11 +514,14 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
                 (user_id, row["memory_id"])).fetchone():
                 db.execute("DELETE FROM memory_revisions WHERE user_id=? AND memory_id=?",
                            (user_id, row["memory_id"]))
+                storage._review_memory_relationships(db, user_id, row["memory_id"])
                 removed += db.execute("DELETE FROM memories WHERE user_id=? AND id=?",
                                       (user_id, row["memory_id"])).rowcount
             else:
                 _refresh_primary_source(db, user_id, row["memory_id"])
         _prune_merges(db)
+        from memory.updating import prune_dependencies
+        prune_dependencies(db)
         storage._prune_memory_relationships(db)
         storage._prune_communication_preferences(db)
     return {"deleted_messages": deleted, "deleted_memories": removed}

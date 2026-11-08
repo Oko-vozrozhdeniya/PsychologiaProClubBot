@@ -13,7 +13,7 @@ VALID_KINDS = frozenset({"fact", "preference", "hypothesis"})
 MAX_CONTENT_LENGTH = 2000
 MAX_SOURCE_LENGTH = 500
 MAX_CANDIDATES = 30
-AUTOMATIC_RELATION_TYPES = frozenset({"same_topic", "same_event", "related_event"})
+AUTOMATIC_RELATION_TYPES = frozenset({"same_topic", "same_event", "related_event", "depends_on"})
 
 
 def split_dialog_extraction(raw):
@@ -59,7 +59,15 @@ def extract_relationship_candidates(raw, message_text):
                 or left == right or quote not in source_text
                 or not has_statement_for_extraction(quote)):
             continue
-        key = (*sorted((left, right)), relation_type)
+        if relation_type == "depends_on":
+            # Only a participant's explicit quoted conclusion, never inferred causality.
+            if (not re.search(r"\bмой вывод\b", quote, re.IGNORECASE)
+                    or left.casefold() not in quote.casefold()
+                    or right.casefold() not in quote.casefold()):
+                continue
+            key = (left, right, relation_type)
+        else:
+            key = (*sorted((left, right)), relation_type)
         if key in seen:
             continue
         seen.add(key)

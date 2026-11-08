@@ -126,6 +126,10 @@ def read_context(user_id, query, policy, source_permissions, now, *,
         live = lifecycle.list_live_memories(user_id, moment, **kwargs)
         live_ids = {item["id"] for item in live}
         records = [item for item in records if item["id"] in live_ids]
+    from memory.updating import blocked_conclusions
+    with storage._connection(**({"db_path": db_path} if db_path is not None else {})) as db:
+        blocked = blocked_conclusions(db, user_id, moment.isoformat(), allowed_sources)
+    records = [item for item in records if item["id"] not in blocked]
     safe = rank_memories(query, records, limit=limit)
     # These modules do not persist their own provenance/expiry. Therefore
     # callers may pass only source-verified items; reject mixed inputs.
@@ -394,12 +398,20 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                    if row["source"].startswith(f"telegram:private:{user_id}:")]
     count = 0
     for link, left, right in pairs:
-        relationship = relationships.MemoryRelationship(
-            user_id, left["id"], right["id"], link["relation_type"], "hypothesis",
-            source, link["evidence_quote"])
         try:
-            remember_relationship(user_id, relationship, left, right, policy,
-                                  permissions, now, **kwargs)
+            if link["relation_type"] == "depends_on":
+                # A model-suggested dependency stays tentative. It can only
+                # restrict a hypothesis, never alter a participant fact.
+                _write_policy(user_id, policy, now, kwargs)
+                from memory.updating import save_dependency
+                save_dependency(user_id, left, right, source, moment,
+                                db_path=db_path or storage.DATABASE_PATH)
+            else:
+                relationship = relationships.MemoryRelationship(
+                    user_id, left["id"], right["id"], link["relation_type"], "hypothesis",
+                    source, link["evidence_quote"])
+                remember_relationship(user_id, relationship, left, right, policy,
+                                      permissions, now, **kwargs)
         except (ValueError, PermissionError):
             # A concurrent correction/deletion/revocation fails closed.
             continue
@@ -531,3 +543,22 @@ def _save_dialog_facts(user_id, source, message_text, raw_candidates,
         known[identity] = storage.get_memory(user_id, memory_id, **kwargs)
         saved += 1
     return saved
+
+
+def remember_dependency(user_id, premise_snapshot, conclusion_snapshot, source,
+                        policy, source_permissions, now, *, explicitly_confirmed=False,
+                        db_path=None):
+    """Record only a trusted explicit dependency, never a model-assigned flag."""
+    kwargs = {"db_path": db_path} if db_path is not None else {}
+    moment = _write_policy(user_id, policy, now, kwargs)
+    if explicitly_confirmed is not True:
+        raise PermissionError("Explicit dependency confirmation required")
+    allowed = _sources(source_permissions, moment)
+    for snapshot in (premise_snapshot, conclusion_snapshot):
+        if not isinstance(snapshot, dict) or snapshot.get("source") not in allowed:
+            raise PermissionError("Unverified dependency endpoint")
+    if source not in allowed:
+        raise PermissionError("Unverified dependency witness")
+    from memory.updating import save_dependency
+    return save_dependency(user_id, premise_snapshot, conclusion_snapshot,
+                           source, moment, db_path=db_path or storage.DATABASE_PATH)
