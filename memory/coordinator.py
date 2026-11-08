@@ -383,11 +383,33 @@ def save_dialog_candidates(user_id, source, message_text, raw_candidates,
                                shown[row["id"]]["content"], shown[row["id"]]["kind"]))
         if unchanged or accepted_here or reaffirmed_here:
             eligible.setdefault(row["content"], []).append(row)
+    # The model maps natural wording to scoped references. The server never
+    # resolves a guessed ID outside shown/actually accepted current snapshots.
+    eligible_by_id = {row["id"]: row for rows in eligible.values() for row in rows}
+
+    def resolve_endpoint(link, side):
+        if side + "_memory_id" in link:
+            identity = link[side + "_memory_id"]
+            row = eligible_by_id.get(identity)
+            # IDs are valid only when they were actually shown to the model.
+            return row if identity in shown else None
+        if side + "_candidate_index" in link:
+            index = link[side + "_candidate_index"]
+            if index >= len(facts):
+                return None
+            candidate = facts[index]
+            matches = [row for row in eligible.get(candidate["content"], [])
+                       if row["kind"] == candidate["kind"] and row["source"] == source
+                       and (row["content"], row["kind"]) in accepted]
+        else:
+            matches = eligible.get(link[side + "_content"], [])
+        return matches[0] if len(matches) == 1 else None
+
     pairs = []
     for link in links:
-        left, right = (eligible.get(link[name], []) for name in ("source_content", "target_content"))
-        if len(left) == len(right) == 1 and left[0]["id"] != right[0]["id"]:
-            pairs.append((link, left[0], right[0]))
+        left, right = (resolve_endpoint(link, side) for side in ("source", "target"))
+        if left is not None and right is not None and left["id"] != right["id"]:
+            pairs.append((link, left, right))
     if not pairs:
         return saved
     # Relationship-only messages also retain their original date and consent.
@@ -499,6 +521,12 @@ def _save_dialog_facts(user_id, source, message_text, raw_candidates,
                 r"\b(ошибка|ошибся|ошиблась|неверно|неправильно|исправь|"
                 r"исправляю|на самом деле|я не)\b"
             )
+            # Semantic extraction supplies a source quotation for natural
+            # revisions; old marker-based responses remain compatible.
+            quote = matching.get("revision_evidence_quote")
+            quote_supported = (isinstance(quote, str) and 0 < len(quote) <= 500
+                and " ".join(quote.split()) in " ".join(message_text[:6000].split())
+                and has_statement_for_extraction(quote))
             if not (
                 kind in ("correction", "change")
                 and isinstance(matching.get("replaces_content"), str)
@@ -511,7 +539,7 @@ def _save_dialog_facts(user_id, source, message_text, raw_candidates,
                     and memory_match_key(old["content"], old["kind"])[:2] == ("preference", "preference")))
                 and old["source"] in live_sources
                 and matching["confidence"] >= 0.95
-                and re.search(marker, message_text.casefold())
+                and (quote_supported or re.search(marker, message_text.casefold()))
             ):
                 continue
             if not lifecycle.has_memory_consent(user_id, **kwargs):

@@ -30,6 +30,25 @@ def split_dialog_extraction(raw):
     return facts, links
 
 
+def _relationship_endpoint(item, side):
+    """An internal reference is exact; the participant's wording need not be."""
+    names = (side + "_memory_id", side + "_candidate_index", side + "_content")
+    provided = [name for name in names if name in item]
+    if len(provided) != 1:
+        raise ValueError("One unambiguous endpoint reference required")
+    name = provided[0]
+    value = item[name]
+    if name.endswith("_memory_id"):
+        if type(value) is not int or value <= 0:
+            raise ValueError("Invalid memory reference")
+    elif name.endswith("_candidate_index"):
+        if type(value) is not int or not 0 <= value < 5:
+            raise ValueError("Invalid candidate reference")
+    else:
+        value = _clean_text(value, name, MAX_CONTENT_LENGTH)
+    return name, value
+
+
 def extract_relationship_candidates(raw, message_text):
     """Validate model proposals, never treating model confidence as confirmation.
 
@@ -47,8 +66,8 @@ def extract_relationship_candidates(raw, message_text):
         if not isinstance(item, dict):
             continue
         try:
-            left = _clean_text(item.get("source_content"), "source_content", MAX_CONTENT_LENGTH)
-            right = _clean_text(item.get("target_content"), "target_content", MAX_CONTENT_LENGTH)
+            left_key, left = _relationship_endpoint(item, "source")
+            right_key, right = _relationship_endpoint(item, "target")
             quote = _clean_text(item.get("evidence_quote"), "evidence_quote", 500)
         except ValueError:
             continue
@@ -56,23 +75,18 @@ def extract_relationship_candidates(raw, message_text):
         relation_type = item.get("relation_type")
         if (not isinstance(relation_type, str) or relation_type not in AUTOMATIC_RELATION_TYPES
                 or type(confidence) not in (int, float) or not 0.95 <= confidence <= 1
-                or left == right or quote not in source_text
+                or (left_key.replace("source_", "") == right_key.replace("target_", "") and left == right)
+                or quote not in source_text
                 or not has_statement_for_extraction(quote)):
             continue
-        if relation_type == "depends_on":
-            # Only a participant's explicit quoted conclusion, never inferred causality.
-            if (not re.search(r"\bмой вывод\b", quote, re.IGNORECASE)
-                    or left.casefold() not in quote.casefold()
-                    or right.casefold() not in quote.casefold()):
-                continue
-            key = (left, right, relation_type)
-        else:
-            key = (*sorted((left, right)), relation_type)
+        endpoints = ((left_key.replace("source_", ""), left),
+                     (right_key.replace("target_", ""), right))
+        key = (endpoints if relation_type == "depends_on" else tuple(sorted(endpoints)), relation_type)
         if key in seen:
             continue
         seen.add(key)
-        result.append(dict(source_content=left, target_content=right,
-                           relation_type=relation_type, evidence_quote=quote))
+        result.append({left_key: left, right_key: right,
+                       "relation_type": relation_type, "evidence_quote": quote})
     return result
 
 
