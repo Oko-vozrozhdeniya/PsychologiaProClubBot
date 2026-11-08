@@ -109,7 +109,7 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         "model": model, "messages": messages, "max_completion_tokens": 1200,
         "stream": False,
         **((search_settings("Groq")
-            if response_task == "search" else extraction_settings("Groq"))
+            if response_task in ("search","closure_review") else extraction_settings("Groq"))
            if system_instruction is not None else {}),
     }, ensure_ascii=False).encode("utf-8")
     stats = {
@@ -135,6 +135,9 @@ def request_groq(question, history=None, personal_memory_context=None, *,
             if response_task == "search":
                 from memory.ai_contract import parse_search_plan
                 parse_search_plan(choice, result_choice.get("finish_reason"))
+            elif response_task == "closure_review":
+                from memory.ai_contract import parse_closure_review
+                parse_closure_review(choice,result_choice.get("finish_reason"),user_messages=[])
             elif response_task == "extraction":
                 parse_extraction(choice, result_choice.get("finish_reason"))
             else:
@@ -218,9 +221,37 @@ def request_memory_search(question, history, active_context, mode, *, gemini_key
                        'active_context':active_context[:6000]},ensure_ascii=False)
     instruction=instructions_for('search')
     user_messages=[question]+[item['text'] for item in recent if item['role']=='user']
+    return _request_semantic_json(prompt,instruction,mode,
+        lambda text,finish=None: parse_search_plan(text,finish,user_messages=user_messages),
+        gemini_key=gemini_key,gemini_model=gemini_model)
+
+
+def request_closure_review(question,history,mode,*,gemini_key,gemini_model):
+    """Independent scope check, only for proposed farewells; no first verdict supplied."""
+    from memory.ai_contract import CLOSURE_REVIEW_INSTRUCTIONS, parse_closure_review
+    recent=[];size=0
+    for item in reversed((history or [])[-60:]):
+        if not isinstance(item,dict) or item.get('role') not in ('user','model'):
+            continue
+        value='\n'.join(p['text'] for p in item.get('parts',[]) if isinstance(p,dict)
+            and isinstance(p.get('text'),str))[:1800]
+        if size+len(value)>16000:
+            break
+        recent.insert(0,{'role':item['role'],'text':value});size+=len(value)
+    prompt=json.dumps({'question':question[:6000],'recent':recent},ensure_ascii=False)
+    user_messages=[question[:6000]]+[i['text'] for i in recent if i['role']=='user']
+    return _request_semantic_json(prompt,CLOSURE_REVIEW_INSTRUCTIONS,mode,
+        lambda text,finish=None: parse_closure_review(text,finish,user_messages=user_messages),
+        gemini_key=gemini_key,gemini_model=gemini_model,response_task="closure_review")
+
+
+def _request_semantic_json(prompt,instruction,mode,parser,*,gemini_key,gemini_model,response_task="search"):
+    """Shared native structured transport for bounded semantic tasks."""
+    if mode not in ('auto','gemini','groq'):
+        raise ValueError('Invalid AI mode')
     def groq():
-        text=request_groq(prompt,system_instruction=instruction,response_task='search')
-        return parse_search_plan(text,user_messages=user_messages),'Groq'
+        text=request_groq(prompt,system_instruction=instruction,response_task=response_task)
+        return parser(text),'Groq'
     if mode=='groq':
         return groq()
     try:
@@ -237,7 +268,7 @@ def request_memory_search(question, history, active_context, mode, *, gemini_key
             data=json.loads(response.read(131072).decode())
         candidate=data['candidates'][0]
         text=''.join(p.get('text','') for p in candidate['content']['parts'] if isinstance(p,dict))
-        return parse_search_plan(text,candidate.get('finishReason'),user_messages=user_messages),'Gemini'
+        return parser(text,candidate.get('finishReason')),'Gemini'
     except Exception:
         if mode!='auto':
             raise

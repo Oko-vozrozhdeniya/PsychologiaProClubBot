@@ -311,6 +311,11 @@ def format_diagnostic(record):
             ("history_search_status", "Поиск прошлого контекста"),
             ("history_statement_scope", "Тип обращения к памяти"),
             ("reply_mode", "Форма ответа"),
+            ("dialogue_rules", "Версия правил диалога"),
+            ("proposed_reply_mode", "Предварительная форма ответа"),
+            ("closure_review", "Проверка области завершения"),
+            ("closure_review_provider", "Кто проверил область завершения"),
+            ("closure_review_error", "Ошибка проверки области завершения"),
             ("history_scanned", "Проверено собственных фрагментов истории"),
             ("history_matched", "Подобрано прошлых фрагментов"),
             ("history_current_matches", "Подобрано актуальных записей по смыслу обращения"),
@@ -1777,6 +1782,31 @@ def read_historical_memory_prompt(user_id, question, history, active_context, mo
                 if isinstance(item,dict) and item.get('role')=='user'
                 for part in item.get('parts',[])
                 if isinstance(part,dict) and isinstance(part.get('text'),str)])
+        from memory.ai_contract import CLOSURE_REVIEW_INSTRUCTIONS, PRIVATE_INSTRUCTIONS, SEARCH_INSTRUCTIONS
+        import hashlib
+        rules=hashlib.sha256((SEARCH_INSTRUCTIONS+PRIVATE_INSTRUCTIONS+CLOSURE_REVIEW_INSTRUCTIONS).encode()).hexdigest()[:12]
+        proposed=plan['reply_mode']
+        if proposed == 'brief_close':
+            if not personal_lifecycle.has_memory_consent(user_id):
+                raise PermissionError('Consent withdrawn before closure review')
+            from memory.ai_providers import request_closure_review
+            try:
+                target,reviewer=request_closure_review(question,history,mode,
+                    gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL)
+                if target not in ('conversation','topic','pause','unclear'):
+                    raise ValueError('Invalid closure target')
+                if diagnostics is not None:
+                    diagnostics.update(closure_review=target,closure_review_provider=reviewer)
+            except Exception as error:
+                target='unclear'
+                if diagnostics is not None:
+                    diagnostics.update(closure_review='unclear',closure_review_error=type(error).__name__)
+            if target != 'conversation':
+                plan['reply_mode']='brief_clarify' if target=='unclear' else 'answer'
+                if plan['statement_scope']=='social':
+                    plan['statement_scope']='ambiguous'
+        if diagnostics is not None:
+            diagnostics.update(dialogue_rules=rules,proposed_reply_mode=proposed)
         if diagnostics is not None:
             diagnostics.update(history_planner_provider=provider, history_search_status="не требуется",
                                history_statement_scope=plan["statement_scope"],

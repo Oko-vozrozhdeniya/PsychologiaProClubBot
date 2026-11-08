@@ -261,6 +261,56 @@ class SearchContract(unittest.TestCase):
         self.assertLessEqual(len(payload['active_context']),6000)
 
 
+class ClosureReview(unittest.TestCase):
+    def test_review_contract_refuses_forged_or_assistant_only_evidence(self):
+        parse=ai_contract.parse_closure_review
+        for evidence in ([],['До свидания']):
+            self.assertEqual(parse(json.dumps({'target':'conversation','evidence':evidence}),
+                user_messages=['Спасибо за объяснение']),'unclear')
+        for target in ('conversation','topic','pause','unclear'):
+            self.assertEqual(parse(json.dumps({'target':target,'evidence':['Спасибо']}),
+                user_messages=['Спасибо']),target)
+        for text in ('{}','{"target":"conversation","target":"unclear","evidence":[]}',
+                     '{"target":"conversation","evidence":true}'):
+            with self.assertRaises(ai_contract.ExtractionFormatError):
+                parse(text,user_messages=['Спасибо'])
+        with self.assertRaises(ai_contract.ExtractionTruncatedError):
+            parse('{}','MAX_TOKENS',user_messages=[])
+
+    def test_native_providers_review_original_context_without_first_verdict(self):
+        text=json.dumps({'target':'unclear','evidence':[]})
+        history=[{'role':'user','parts':[{'text':'Обсудим другую тему'}]},
+                 {'role':'model','parts':[{'text':'Конечно'}]}]
+        systems=[]
+        for provider in ('Gemini','Groq'):
+            body=SearchContract().response(provider,text)
+            with patch.dict('os.environ',{'GROQ_API_KEY':'fake'}),patch('urllib.request.urlopen',
+                    return_value=io.BytesIO(json.dumps(body).encode())) as fetch:
+                result,actual=ai_providers.request_closure_review('Мне достаточно',history,provider.lower(),
+                    gemini_key='fake',gemini_model='test')
+            self.assertEqual((result,actual),('unclear',provider))
+            payload=json.loads(fetch.call_args.args[0].data)
+            if provider=='Gemini':
+                systems.append(payload['system_instruction']['parts'][0]['text'])
+                data=payload['contents'][0]['parts'][0]['text']
+            else:
+                systems.append(payload['messages'][0]['content'])
+                data=payload['messages'][1]['content']
+            data=json.loads(data)
+            self.assertEqual(set(data),{'question','recent'})
+            self.assertEqual(data['recent'][0]['text'],'Обсудим другую тему')
+        self.assertEqual(systems[0],systems[1])
+        self.assertEqual(systems[0],ai_contract.CLOSURE_REVIEW_INSTRUCTIONS)
+
+    def test_review_auto_fallback_validates_secondary_result(self):
+        text=json.dumps({'target':'topic','evidence':['Эту тему']} )
+        with patch('urllib.request.urlopen',side_effect=TimeoutError),patch.object(
+                ai_providers,'request_groq',return_value=text):
+            result,provider=ai_providers.request_closure_review('Эту тему отложим.',[], 'auto',
+                gemini_key='fake',gemini_model='test')
+        self.assertEqual((result,provider),('topic','Groq'))
+
+
 class BotHistoricalRecall(unittest.TestCase):
     def setUp(self):
         self.b=bot_fixtures.ActualMemoryRoundTripTests(methodName='runTest')
@@ -357,6 +407,9 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
             return self.generated_reply,'Groq' if mode=='groq' else 'Gemini'
         self.ns['request_personal_ai']=answer
         self.real=coordinator.read_historical_context
+        review_patch=patch.object(ai_providers,'request_closure_review',return_value=('conversation','Gemini'))
+        self.review=review_patch.start()
+        self.addCleanup(review_patch.stop)
 
     def local(self,*a,**kw):
         return self.real(*a,db_path=self.db,**kw)
@@ -370,6 +423,7 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls),1)
         _,short,prompt,_=self.calls[0]
         self.assertEqual(short,[])
+        self.review.assert_not_called()
         self.assertIn('велотренажёр 20 минут',prompt)
         self.assertIn('отказался от велопохода',prompt)
         self.assertIn('past_conversation',prompt)
@@ -536,6 +590,28 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
 
     async def test_groq_farewell_uses_the_same_closing_path(self):
         await self.social_farewell('groq')
+
+    async def test_grounded_but_ambiguous_quote_cannot_force_farewell(self):
+        for text in ('На сегодня мне достаточно, спасибо.', 'Благодарю, я устал от этого.'):
+            self.f.message.text=text
+            self.generated_reply='Хотите сменить тему или закончить разговор?'
+            closing=dict(plan(search=False,scope='social'),reply_mode='brief_close',closing_evidence=[text])
+            self.review.return_value=('unclear','Gemini')
+            with patch.object(ai_providers,'request_memory_search',return_value=(closing,'Gemini')):
+                await self.f.invoke()
+            self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_clarify'})
+            self.assertEqual(self.f.records[-1]['closure_review'],'unclear')
+            self.assertEqual(self.f.records[-1]['proposed_reply_mode'],'brief_close')
+            self.assertEqual(len(self.f.records[-1]['dialogue_rules']),12)
+
+    async def test_closure_review_failure_does_not_authorize_farewell(self):
+        self.f.message.text='На сегодня достаточно.'
+        self.review.side_effect=TimeoutError
+        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close',closing_evidence=[self.f.message.text])
+        with patch.object(ai_providers,'request_memory_search',return_value=(closing,'Gemini')):
+            await self.f.invoke()
+        self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_clarify'})
+        self.assertEqual(self.f.records[-1]['closure_review_error'],'TimeoutError')
 
     async def test_new_fact_before_farewell_is_still_saved(self):
         self.f.message.text='Теперь мне нравятся жёлтые кактусы. На этом закончим, пока.'
