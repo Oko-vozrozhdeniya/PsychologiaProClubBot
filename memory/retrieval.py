@@ -247,3 +247,38 @@ def retrieve_memories(
         memories=candidates,
         limit=limit,
     )
+
+
+def historical_score(content, queries):
+    """Rank semantic query rewrites locally; no fixed recall-keyword gate.
+
+    The model resolves intent/synonyms; this ranker resolves only scoped local
+    evidence. Exact numeric/Latin identifiers retain existing constraints.
+    """
+    score = 0
+    for index, query in enumerate(queries):
+        tokens = _tokens(query)
+        if not tokens:
+            continue
+        value = _score_memory({'content':content,'kind':'hypothesis'},tokens,recall=True)
+        if value:
+            score += value * (6-index)
+    return score
+
+
+def historical_chunks(text, *, width=1200, overlap=200):
+    """Bounded overlapping excerpts; do not silently label them full plans."""
+    if not isinstance(text,str):
+        return
+    for start in range(0,len(text),width-overlap):
+        end=min(start+width,len(text))
+        yield text[start:end], start>0 or end<len(text)
+        if end==len(text):
+            break
+
+
+def archive_source_digest(content, created_at):
+    import hashlib
+    import json
+    value=json.dumps([content,created_at],ensure_ascii=False,separators=(',',':'))
+    return hashlib.sha256(value.encode()).hexdigest()

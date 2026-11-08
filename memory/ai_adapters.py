@@ -12,3 +12,10 @@ def extraction_settings(provider):
     raise ValueError("No structured-output adapter for provider")
 
 
+
+
+def search_settings(provider):
+    from memory.ai_contract import SEARCH_MAX_TOKENS
+    settings = extraction_settings(provider)
+    settings['maxOutputTokens' if provider == 'Gemini' else 'max_completion_tokens'] = SEARCH_MAX_TOKENS
+    return settings

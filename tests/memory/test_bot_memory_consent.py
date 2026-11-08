@@ -152,6 +152,7 @@ class PrivateDialogConsentTests(unittest.IsolatedAsyncioTestCase):
             "personal_lifecycle": SimpleNamespace(
                 has_memory_consent=lambda uid: lifecycle.has_memory_consent(uid, db_path=self.db)),
             "read_explicit_memory_prompt": self.lookup,
+            "read_historical_memory_prompt": Mock(return_value=""),
             "request_personal_ai": self.request, "request_gemini": Mock(),
             "remember_dialog_facts": self.extract,
             "save_diagnostic_record": Mock(),

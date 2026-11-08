@@ -306,6 +306,14 @@ def format_diagnostic(record):
             ("stored_memories", "Активных записей"),
             ("matched_memories", "Подобрано записей"),
             ("matched_relationships", "Подобрано связей"), ("read_error", "Ошибка поиска"),
+            ("history_planner_provider", "Кто разобрал обращение к прошлому"),
+            ("history_planner_error", "Ошибка смыслового разбора поиска"),
+            ("history_search_status", "Поиск прошлого контекста"),
+            ("history_statement_scope", "Тип обращения к памяти"),
+            ("history_scanned", "Проверено собственных фрагментов истории"),
+            ("history_matched", "Подобрано прошлых фрагментов"),
+            ("history_current_matches", "Подобрано актуальных записей по смыслу обращения"),
+            ("history_search_error", "Ошибка поиска прошлого контекста"),
             ("answer_provider", "Кто ответил"), ("extraction_provider", "Кто извлекал факты"),
             ("extraction_fallback", "Причина перехода к резерву"),
             ("write_stage", "Этап сохранения"), ("offered_candidates", "Предложено фактов"),
@@ -1359,6 +1367,18 @@ async def private_message(
                 memory_check.update(read_status="ошибка", read_error=type(error).__name__)
                 memory_prompt = ""
             mode = context.application.bot_data.get("test_ai_mode", "auto")
+            try:
+                past_context = await asyncio.to_thread(
+                    read_historical_memory_prompt, user_id, question, history,
+                    memory_prompt, mode, memory_check)
+                if past_context:
+                    memory_prompt += "\n\n" + past_context
+            except Exception as error:
+                memory_check.update(history_search_status="ошибка",history_search_error=type(error).__name__)
+                memory_prompt += "\nПоиск прошлого контекста сейчас не выполнен. Не отрицай существование прежней переписки."
+            if not await asyncio.to_thread(personal_lifecycle.has_memory_consent, user_id):
+                await message.reply_text("Обработка приостановлена: согласие на личный диалог отозвано.")
+                return
             answer, provider = await asyncio.to_thread(
                 request_personal_ai,
                 question,
@@ -1380,16 +1400,20 @@ async def private_message(
 
             memory_check["answer_provider"] = provider
             try:
-                saved_facts = await asyncio.to_thread(
-                    remember_dialog_facts,
-                    user_id,
-                    message.message_id,
-                    question,
-                    provider,
-                    mode,
-                    memory_check,
-                    source_created_at=message_created_at,
-                )
+                if memory_check.get('history_statement_scope') in ('historical_reference','question','ambiguous'):
+                    saved_facts = 0
+                    memory_check.update(write_status="пропущено: обращение к прошлому без нового утверждения")
+                else:
+                    saved_facts = await asyncio.to_thread(
+                        remember_dialog_facts,
+                        user_id,
+                        message.message_id,
+                        question,
+                        provider,
+                        mode,
+                        memory_check,
+                        source_created_at=message_created_at,
+                    )
                 logger.info("Automatic memory saved %s facts", saved_facts)
             except Exception as error:
                 logger.exception("Automatic memory extraction failed")
@@ -1718,6 +1742,54 @@ def remember_dialog_facts(user_id, message_id, question, provider="Gemini", mode
     if diagnostics is not None:
         diagnostics.update(saved_facts=saved, write_status="выполнено")
     return saved
+
+
+def read_historical_memory_prompt(user_id, question, history, active_context, mode,
+                                  diagnostics=None):
+    """Semantic intent planning plus scoped local history retrieval, read only."""
+    from memory.ai_providers import request_memory_search
+    from memory.ai_contract import parse_search_plan
+    from memory.coordinator import read_historical_context
+    if user_id != OWNER_ID and user_id not in TEST_USER_IDS:
+        return ""
+    if not personal_lifecycle.has_memory_consent(user_id):
+        return ""
+    try:
+        plan, provider = request_memory_search(question, history, active_context, mode,
+            gemini_key=GEMINI_API_KEY, gemini_model=GEMINI_MODEL)
+        # Validate again at the application boundary, including test/custom adapters.
+        plan = parse_search_plan(json.dumps(plan, ensure_ascii=False))
+        if diagnostics is not None:
+            diagnostics.update(history_planner_provider=provider, history_search_status="не требуется",
+                               history_statement_scope=plan["statement_scope"])
+    except Exception as error:
+        if diagnostics is not None:
+            diagnostics.update(history_planner_error=type(error).__name__, history_search_status="резервный поиск")
+        # Direct lexical fallback is not a substitute for semantic intent planning.
+        # It still has no magic-word gate and never falls back to unrelated rows.
+        plan = {'search_history':True,'needs_clarification':False,'queries':[question[:160]],'statement_scope':'unspecified'}
+    if not personal_lifecycle.has_memory_consent(user_id):
+        raise PermissionError("Consent withdrawn during search planning")
+    if plan['needs_clarification']:
+        if diagnostics is not None:
+            diagnostics['history_search_status']="нужно уточнение темы"
+        return "Отсылка к прошлому неоднозначна: уточни, о каком плане или разговоре речь. Не угадывай тему."
+    if not plan['search_history']:
+        return ""
+    now = datetime.now(timezone.utc)
+    policy = AccessPolicy(user_id, True, True, True, (now+timedelta(minutes=2)).isoformat())
+    permissions = [SourcePermission(**item) for item in personal_lifecycle.list_live_sources(user_id, now)
+                   if item['source'].startswith(f'telegram:private:{user_id}:')]
+    result = read_historical_context(user_id, plan['queries'], policy, permissions, now.isoformat(),
+                                    archive_path=DIALOG_HISTORY_FILE)
+    if diagnostics is not None:
+        diagnostics.update(history_search_status="выполнено",history_scanned=result['scanned_history'],
+                           history_matched=result['matched_history'],
+                           history_current_matches=len(result['current_memories']))
+    current=build_memory_context({'memories':result['current_memories']})
+    past=result['context'] or ("Поиск в доступной личной истории не нашёл подходящих фрагментов. "
+                                "Не утверждай, что тему никогда не обсуждали; при необходимости уточни детали.")
+    return current + "\n\n" + past
 
 
 def read_explicit_memory_prompt(user_id, query, diagnostics=None):

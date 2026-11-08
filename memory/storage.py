@@ -275,6 +275,17 @@ def delete_memory(user_id, memory_id, db_path=DATABASE_PATH):
         tables = {row["name"] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()}
+        if {"private_archive_exclusions", "private_messages", "memory_sources"} <= tables:
+            # An explicitly forgotten fact must not be recovered from its raw
+            # source pair. Preserve only a digest until the original expiry.
+            from memory.retrieval import archive_source_digest
+            originals = connection.execute("""SELECT DISTINCT p.content,p.created_at,p.expires_at
+                FROM private_messages p JOIN memory_sources ms
+                ON p.user_id=ms.user_id AND p.message_id=ms.message_id
+                WHERE ms.user_id=? AND ms.memory_id=?""", (user_id,memory_id)).fetchall()
+            for original in originals:
+                connection.execute("INSERT OR REPLACE INTO private_archive_exclusions VALUES (?,?,?)",
+                    (user_id,archive_source_digest(original["content"],original["created_at"]),original["expires_at"]))
         if "communication_preferences" in tables:
             # Forgetting a fact extracted from an explicit style statement
             # must also remove the setting derived from that same source.

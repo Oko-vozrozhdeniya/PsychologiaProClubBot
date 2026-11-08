@@ -34,6 +34,9 @@ def initialize_lifecycle(db_path=storage.DATABASE_PATH):
     with storage._connection(db_path) as db:
         from memory.updating import initialize_dependencies
         initialize_dependencies(db)
+        db.execute("""CREATE TABLE IF NOT EXISTS private_archive_exclusions (
+            user_id INTEGER NOT NULL, digest TEXT NOT NULL, expires_at TEXT NOT NULL,
+            PRIMARY KEY(user_id,digest))""")
         db.execute("""CREATE TABLE IF NOT EXISTS private_messages (
             user_id INTEGER NOT NULL CHECK(user_id > 0),
             message_id TEXT NOT NULL,
@@ -450,6 +453,7 @@ def purge_expired(now, *, db_path=storage.DATABASE_PATH):
     with storage._connection(db_path) as db:
         # Snapshot memories whose source linkage is managed by this module.
         managed = db.execute("SELECT DISTINCT user_id, memory_id FROM memory_sources").fetchall()
+        db.execute("DELETE FROM private_archive_exclusions WHERE expires_at<=?",(moment,))
         expired = db.execute("DELETE FROM private_messages WHERE expires_at<=?",
                              (moment,)).rowcount
         # Foreign keys must be enabled on this connection before any deletion.
@@ -498,6 +502,14 @@ def delete_message(user_id, message_id, *, db_path=storage.DATABASE_PATH):
     storage._validate_user_id(user_id)
     message_id = storage._validate_text(message_id, "message_id")
     with storage._connection(db_path) as db:
+        # Archive rows predate message IDs in the JSONL format. Bind an explicit
+        # source deletion to its original text/date without retaining its body.
+        original = db.execute("SELECT content,created_at,expires_at FROM private_messages "
+            "WHERE user_id=? AND message_id=?",(user_id,message_id)).fetchone()
+        if original is not None:
+            from memory.retrieval import archive_source_digest
+            db.execute("INSERT OR REPLACE INTO private_archive_exclusions VALUES (?,?,?)",
+                (user_id,archive_source_digest(original['content'],original['created_at']),original['expires_at']))
         affected = db.execute("""SELECT DISTINCT memory_id FROM memory_sources
             WHERE user_id=? AND message_id=?""", (user_id, message_id)).fetchall()
         db.execute("""DELETE FROM memory_revisions

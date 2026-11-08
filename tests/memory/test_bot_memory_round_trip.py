@@ -25,6 +25,7 @@ from memory.extraction import has_statement_for_extraction
 
 def load_function(name, namespace):
     namespace.setdefault("retention_worker", retention_worker)
+    namespace.setdefault("read_historical_memory_prompt", lambda *args, **kwargs: "")
     source = (Path(__file__).resolve().parents[2] / "bot.py").read_text(encoding="utf-8")
     node = next(
         item for item in ast.parse(source).body

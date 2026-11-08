@@ -13,7 +13,7 @@ import urllib.request
 
 from memory.gemini_prompt_adapter import append_private_memory
 from memory.ai_contract import instructions_for, parse_extraction, ExtractionFormatError
-from memory.ai_adapters import extraction_settings
+from memory.ai_adapters import extraction_settings, search_settings
 
 GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b"
 
@@ -71,7 +71,7 @@ def _describe_groq_http_error(error):
 
 
 def request_groq(question, history=None, personal_memory_context=None, *,
-                 system_instruction=None):
+                 system_instruction=None, response_task="extraction"):
     """Make one explicit, bounded Groq chat request. No secret/body logging."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL).strip()
@@ -108,7 +108,9 @@ def request_groq(question, history=None, personal_memory_context=None, *,
     payload = json.dumps({
         "model": model, "messages": messages, "max_completion_tokens": 1200,
         "stream": False,
-        **(extraction_settings("Groq") if system_instruction is not None else {}),
+        **((search_settings("Groq")
+            if response_task == "search" else extraction_settings("Groq"))
+           if system_instruction is not None else {}),
     }, ensure_ascii=False).encode("utf-8")
     stats = {
         "request_bytes": len(payload),
@@ -130,7 +132,13 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         result_choice = result["choices"][0]
         choice = result_choice["message"]["content"]
         if system_instruction is not None:
-            parse_extraction(choice, result_choice.get("finish_reason"))
+            if response_task == "search":
+                from memory.ai_contract import parse_search_plan
+                parse_search_plan(choice, result_choice.get("finish_reason"))
+            elif response_task == "extraction":
+                parse_extraction(choice, result_choice.get("finish_reason"))
+            else:
+                raise ValueError("Unknown structured task")
         if not isinstance(choice, str) or not choice.strip():
             raise ValueError("No text returned")
         return choice.strip()
@@ -185,3 +193,49 @@ def request_personal_ai(question, history, personal_memory_context, mode,
         raise ValueError("Unknown test AI mode")
     answer = gemini_call(question, None, history, None, personal_memory_context)
     return answer, "Gemini"
+
+
+def request_memory_search(question, history, active_context, mode, *, gemini_key,
+                          gemini_model):
+    """One bounded semantic query plan; no full archive or permissions from AI."""
+    from memory.ai_contract import parse_search_plan
+    from memory.ai_adapters import search_settings
+    if mode not in ('auto','gemini','groq'):
+        raise ValueError('Invalid AI mode')
+    recent, size = [], 0
+    for item in reversed((history or [])[-8:]):
+        if not isinstance(item,dict) or item.get('role') not in ('user','model'):
+            continue
+        value='\n'.join(p['text'] for p in item.get('parts',[]) if isinstance(p,dict)
+                         and isinstance(p.get('text'),str))[:1800]
+        if size+len(value)>6000:
+            break
+        recent.insert(0,{'role':item['role'],'text':value})
+        size+=len(value)
+    prompt=json.dumps({'question':question[:6000], 'recent':recent,
+                       'active_context':active_context[:6000]},ensure_ascii=False)
+    instruction=instructions_for('search')
+    def groq():
+        text=request_groq(prompt,system_instruction=instruction,response_task='search')
+        return parse_search_plan(text),'Groq'
+    if mode=='groq':
+        return groq()
+    try:
+        if not gemini_key or not isinstance(gemini_model,str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,100}',gemini_model):
+            raise ValueError('Gemini search unavailable')
+        payload={'system_instruction':{'parts':[{'text':instruction}]},
+                 'contents':[{'role':'user','parts':[{'text':prompt}]}],
+                 'generationConfig':search_settings('Gemini')}
+        request=urllib.request.Request(
+            'https://generativelanguage.googleapis.com/v1beta/models/'+gemini_model+':generateContent',
+            data=json.dumps(payload,ensure_ascii=False).encode(),
+            headers={'x-goog-api-key':gemini_key,'Content-Type':'application/json'},method='POST')
+        with urllib.request.urlopen(request,timeout=15) as response:
+            data=json.loads(response.read(131072).decode())
+        candidate=data['candidates'][0]
+        text=''.join(p.get('text','') for p in candidate['content']['parts'] if isinstance(p,dict))
+        return parse_search_plan(text,candidate.get('finishReason')),'Gemini'
+    except Exception:
+        if mode!='auto':
+            raise
+        return groq()

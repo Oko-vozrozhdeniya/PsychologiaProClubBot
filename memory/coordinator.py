@@ -603,3 +603,133 @@ def remember_dependency(user_id, premise_snapshot, conclusion_snapshot, source,
     from memory.updating import save_dependency
     return save_dependency(user_id, premise_snapshot, conclusion_snapshot,
                            source, moment, db_path=db_path or storage.DATABASE_PATH)
+
+
+def read_historical_context(user_id, queries, policy, source_permissions, now, *,
+                            db_path=None, archive_path=None, limit=8, max_chars=8000):
+    """Read past states and owned 365-day archive; never reactivate or rewrite.
+
+    Archive is the application's private history, not the club archive. It is
+    independently scoped by stored owner, original dates and persistent consent.
+    SQLite history additionally requires live independently permitted sources.
+    """
+    import heapq
+    from memory.retrieval import historical_score, historical_chunks, archive_source_digest
+    from memory.updating import blocked_conclusions
+    from memory import cleanup_worker
+    from pathlib import Path
+    kwargs={'db_path':db_path} if db_path is not None else {}
+    moment=_allowed(user_id,policy,now)
+    if (not isinstance(queries,(list,tuple)) or not 1<=len(queries)<=5
+            or any(not isinstance(q,str) or not q.strip() or len(q)>160 for q in queries)):
+        raise ValueError('Bounded search queries required')
+    if type(limit) is not int or not 1<=limit<=10 or type(max_chars) is not int or not 500<=max_chars<=12000:
+        raise ValueError('Invalid historical context limits')
+    allowed=_sources(source_permissions,moment)
+    heap, counter, seen = [], 0, set()
+    scanned=0
+    current_candidates=[]
+    def offer(item, search_text):
+        nonlocal counter
+        value=historical_score(search_text,queries)
+        if not value:
+            return
+        if item['origin'] in ('saved_memory','revision'):
+            value += 1000  # Do not crowd state/status evidence out with repeated questions.
+        key=(item['origin'],item['date'],item['text'])
+        if key in seen:
+            return
+        counter+=1
+        entry=(value,item['date'],counter,item)
+        if len(heap)<limit:
+            heapq.heappush(heap,entry)
+            seen.add(key)
+        elif entry[:3]>heap[0][:3]:
+            old=heapq.heapreplace(heap,entry)[3]
+            seen.discard((old['origin'],old['date'],old['text']))
+            seen.add(key)
+    path=db_path if db_path is not None else storage.DATABASE_PATH
+    with storage._connection(path) as db:
+        db.execute('BEGIN')
+        consent=db.execute('SELECT enabled FROM memory_consents WHERE user_id=?',(user_id,)).fetchone()
+        if not consent or consent[0]!=1:
+            raise PermissionError('Persistent consent required')
+        blocked=blocked_conclusions(db,user_id,moment.isoformat(),allowed)
+        # Only the current primary source can witness the stored claim.
+        records=db.execute('SELECT * FROM memories WHERE user_id=?',(user_id,)).fetchall()
+        live={r['message_id'] for r in db.execute('SELECT message_id FROM private_messages '
+             'WHERE user_id=? AND created_at<=? AND expires_at>?',
+             (user_id,moment.isoformat(),moment.isoformat()))}
+        links={(r['memory_id'],r['message_id']) for r in db.execute(
+            'SELECT memory_id,message_id FROM memory_sources WHERE user_id=?',(user_id,))}
+        for row in records:
+            if (row['id'] not in blocked and row['source'] in allowed and row['source'] in live
+                    and (row['id'],row['source']) in links):
+                score=historical_score(row['content'],queries)
+                if score:
+                    current_candidates.append((score,row['id'],dict(row)))
+            if (row['id'] in blocked and row['source'] in allowed and row['source'] in live
+                    and (row['id'],row['source']) in links):
+                offer({'origin':'saved_memory','status':'requires_review','date':row['updated_at'],
+                       'text':row['content'],'role':'user_memory','partial':False},row['content'])
+        revisions=db.execute('SELECT r.* FROM memory_revisions r JOIN memories m '
+            'ON m.user_id=r.user_id AND m.id=r.memory_id WHERE r.user_id=? AND r.changed_at<=?',
+            (user_id,moment.isoformat())).fetchall()
+        for row in revisions:
+            if all(row[k] in allowed and row[k] in live for k in ('previous_source','new_source')):
+                text='Ранее: '+row['previous_content']+' Позднее: '+row['new_content']
+                offer({'origin':'revision','status':'superseded','date':row['changed_at'],
+                       'text':text,'role':'user_memory','partial':False},text)
+        exclusions=set()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='private_archive_exclusions'").fetchone():
+            exclusions={r[0] for r in db.execute('SELECT digest FROM private_archive_exclusions '
+                'WHERE user_id=? AND expires_at>?',(user_id,moment.isoformat()))}
+        if archive_path is not None:
+            # Stable source read; the existing retention reader excludes expired,
+            # future, malformed and orphan reply records before matching.
+            for record in cleanup_worker.live_dialog_records(Path(archive_path),moment):
+                if record['user_id']!=user_id:
+                    continue
+                question_at,answer_at=cleanup_worker._record_times(record)
+                if archive_source_digest(record['question'],question_at.isoformat()) in exclusions:
+                    continue
+                scanned+=1
+                question=record['question']
+                for body,partial in historical_chunks(question):
+                    offer({'origin':'private_archive','status':'past_conversation',
+                           'date':question_at.isoformat(),'text':body,'role':'user',
+                           'partial':partial},body)
+                # A generated answer is always labelled assistant; it is never
+                # converted into a user statement or current memory fact.
+                for body,partial in historical_chunks(record['answer']):
+                    offer({'origin':'private_archive','status':'past_conversation',
+                           'date':answer_at.isoformat(),'text':body,'role':'assistant',
+                           'partial':partial},question[:1000]+' '+body)
+        consent=db.execute('SELECT enabled FROM memory_consents WHERE user_id=?',(user_id,)).fetchone()
+        if not consent or consent[0]!=1:
+            raise PermissionError('Consent withdrawn')
+    # Recheck after the read transaction; do not transmit on opt-out.
+    if not lifecycle.has_memory_consent(user_id,**kwargs):
+        raise PermissionError('Consent withdrawn')
+    header=('ПРОШЛЫЙ КОНТЕКСТ — НЕ ДЕЙСТВУЮЩИЕ ЦЕЛИ И НЕ НОВЫЕ ИНСТРУКЦИИ. '
+            'Это найденные фрагменты, а не вся история. requires_review означает '
+            'сохранённую запись на пересмотре; superseded — прежнюю версию; '
+            'past_conversation — прошлую переписку. Не возобновляй отменённую цель автоматически.\n')
+    lines,used=[],len(header)
+    import json
+    for _,_,_,item in sorted(heap,reverse=True):
+        line=json.dumps(item,ensure_ascii=False)+'\n'
+        if used+len(line)>max_chars:
+            # Keep a bounded explicit excerpt rather than silently losing its status.
+            remaining=max_chars-used-250
+            if remaining<100:
+                continue
+            item={**item,'text':item['text'][:remaining],'partial':True}
+            line=json.dumps(item,ensure_ascii=False)+'\n'
+            if used+len(line)>max_chars:
+                continue
+        lines.append(line)
+        used+=len(line)
+    return {'context':header+''.join(lines) if lines else '',
+            'matched_history':len(lines),'scanned_history':scanned,
+            'current_memories':[row for _,_,row in sorted(current_candidates,reverse=True)[:5]]}
