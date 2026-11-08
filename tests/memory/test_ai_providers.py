@@ -335,7 +335,7 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
                      "change_command", "history_command", "diagnostics", "testai", "groq_ping",
                      "private_message", "save_message", "track_topic_changes",
                      "start_retention_cleanup", "stop_retention_cleanup", "recovery_check_command",
-                     "backup_now_command"):
+                     "backup_now_command", "dialogue_lab_command"):
             self.ns[name] = Mock()
         exec(compile(ast.Module(body=[self.functions["main"]], type_ignores=[]), "bot.py", "exec"), self.ns)
         self.ns["main"]()
@@ -345,6 +345,8 @@ class AiModeCommandTests(unittest.IsolatedAsyncioTestCase):
         for command in ("ai_gemini", "ai_groq", "ai_auto"):
             self.assertIs(registered[command][1], self.ns["choose_ai_mode"])
             self.assertIsNotNone(registered[command][2])
+        self.assertIs(registered["dialogue_lab"][1], self.ns["dialogue_lab_command"])
+        self.assertIsNotNone(registered["dialogue_lab"][2])
         self.assertIs(registered["ai_mode"][1], self.ns["show_ai_mode"])
         self.assertIsNotNone(registered["ai_mode"][2])
         self.assertIs(registered["recovery_check"][1], self.ns["recovery_check_command"])
