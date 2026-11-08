@@ -458,9 +458,22 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(o=={'reply_mode':'brief_continue'} for o in self.reply_options))
         self.assertIn(supplied[0],str(self.calls[1][1]))
 
+    async def test_ambiguous_topic_completion_keeps_generated_answer_open(self):
+        # Planner output is stubbed: this checks routing, not live semantic quality.
+        self.f.message.text='На сегодня мне достаточно, спасибо.'
+        self.generated_reply='Рад, что разобрались. Есть что-то ещё, что хочется обсудить?'
+        decision=dict(plan(search=False,scope='ambiguous'),reply_mode='answer')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
+            await self.f.invoke()
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.ns['send_long_message'].await_args.args[1],self.generated_reply)
+        self.assertEqual(self.reply_options[-1],{})
+        self.assertEqual(self.f.records[-1]['reply_mode'],'answer')
+        self.assertEqual(self.f.records[-1]['answer_provider'],'Gemini')
+
     async def social_farewell(self,mode):
         self.f.app.bot_data['test_ai_mode']=mode
-        self.f.message.text='На сегодня мне достаточно, спасибо.'
+        self.f.message.text='Спасибо, на сегодня закончим разговор. До свидания.'
         self.generated_reply='Тогда до следующей встречи.'
         # A pure social turn cannot become a new goal even if extraction would
         # otherwise offer one. Only an actual assertion keeps the write path.
