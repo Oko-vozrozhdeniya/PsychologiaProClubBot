@@ -1,0 +1,75 @@
+import ast
+import asyncio
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+from tools import dialogue_lab as lab
+
+
+class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parents[2]
+        tree = ast.parse((root/'bot.py').read_text())
+        selected = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name in ('dialogue_lab_command','run_dialogue_lab')]
+        self.sent = AsyncMock()
+        self.ns = dict(asyncio=asyncio, os=os, Update=object,
+            ContextTypes=SimpleNamespace(DEFAULT_TYPE=object), GEMINI_API_KEY='FAKE GEMINI',
+            GEMINI_MODEL='test', is_owner=lambda u:u.effective_user.id==1,
+            send_long_message=self.sent)
+        exec(compile(ast.Module(body=selected,type_ignores=[]),'bot.py','exec'),self.ns)
+        self.message=SimpleNamespace(reply_text=AsyncMock())
+        self.update=SimpleNamespace(effective_message=self.message,
+            effective_chat=SimpleNamespace(type='private'),effective_user=SimpleNamespace(id=1))
+        self.jobs=[]
+        self.app=SimpleNamespace(bot_data={'test_ai_mode':'auto'},create_task=self.jobs.append)
+        self.context=SimpleNamespace(application=self.app)
+        self.env=patch.dict(os.environ,{'GROQ_API_KEY':'FAKE GROQ'})
+        self.env.start();self.addCleanup(self.env.stop)
+
+    async def test_other_users_and_groups_cannot_launch_paid_requests(self):
+        for user,chat in ((2,'private'),(1,'group')):
+            self.update.effective_user.id=user;self.update.effective_chat.type=chat
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+        self.assertEqual(self.jobs,[])
+        self.message.reply_text.assert_not_awaited()
+
+    async def test_missing_keys_cannot_launch(self):
+        self.ns['GEMINI_API_KEY']=''
+        await self.ns['dialogue_lab_command'](self.update,self.context)
+        self.assertEqual(self.jobs,[])
+
+    async def test_background_run_is_bounded_rejects_duplicate_and_preserves_mode(self):
+        with patch.object(lab,'run_case',side_effect=lambda p,c,*a:c[3]) as run:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            self.assertEqual(len(self.jobs),1)
+            self.assertTrue(self.app.bot_data['dialogue_lab_running'])
+            await self.jobs.pop()
+        self.assertEqual(run.call_count,16)
+        self.assertNotIn('dialogue_lab_running',self.app.bot_data)
+        self.assertEqual(self.app.bot_data['test_ai_mode'],'auto')
+        text=str(self.sent.await_args_list)
+        self.assertIn('4/4',text)
+        self.assertNotIn('FAKE GEMINI',text)
+        self.assertNotIn('FAKE GROQ',text)
+
+    async def test_provider_failures_report_only_class_and_clear_running_flag(self):
+        with patch.object(lab,'run_case',side_effect=RuntimeError('SECRET RAW ERROR')):
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        text=str(self.sent.await_args_list)
+        self.assertIn('RuntimeError',text)
+        self.assertNotIn('SECRET RAW ERROR',text)
+        self.assertNotIn('dialogue_lab_running',self.app.bot_data)
+
+    async def test_cancellation_clears_flag(self):
+        async def cancelled(*a,**k):
+            raise asyncio.CancelledError
+        await self.ns['dialogue_lab_command'](self.update,self.context)
+        with patch.object(asyncio,'to_thread',side_effect=cancelled):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.jobs.pop()
+        self.assertNotIn('dialogue_lab_running',self.app.bot_data)

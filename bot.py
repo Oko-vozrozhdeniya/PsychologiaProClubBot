@@ -1474,6 +1474,64 @@ async def private_message(
             )
 
 
+async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only bounded live evaluation on synthetic cases, no chat or DB reads."""
+    if not is_owner(update) or update.effective_chat.type != "private":
+        return
+    app = context.application
+    if app.bot_data.get("dialogue_lab_running"):
+        await update.effective_message.reply_text("Сравнение уже выполняется. Дождись отчёта.")
+        return
+    if not GEMINI_API_KEY or not os.environ.get("GROQ_API_KEY", "").strip():
+        await update.effective_message.reply_text("Для сравнения нужны настроенные ключи Gemini и Groq.")
+        return
+    app.bot_data["dialogue_lab_running"] = True
+    try:
+        await update.effective_message.reply_text(
+            "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, "
+            "не более 24 обращений к API. Личная память и переписка не используются. "
+            "Результат пришлю сюда; обычные настройки бота не изменятся.")
+        app.create_task(run_dialogue_lab(update.effective_message, app))
+    except BaseException:
+        app.bot_data.pop("dialogue_lab_running", None)
+        raise
+
+
+async def run_dialogue_lab(message, app):
+    """Background task: leave Telegram updates responsive during API requests."""
+    actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
+    titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
+    results = []
+    try:
+        from tools.dialogue_lab import CASES, run_case
+        for provider in ("gemini", "groq"):
+            rows = []
+            for index, case in enumerate(CASES[:4]):
+                for policy, label in (("current", "текущий"), ("candidate", "новый")):
+                    try:
+                        actual = await asyncio.to_thread(run_case, policy, case, provider, GEMINI_API_KEY, GEMINI_MODEL)
+                        error = None
+                    except Exception as error_value:
+                        actual, error = "error", type(error_value).__name__
+                    ok = actual == case[3]
+                    results.append((provider, policy, ok, actual == "error"))
+                    rows.append(f"{titles[index]} / {label}: {actions.get(actual, 'неизвестно')}; "
+                                f"ожидалось {actions[case[3]]} — {'OK' if ok else 'НЕ ПРОШЁЛ'}"
+                                + (f" ({error})" if error else ""))
+            await send_long_message(message, provider.upper() + "\n" + "\n".join(rows))
+        summary = []
+        for provider in ("gemini", "groq"):
+            for policy, label in (("current", "текущий"), ("candidate", "новый")):
+                group = [r for r in results if r[0] == provider and r[1] == policy]
+                summary.append(f"{provider.upper()} / {label}: {sum(r[2] for r in group)}/4, "
+                               f"ошибок API/формата: {sum(r[3] for r in group)}")
+        await send_long_message(message, "Сравнение завершено\n" + "\n".join(summary)
+            + "\nЭто проверка выбора действия, не естественности ответа и не всей памяти. "
+              "Новый подход в обычный диалог не включён.")
+    finally:
+        app.bot_data.pop("dialogue_lab_running", None)
+
+
 async def testai(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -2352,6 +2410,10 @@ def main():
     app.add_handler(
         CommandHandler("testai", testai)
     )
+    app.add_handler(CommandHandler(
+        "dialogue_lab", dialogue_lab_command,
+        filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID),
+    ))
     app.add_handler(
         CommandHandler(
             "groq_ping", groq_ping,
