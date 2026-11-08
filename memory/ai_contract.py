@@ -6,7 +6,10 @@ from memory.extraction import split_dialog_extraction
 BASE_INSTRUCTIONS = (
     'Ты ИИ-помощник клуба «Психология Pro». Общайся на русском языке, естественно, '
     'доброжелательно и по существу. Ты можешь обсуждать психологию, самопознание, '
-    'повседневные вопросы и другие темы. Не выдумывай факты и не выдавай предположения за '
+    'повседневные вопросы и другие темы. Самостоятельно формулируй ответ по смыслу '
+    'всего разговора: знания и правила направляют выбор содержания и способа общения, '
+    'но не задают готовые реплики для дословного воспроизведения. Сохраняй точность '
+    'терминов и цитат, когда она нужна по запросу. Не выдумывай факты и не выдавай предположения за '
     'достоверную информацию. Не ставь медицинские или психологические диагнозы. Не '
     'представляй себя психологом или психотерапевтом. Ты работаешь через Telegram-бота. '
     'Голосовые сообщения пока не распознаются. Долгосрочная память используется только при '
@@ -66,8 +69,8 @@ PRIVATE_INSTRUCTIONS = (
     'Не заменяй такой отчёт его перефразированием. Если пользователь просто отменил '
     'намерение, передумал или поправил деталь и не задал новой темы, дай короткую '
     'естественную реакцию и один лёгкий вопрос для продолжения разговора без пересказа '
-    'сказанного и объяснения внутренних изменений. Например: «Хорошо, понял. '
-    'О чём поговорим теперь?» Формулировки меняй, сохраняя краткость и тон разговора. '
+    'сказанного и объяснения внутренних изменений. Подбирай формулировку по '
+    'контексту, тону и границам собеседника, избегая однообразных повторов. '
     'Если человек явно заканчивает беседу или прощается, ответь коротким прощанием '
     'без нового вопроса. Завершение дела или отмена плана сами по себе не означают '
     'завершение беседы. В длинном рассказе учитывай поправку в дальнейшем ответе, '
@@ -168,9 +171,9 @@ class ExtractionTruncatedError(ExtractionFormatError):
     pass
 
 
-def instructions_for(task):
+def instructions_for(task, *, reply_mode="answer"):
     if task == "private":
-        return BASE_INSTRUCTIONS + PRIVATE_INSTRUCTIONS
+        return BASE_INSTRUCTIONS + PRIVATE_INSTRUCTIONS + dialogue_guidance(reply_mode)
     if task == "archive":
         return BASE_INSTRUCTIONS + ARCHIVE_INSTRUCTIONS
     if task == "search":
@@ -318,45 +321,30 @@ def parse_search_plan(text, finish_reason=None):
     return data
 
 
-BRIEF_REPLIES = {
-    'brief_continue': (
-        'Хорошо, понял. О чём поговорим теперь?',
-        'Понял. Что хочется обсудить сейчас?',
-        'Хорошо. К какой теме перейдём?',
-        'Понял. О чём продолжим разговор?',
-        'Хорошо. Что обсудим дальше?',
-    ),
-    'brief_close': (
-        'Хорошо, до встречи!',
-        'До встречи!',
-        'Всего доброго!',
-        'Спасибо за разговор. До встречи!',
-        'Хорошо, до связи!',
-    ),
-    'brief_ack': ('Хорошо, понял.', 'Понял.', 'Хорошо.'),
-}
-
-
-def make_brief_reply(mode, history=()):
-    """Rotate bounded reactions using only this conversation's permitted history.
-
-    Semantic routing is separate; no wording/keyword classification happens here.
-    No extra user profile or retention-extending state is persisted.
-    """
-    if mode not in BRIEF_REPLIES:
-        raise ValueError('Unknown brief reply mode')
-    if not isinstance(history,(list,tuple)):
-        raise ValueError('Conversation history required')
-    variants=BRIEF_REPLIES[mode]
-    for item in reversed(history):
-        if not isinstance(item,dict) or item.get('role') != 'model':
-            continue
-        parts=item.get('parts',[])
-        if not isinstance(parts,list):
-            continue
-        text=' '.join(p['text'] for p in parts if isinstance(p,dict)
-                      and isinstance(p.get('text'),str))
-        text=' '.join(text.split())
-        if text in variants:
-            return variants[(variants.index(text)+1)%len(variants)]
-    return variants[0]
+def dialogue_guidance(reply_mode):
+    """Response goals for generation, never a vocabulary or reply template."""
+    if reply_mode == "answer":
+        return ""
+    if reply_mode == "brief_continue":
+        return (
+            " Правило текущего ответа: собеседник кратко изменил намерение или поправил факт, "
+            "разговор продолжается, следующая тема не выбрана. Сформулируй свою уместную "
+            "реакцию и один короткий вопрос, который поможет продолжить именно этот "
+            "разговор. Достаточно одного-двух коротких предложений. Учитывай контекст и "
+            "предыдущие ответы, избегай однообразия. Не пересказывай поправку, не отчитывайся "
+            "о памяти, не навязывай прежнюю отменённую цель и не добавляй несколько вопросов."
+        )
+    if reply_mode == "brief_close":
+        return (
+            " Правило текущего ответа: собеседник завершает сам разговор. Самостоятельно "
+            "выбери краткое естественное прощание по контексту и тону беседы, в пределах "
+            "одного-двух коротких предложений. Не задавай вопрос для продолжения, не "
+            "открывай новую тему, не перечисляй решения и операции памяти."
+        )
+    if reply_mode == "brief_ack":
+        return (
+            " Правило текущего ответа: собеседник просит только кратко подтвердить "
+            "понимание без дополнительных вопросов. Сформулируй свою естественную реакцию "
+            "одним коротким предложением по контексту, без пересказа и отчёта о памяти."
+        )
+    raise ValueError("Unknown dialogue guidance")

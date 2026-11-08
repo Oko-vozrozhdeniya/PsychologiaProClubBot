@@ -825,7 +825,8 @@ def request_gemini(
     history=None,
     request_stats_sink=None,
     personal_memory_context=None,
-    timeout_override=None
+    timeout_override=None,
+    reply_mode="answer"
 ):
     if not GEMINI_API_KEY:
         logger.error(
@@ -858,7 +859,7 @@ def request_gemini(
         }]
 
     else:
-        instructions = instructions_for("private")
+        instructions = instructions_for("private", reply_mode=reply_mode)
 
         contents = list(history or [])
 
@@ -1380,27 +1381,19 @@ async def private_message(
             if not await asyncio.to_thread(personal_lifecycle.has_memory_consent, user_id):
                 await message.reply_text("Обработка приостановлена: согласие на личный диалог отозвано.")
                 return
-            controlled_brief = (
-                memory_check.get("reply_mode") in ("brief_ack", "brief_continue", "brief_close")
-                and memory_check.get("history_statement_scope") in ("current_assertion", "social")
-                and memory_check.get("history_planner_provider") in ("Gemini", "Groq")
-                and not memory_check.get("history_planner_error")
+            reply_mode = memory_check.get("reply_mode", "answer")
+            reply_options = ({"reply_mode": reply_mode}
+                             if reply_mode != "answer" and not memory_check.get("history_planner_error")
+                             else {})
+            answer, provider = await asyncio.to_thread(
+                request_personal_ai,
+                question,
+                history,
+                memory_prompt,
+                mode,
+                request_gemini,
+                **reply_options,
             )
-            if controlled_brief:
-                # Semantic intent is interpreted by the shared planner. The app
-                # controls length, one continuation question, or a closing reply.
-                from memory.ai_contract import make_brief_reply
-                answer = make_brief_reply(memory_check["reply_mode"], history)
-                provider = memory_check["history_planner_provider"]
-            else:
-                answer, provider = await asyncio.to_thread(
-                    request_personal_ai,
-                    question,
-                    history,
-                    memory_prompt,
-                    mode,
-                    request_gemini,
-                )
             answer_created_at = datetime.now(timezone.utc)
             # A request already in flight may outlive the stored consent.
             if not await asyncio.to_thread(
@@ -1412,7 +1405,7 @@ async def private_message(
                 )
                 return
 
-            memory_check["answer_provider"] = "приложение" if controlled_brief else provider
+            memory_check["answer_provider"] = provider
             try:
                 if memory_check.get('history_statement_scope') == 'social':
                     saved_facts = 0
@@ -1455,12 +1448,9 @@ async def private_message(
             except Exception:
                 logger.exception("Cannot save memory diagnostic")
             if context.application.bot_data.get("test_show_provider"):
-                if controlled_brief:
-                    answer += "\n\n[Тест: краткая реакция приложения]"
-                else:
-                    model = (GEMINI_MODEL if provider == "Gemini"
-                             else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
-                    answer += f"\n\n[Тест: {provider} · {model}]"
+                model = (GEMINI_MODEL if provider == "Gemini"
+                         else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
+                answer += f"\n\n[Тест: {provider} · {model}]"
             await send_long_message(
                 message,
                 answer

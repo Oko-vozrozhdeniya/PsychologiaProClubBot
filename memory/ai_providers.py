@@ -71,7 +71,7 @@ def _describe_groq_http_error(error):
 
 
 def request_groq(question, history=None, personal_memory_context=None, *,
-                 system_instruction=None, response_task="extraction"):
+                 system_instruction=None, response_task="extraction", reply_mode="answer"):
     """Make one explicit, bounded Groq chat request. No secret/body logging."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL).strip()
@@ -89,7 +89,7 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         raise GroqRequestError(reason="Некорректная инструкция запроса")
     if personal_memory_context:
         question = append_private_memory(question, personal_memory_context)
-    instructions = system_instruction if system_instruction is not None else instructions_for("private")
+    instructions = system_instruction if system_instruction is not None else instructions_for("private", reply_mode=reply_mode)
     messages = [{"role": "system", "content": instructions}]
     if history is not None and not isinstance(history, (tuple, list)):
         raise GroqRequestError(reason="Некорректный формат истории")
@@ -172,14 +172,16 @@ def request_groq(question, history=None, personal_memory_context=None, *,
 
 
 def request_personal_ai(question, history, personal_memory_context, mode,
-                        gemini_call):
-    """Return the actual provider, not the model's claimed identity."""
+                        gemini_call, *, reply_mode="answer"):
+    """Generate freely under shared rules; return the actual provider."""
+    instructions_for("private", reply_mode=reply_mode)  # Validate before network use.
+    reply_options = {"reply_mode": reply_mode} if reply_mode != "answer" else {}
     if mode == "groq":
-        return request_groq(question, history, personal_memory_context), "Groq"
+        return request_groq(question, history, personal_memory_context, **reply_options), "Groq"
     if mode == "auto":
         try:
             answer = gemini_call(
-                question, None, history, None, personal_memory_context, 15
+                question, None, history, None, personal_memory_context, 15, **reply_options
             )
             return answer, "Gemini"
         except Exception as error:
@@ -188,10 +190,10 @@ def request_personal_ai(question, history, personal_memory_context, mode,
                 "timeout", "unavailable", "rate_limit"
             ):
                 raise
-            return request_groq(question, history, personal_memory_context), "Groq"
+            return request_groq(question, history, personal_memory_context, **reply_options), "Groq"
     if mode != "gemini":
         raise ValueError("Unknown test AI mode")
-    answer = gemini_call(question, None, history, None, personal_memory_context)
+    answer = gemini_call(question, None, history, None, personal_memory_context, **reply_options)
     return answer, "Gemini"
 
 

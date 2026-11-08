@@ -189,35 +189,6 @@ class SearchContract(unittest.TestCase):
             self.assertEqual(parse_search_plan(json.dumps(changed))['reply_mode'],'answer')
         self.assertEqual(parse_search_plan(json.dumps(dict(closing,reply_mode='brief_continue')))['reply_mode'],'answer')
 
-    def test_continuation_variants_rotate_with_one_question_and_bounded_length(self):
-        history=[];seen=[]
-        for _ in range(12):
-            reply=ai_contract.make_brief_reply('brief_continue',history)
-            self.assertLessEqual(len(reply),80)
-            self.assertEqual(reply.count('?'),1)
-            self.assertNotIn('\n',reply)
-            if seen:self.assertNotEqual(reply,seen[-1])
-            seen.append(reply)
-            history.extend([{'role':'model','parts':[{'text':reply}]},
-                            {'role':'model','parts':[{'text':'Другой содержательный ответ.'}]}])
-        self.assertGreaterEqual(len(set(seen)),4)
-
-    def test_farewell_variants_have_no_continuation_question_and_change(self):
-        history=[];seen=[]
-        for _ in range(8):
-            reply=ai_contract.make_brief_reply('brief_close',history)
-            self.assertNotIn('?',reply)
-            self.assertLessEqual(len(reply),80)
-            if seen:self.assertNotEqual(reply,seen[-1])
-            seen.append(reply)
-            history.append({'role':'model','parts':[{'text':reply}]})
-        self.assertGreaterEqual(len(set(seen)),4)
-
-    def test_user_text_does_not_count_as_previous_bot_variant(self):
-        first=ai_contract.make_brief_reply('brief_continue')
-        self.assertEqual(ai_contract.make_brief_reply('brief_continue',[
-            {'role':'user','parts':[{'text':first}]}]),first)
-
     def test_truncation_is_not_a_valid_plan(self):
         with self.assertRaises(ai_contract.ExtractionTruncatedError):
             parse_search_plan(json.dumps(plan('план')),'MAX_TOKENS')
@@ -349,10 +320,14 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         bot_fixtures.load_function('read_historical_memory_prompt',self.ns)
         self.f.message.text='Вернёмся к прежнему вечернему плану тренировок.'
         self.f.message.date=self.clock
+        self.ns['GROQ_DEFAULT_MODEL']=ai_providers.GROQ_DEFAULT_MODEL
         self.calls=[]
-        def answer(question,history,memory,mode,gemini):
+        self.reply_options=[]
+        self.generated_reply='Ответ по найденному прошлому плану'
+        def answer(question,history,memory,mode,gemini,**options):
             self.calls.append((question,history,memory,mode))
-            return 'Ответ по найденному прошлому плану','Groq' if mode=='groq' else 'Gemini'
+            self.reply_options.append(options)
+            return self.generated_reply,'Groq' if mode=='groq' else 'Gemini'
         self.ns['request_personal_ai']=answer
         self.real=coordinator.read_historical_context
 
@@ -396,34 +371,37 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m['content']=='Готовлюсь к велопоходу'
             for m in lifecycle.list_live_memories(101,self.clock,db_path=self.db)))
 
-    async def controlled_reaction(self,mode):
+    async def generated_reaction(self,mode):
         self.f.app.bot_data['test_ai_mode']=mode
         self.f.app.bot_data['test_show_provider']=True
         self.f.message.text='С кактусами я передумал, теперь мне нравятся жёлтые.'
         self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
             kind='preference',confidence=0.99)]
         provider='Groq' if mode=='groq' else 'Gemini'
+        self.generated_reply='Понял вас. Что сейчас хочется обсудить?'
         decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_continue')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,provider)):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
-        self.assertEqual(self.calls,[])  # No free-form second response to grow an echo.
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_continue'})
         delivered=self.ns['send_long_message'].await_args.args[1]
-        self.assertEqual(delivered,'Хорошо, понял. О чём поговорим теперь?\n\n[Тест: краткая реакция приложения]')
+        model='test' if provider=='Gemini' else ai_providers.GROQ_DEFAULT_MODEL
+        self.assertEqual(delivered,self.generated_reply+f'\n\n[Тест: {provider} · {model}]')
         archive=list(cleanup_worker.live_dialog_records(self.path,self.clock))
-        self.assertEqual(archive[-1]['answer'],'Хорошо, понял. О чём поговорим теперь?')
-        self.assertEqual(self.f.records[-1]['answer_provider'],'приложение')
+        self.assertEqual(archive[-1]['answer'],self.generated_reply)
+        self.assertEqual(self.f.records[-1]['answer_provider'],provider)
         self.assertEqual(self.f.records[-1]['reply_mode'],'brief_continue')
         self.assertEqual(self.f.records[-1]['saved_facts'],1)
         self.assertEqual(self.f.records[-1]['extraction_provider'],provider)
         self.assertTrue(any('жёлтые кактусы' in r['content'] for r in
             lifecycle.list_live_memories(101,self.clock,db_path=self.db)))
 
-    async def test_gemini_controlled_reaction_preserves_fact_write_archive_and_provenance(self):
-        await self.controlled_reaction('gemini')
+    async def test_gemini_generated_reaction_preserves_fact_write_archive_and_provenance(self):
+        await self.generated_reaction('gemini')
 
-    async def test_groq_controlled_reaction_uses_same_app_response_and_its_extractor(self):
-        await self.controlled_reaction('groq')
+    async def test_groq_generated_reaction_uses_own_text_and_its_extractor(self):
+        await self.generated_reaction('groq')
 
     async def test_brief_cancellation_updates_existing_goal_but_preserves_old_plan(self):
         old=storage.get_memory(101,self.mid,db_path=self.db)
@@ -440,7 +418,7 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
-        self.assertEqual(self.calls,[])
+        self.assertEqual(len(self.calls),1)
         self.assertEqual(storage.get_memory(101,self.mid,db_path=self.db)['content'],cancelled)
         self.assertEqual(self.f.records[-1]['saved_facts'],1)
         self.assertIn('велотренажёр 20 минут',self.path.read_text())
@@ -456,30 +434,34 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
-        self.assertEqual(self.calls,[])
+        self.assertEqual(len(self.calls),1)
         self.assertEqual(self.path.read_bytes(),before)
         self.ns['send_long_message'].assert_not_awaited()
 
-    async def test_successive_corrections_vary_in_the_real_session(self):
+    async def test_successive_provider_phrasing_is_preserved_with_conversation_context(self):
         self.f.fixture.model_result=[]
+        supplied=['Сейчас можно выбрать другую тему. Что вам интересно?',
+                  'Принято. С чего продолжим?',
+                  'Что сейчас больше хочется обсудить?']
         replies=[]
         decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_continue')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             for index,text in enumerate(('Поход отменяется.', 'Подготовку пока отложу.', 'Пока без поездок.')):
+                self.generated_reply=supplied[index]
                 self.f.message.message_id=810+index
                 self.f.message.text=text
                 await self.f.invoke()
                 replies.append(self.ns['send_long_message'].await_args.args[1])
         self.ns['send_error_response'].assert_not_awaited()
-        self.assertEqual(self.calls,[])
-        self.assertEqual(len(set(replies)),3)
-        for reply in replies:
-            self.assertEqual(reply.count('?'),1)
-            self.assertLessEqual(len(reply),80)
+        self.assertEqual(len(self.calls),3)
+        self.assertEqual(replies,supplied)
+        self.assertTrue(all(o=={'reply_mode':'brief_continue'} for o in self.reply_options))
+        self.assertIn(supplied[0],str(self.calls[1][1]))
 
     async def social_farewell(self,mode):
         self.f.app.bot_data['test_ai_mode']=mode
         self.f.message.text='На сегодня мне достаточно, спасибо.'
+        self.generated_reply='Тогда до следующей встречи.'
         # A pure social turn cannot become a new goal even if extraction would
         # otherwise offer one. Only an actual assertion keeps the write path.
         decision=dict(plan(search=False,scope='social'),reply_mode='brief_close')
@@ -487,12 +469,13 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
                 'Groq' if mode=='groq' else 'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
-        self.assertEqual(self.calls,[])
+        self.assertEqual(len(self.calls),1)
         reply=self.ns['send_long_message'].await_args.args[1]
-        self.assertEqual(reply,'Хорошо, до встречи!')
+        self.assertEqual(reply,self.generated_reply)
+        self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_close'})
         self.assertNotIn('?',reply)
         self.assertEqual(self.f.records[-1]['reply_mode'],'brief_close')
-        self.assertEqual(self.f.records[-1]['answer_provider'],'приложение')
+        self.assertEqual(self.f.records[-1]['answer_provider'],'Groq' if mode=='groq' else 'Gemini')
         self.assertEqual(self.f.records[-1]['write_status'],'пропущено: завершение разговора без нового утверждения')
         self.assertEqual(len(lifecycle.list_live_memories(101,self.clock,db_path=self.db)),1)
         self.assertEqual(list(cleanup_worker.live_dialog_records(self.path,self.clock))[-1]['answer'],reply)
@@ -505,13 +488,14 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
 
     async def test_new_fact_before_farewell_is_still_saved(self):
         self.f.message.text='Теперь мне нравятся жёлтые кактусы. На этом закончим, пока.'
+        self.generated_reply='До скорого, спасибо за беседу.'
         self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
             kind='preference',confidence=0.99)]
         decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_close')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
-        self.assertEqual(self.calls,[])
+        self.assertEqual(len(self.calls),1)
         self.assertNotIn('?',self.ns['send_long_message'].await_args.args[1])
         self.assertEqual(self.f.records[-1]['saved_facts'],1)
         self.assertTrue(any('жёлтые кактусы' in row['content'] for row in
