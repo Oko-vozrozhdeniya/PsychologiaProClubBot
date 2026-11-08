@@ -310,6 +310,7 @@ def format_diagnostic(record):
             ("history_planner_error", "Ошибка смыслового разбора поиска"),
             ("history_search_status", "Поиск прошлого контекста"),
             ("history_statement_scope", "Тип обращения к памяти"),
+            ("reply_mode", "Форма ответа"),
             ("history_scanned", "Проверено собственных фрагментов истории"),
             ("history_matched", "Подобрано прошлых фрагментов"),
             ("history_current_matches", "Подобрано актуальных записей по смыслу обращения"),
@@ -1379,14 +1380,26 @@ async def private_message(
             if not await asyncio.to_thread(personal_lifecycle.has_memory_consent, user_id):
                 await message.reply_text("Обработка приостановлена: согласие на личный диалог отозвано.")
                 return
-            answer, provider = await asyncio.to_thread(
-                request_personal_ai,
-                question,
-                history,
-                memory_prompt,
-                mode,
-                request_gemini,
+            controlled_ack = (
+                memory_check.get("reply_mode") == "brief_ack"
+                and memory_check.get("history_statement_scope") == "current_assertion"
+                and memory_check.get("history_planner_provider") in ("Gemini", "Groq")
+                and not memory_check.get("history_planner_error")
             )
+            if controlled_ack:
+                # Semantic intent is interpreted by the shared planner. The app
+                # controls this narrow reaction; no generated echo or follow-up.
+                answer = "Хорошо, понял."
+                provider = memory_check["history_planner_provider"]
+            else:
+                answer, provider = await asyncio.to_thread(
+                    request_personal_ai,
+                    question,
+                    history,
+                    memory_prompt,
+                    mode,
+                    request_gemini,
+                )
             answer_created_at = datetime.now(timezone.utc)
             # A request already in flight may outlive the stored consent.
             if not await asyncio.to_thread(
@@ -1398,7 +1411,7 @@ async def private_message(
                 )
                 return
 
-            memory_check["answer_provider"] = provider
+            memory_check["answer_provider"] = "приложение" if controlled_ack else provider
             try:
                 if memory_check.get('history_statement_scope') in ('historical_reference','question','ambiguous'):
                     saved_facts = 0
@@ -1418,6 +1431,10 @@ async def private_message(
             except Exception as error:
                 logger.exception("Automatic memory extraction failed")
                 memory_check.update(write_status="ошибка", write_error=type(error).__name__)
+            # Extraction can outlive consent as well as answer generation.
+            if not await asyncio.to_thread(personal_lifecycle.has_memory_consent, user_id):
+                await message.reply_text("Обработка приостановлена: согласие на личный диалог отозвано.")
+                return
             from memory.ai_contract import finalize_memory_answer
             answer = finalize_memory_answer(answer, memory_check)
             append_dialog_record(
@@ -1434,9 +1451,12 @@ async def private_message(
             except Exception:
                 logger.exception("Cannot save memory diagnostic")
             if context.application.bot_data.get("test_show_provider"):
-                model = (GEMINI_MODEL if provider == "Gemini"
-                         else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
-                answer += f"\n\n[Тест: {provider} · {model}]"
+                if controlled_ack:
+                    answer += "\n\n[Тест: краткая реакция приложения]"
+                else:
+                    model = (GEMINI_MODEL if provider == "Gemini"
+                             else os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
+                    answer += f"\n\n[Тест: {provider} · {model}]"
             await send_long_message(
                 message,
                 answer
@@ -1761,7 +1781,8 @@ def read_historical_memory_prompt(user_id, question, history, active_context, mo
         plan = parse_search_plan(json.dumps(plan, ensure_ascii=False))
         if diagnostics is not None:
             diagnostics.update(history_planner_provider=provider, history_search_status="не требуется",
-                               history_statement_scope=plan["statement_scope"])
+                               history_statement_scope=plan["statement_scope"],
+                               reply_mode=plan["reply_mode"])
     except Exception as error:
         if diagnostics is not None:
             diagnostics.update(history_planner_error=type(error).__name__, history_search_status="резервный поиск")

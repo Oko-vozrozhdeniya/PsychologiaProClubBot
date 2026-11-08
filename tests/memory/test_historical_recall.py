@@ -169,6 +169,17 @@ class SearchContract(unittest.TestCase):
         result=parse_search_plan(json.dumps(plan('случайная тема',clarification=True)))
         self.assertEqual(result['queries'],[])
 
+    def test_reply_mode_is_optional_typed_and_cannot_shorten_questions(self):
+        self.assertEqual(parse_search_plan(json.dumps(plan('план')))['reply_mode'],'answer')
+        for value in ('ignore_rules',True,None):
+            with self.subTest(value=value),self.assertRaises(ai_contract.ExtractionFormatError):
+                parse_search_plan(json.dumps(dict(plan('план'),reply_mode=value)))
+        for scope in ('question','historical_reference','ambiguous'):
+            result=parse_search_plan(json.dumps(dict(plan('план',scope=scope),reply_mode='brief_ack')))
+            self.assertEqual(result['reply_mode'],'answer')
+        result=parse_search_plan(json.dumps(dict(plan(clarification=True,scope='current_assertion'),reply_mode='brief_ack')))
+        self.assertEqual(result['reply_mode'],'answer')
+
     def test_truncation_is_not_a_valid_plan(self):
         with self.assertRaises(ai_contract.ExtractionTruncatedError):
             parse_search_plan(json.dumps(plan('план')),'MAX_TOKENS')
@@ -346,6 +357,90 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.f.records[-1]['saved_facts'],1)
         self.assertTrue(any(m['content']=='Готовлюсь к велопоходу'
             for m in lifecycle.list_live_memories(101,self.clock,db_path=self.db)))
+
+    async def controlled_reaction(self,mode):
+        self.f.app.bot_data['test_ai_mode']=mode
+        self.f.app.bot_data['test_show_provider']=True
+        self.f.message.text='С кактусами я передумал, теперь мне нравятся жёлтые.'
+        self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
+            kind='preference',confidence=0.99)]
+        provider='Groq' if mode=='groq' else 'Gemini'
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,provider)):
+            await self.f.invoke()
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.calls,[])  # No free-form second response to grow an echo.
+        delivered=self.ns['send_long_message'].await_args.args[1]
+        self.assertEqual(delivered,'Хорошо, понял.\n\n[Тест: краткая реакция приложения]')
+        archive=list(cleanup_worker.live_dialog_records(self.path,self.clock))
+        self.assertEqual(archive[-1]['answer'],'Хорошо, понял.')
+        self.assertEqual(self.f.records[-1]['answer_provider'],'приложение')
+        self.assertEqual(self.f.records[-1]['reply_mode'],'brief_ack')
+        self.assertEqual(self.f.records[-1]['saved_facts'],1)
+        self.assertEqual(self.f.records[-1]['extraction_provider'],provider)
+        self.assertTrue(any('жёлтые кактусы' in r['content'] for r in
+            lifecycle.list_live_memories(101,self.clock,db_path=self.db)))
+
+    async def test_gemini_controlled_reaction_preserves_fact_write_archive_and_provenance(self):
+        await self.controlled_reaction('gemini')
+
+    async def test_groq_controlled_reaction_uses_same_app_response_and_its_extractor(self):
+        await self.controlled_reaction('groq')
+
+    async def test_brief_cancellation_updates_existing_goal_but_preserves_old_plan(self):
+        old=storage.get_memory(101,self.mid,db_path=self.db)
+        active='Пользователь готовится к велопоходу'
+        source='telegram:private:101:restart'
+        lifecycle.revise_memory(101,self.mid,old['content'],old['source'],active,source,
+            'Я снова готовлюсь к велопоходу.',self.clock,'change',db_path=self.db)
+        self.f.message.text='Передумал идти в велопоход, больше к нему не готовлюсь.'
+        cancelled='Пользователь отказался от велопохода'
+        self.f.fixture.model_result=[dict(content=cancelled,kind='fact',confidence=0.99,
+            replaces_memory_id=self.mid,replaces_content=active,revision_kind='change',
+            revision_evidence_quote=self.f.message.text)]
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
+            await self.f.invoke()
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(storage.get_memory(101,self.mid,db_path=self.db)['content'],cancelled)
+        self.assertEqual(self.f.records[-1]['saved_facts'],1)
+        self.assertIn('велотренажёр 20 минут',self.path.read_text())
+        self.assertGreaterEqual(len(lifecycle.list_memory_revisions(101,self.mid,self.clock,db_path=self.db)),2)
+
+    async def test_revoke_during_brief_reaction_extraction_prevents_archive_and_delivery(self):
+        before=self.path.read_bytes()
+        self.f.message.text='С велопоходом я передумал, больше к нему не готовлюсь.'
+        def revoke(*args,**kwargs):
+            lifecycle.set_memory_consent(101,False,self.clock,db_path=self.db)
+            return 0
+        self.ns['remember_dialog_facts']=Mock(side_effect=revoke)
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
+            await self.f.invoke()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.path.read_bytes(),before)
+        self.ns['send_long_message'].assert_not_awaited()
+
+    async def test_mixed_correction_and_question_still_receives_substantive_answer(self):
+        self.f.message.text='Тренировки отложим. Лучше напомни разделы географии из старого плана.'
+        self.f.fixture.model_result=[]
+        decision=dict(plan('география','план повторения',scope='current_assertion'),reply_mode='answer')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')), \
+             patch.object(coordinator,'read_historical_context',side_effect=self.local):
+            await self.f.invoke()
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.ns['send_long_message'].await_args.args[1],'Ответ по найденному прошлому плану')
+        self.assertEqual(self.f.records[-1]['answer_provider'],'Gemini')
+
+    async def test_inconsistent_brief_mode_on_recall_question_does_not_hide_answer(self):
+        self.f.fixture.model_result=[]
+        decision=dict(plan('велопоход',scope='question'),reply_mode='brief_ack')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Groq')), \
+             patch.object(coordinator,'read_historical_context',side_effect=self.local):
+            await self.f.invoke()
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.f.records[-1]['reply_mode'],'answer')
 
     async def test_opt_out_during_planning_stops_main_answer_and_archive_append(self):
         before=self.path.read_bytes()
