@@ -182,12 +182,24 @@ class SearchContract(unittest.TestCase):
         self.assertEqual(result['reply_mode'],'answer')
 
     def test_farewell_mode_needs_social_or_current_scope_and_no_history_request(self):
-        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close')
+        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close',closing_evidence=['Закончим разговор.'])
         self.assertEqual(parse_search_plan(json.dumps(closing))['reply_mode'],'brief_close')
         for changed in (dict(closing,queries=['план']),dict(closing,needs_clarification=True),
                         dict(closing,search_history=True,queries=['план'])):
             self.assertEqual(parse_search_plan(json.dumps(changed))['reply_mode'],'answer')
         self.assertEqual(parse_search_plan(json.dumps(dict(closing,reply_mode='brief_continue')))['reply_mode'],'answer')
+
+    def test_closure_without_grounded_user_evidence_becomes_clarification(self):
+        base=dict(plan(search=False,scope='social'),reply_mode='brief_close')
+        for evidence in ([],['Выдуманная цитата'],['До свидания']):
+            with self.subTest(evidence=evidence):
+                result=parse_search_plan(json.dumps(dict(base,closing_evidence=evidence)),
+                    user_messages=['На сегодня достаточно.'])
+                self.assertEqual(result['reply_mode'],'brief_clarify')
+                self.assertEqual(result['statement_scope'],'ambiguous')
+        result=parse_search_plan(json.dumps(dict(base,closing_evidence=['Пора заканчивать разговор'])),
+            user_messages=['Пора заканчивать разговор, мне нужно уходить.'])
+        self.assertEqual(result['reply_mode'],'brief_close')
 
     def test_truncation_is_not_a_valid_plan(self):
         with self.assertRaises(ai_contract.ExtractionTruncatedError):
@@ -223,6 +235,21 @@ class SearchContract(unittest.TestCase):
                 '', 'auto',gemini_key='fake',gemini_model='test')
         self.assertEqual(provider,'Groq');self.assertTrue(result['search_history'])
         self.assertEqual(groq.call_args.kwargs['response_task'],'search')
+
+    def test_each_planner_checks_closing_evidence_against_user_not_assistant(self):
+        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close',
+            closing_evidence=['Мне пора заканчивать общение'])
+        for provider in ('Gemini','Groq'):
+            for role in ('user','model'):
+                history=[{'role':role,'parts':[{'text':'Мне пора заканчивать общение, скоро ухожу.'}]}]
+                text=json.dumps(closing)
+                body=self.response(provider,text)
+                with self.subTest(provider=provider,role=role), patch.object(
+                        ai_providers,'request_groq',return_value=text), patch.object(
+                        ai_providers.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(body).encode())):
+                    result,_=ai_providers.request_memory_search('Спасибо.',history,'',provider.lower(),
+                        gemini_key='fake',gemini_model='test')
+                self.assertEqual(result['reply_mode'],'brief_close' if role=='user' else 'brief_clarify')
 
     def test_planner_gets_bounded_recent_context_not_full_archive(self):
         h=[{'role':'user','parts':[{'text':'ANCHOR '+'x'*4000}]}]*30
@@ -462,14 +489,25 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         # Planner output is stubbed: this checks routing, not live semantic quality.
         self.f.message.text='На сегодня мне достаточно, спасибо.'
         self.generated_reply='Рад, что разобрались. Есть что-то ещё, что хочется обсудить?'
-        decision=dict(plan(search=False,scope='ambiguous'),reply_mode='answer')
+        decision=dict(plan(search=False,scope='ambiguous'),reply_mode='brief_clarify')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
         self.assertEqual(self.ns['send_long_message'].await_args.args[1],self.generated_reply)
-        self.assertEqual(self.reply_options[-1],{})
-        self.assertEqual(self.f.records[-1]['reply_mode'],'answer')
+        self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_clarify'})
+        self.assertEqual(self.f.records[-1]['reply_mode'],'brief_clarify')
         self.assertEqual(self.f.records[-1]['answer_provider'],'Gemini')
+
+    async def test_application_rechecks_ungrounded_closure_from_adapter(self):
+        self.f.message.text='Благодарю, я устал от этого.'
+        self.generated_reply='От чего именно вы устали?'
+        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close',
+            closing_evidence=['Я заканчиваю разговор'])
+        with patch.object(ai_providers,'request_memory_search',return_value=(closing,'Gemini')):
+            await self.f.invoke()
+        self.assertEqual(self.reply_options[-1],{'reply_mode':'brief_clarify'})
+        self.assertEqual(self.f.records[-1]['history_statement_scope'],'ambiguous')
+        self.assertEqual(self.ns['send_long_message'].await_args.args[1],self.generated_reply)
 
     async def social_farewell(self,mode):
         self.f.app.bot_data['test_ai_mode']=mode
@@ -477,7 +515,7 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.generated_reply='Тогда до следующей встречи.'
         # A pure social turn cannot become a new goal even if extraction would
         # otherwise offer one. Only an actual assertion keeps the write path.
-        decision=dict(plan(search=False,scope='social'),reply_mode='brief_close')
+        decision=dict(plan(search=False,scope='social'),reply_mode='brief_close',closing_evidence=['на сегодня закончим разговор'])
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,
                 'Groq' if mode=='groq' else 'Gemini')):
             await self.f.invoke()
@@ -504,7 +542,7 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.generated_reply='До скорого, спасибо за беседу.'
         self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
             kind='preference',confidence=0.99)]
-        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_close')
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_close',closing_evidence=['На этом закончим, пока.'])
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()

@@ -37,7 +37,7 @@ class AIContractTests(unittest.TestCase):
 
     def test_both_providers_generate_own_words_under_identical_contextual_rules(self):
         generated='Выберем, что сейчас важнее. Что хочется обсудить?'
-        for mode in ('brief_continue','brief_ack','brief_close'):
+        for mode in ('brief_continue','brief_ack','brief_close','brief_clarify'):
             body={'candidates':[{'content':{'parts':[{'text':generated}]}}]}
             with self.subTest(mode=mode), patch.object(self.bot.ns['urllib'].request,'urlopen',
                     return_value=io.BytesIO(json.dumps(body).encode())) as fetch:

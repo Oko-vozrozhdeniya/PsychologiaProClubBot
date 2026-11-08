@@ -217,9 +217,10 @@ def request_memory_search(question, history, active_context, mode, *, gemini_key
     prompt=json.dumps({'question':question[:6000], 'recent':recent,
                        'active_context':active_context[:6000]},ensure_ascii=False)
     instruction=instructions_for('search')
+    user_messages=[question]+[item['text'] for item in recent if item['role']=='user']
     def groq():
         text=request_groq(prompt,system_instruction=instruction,response_task='search')
-        return parse_search_plan(text),'Groq'
+        return parse_search_plan(text,user_messages=user_messages),'Groq'
     if mode=='groq':
         return groq()
     try:
@@ -236,7 +237,7 @@ def request_memory_search(question, history, active_context, mode, *, gemini_key
             data=json.loads(response.read(131072).decode())
         candidate=data['candidates'][0]
         text=''.join(p.get('text','') for p in candidate['content']['parts'] if isinstance(p,dict))
-        return parse_search_plan(text,candidate.get('finishReason')),'Gemini'
+        return parse_search_plan(text,candidate.get('finishReason'),user_messages=user_messages),'Gemini'
     except Exception:
         if mode!='auto':
             raise

@@ -1772,7 +1772,11 @@ def read_historical_memory_prompt(user_id, question, history, active_context, mo
         plan, provider = request_memory_search(question, history, active_context, mode,
             gemini_key=GEMINI_API_KEY, gemini_model=GEMINI_MODEL)
         # Validate again at the application boundary, including test/custom adapters.
-        plan = parse_search_plan(json.dumps(plan, ensure_ascii=False))
+        plan = parse_search_plan(json.dumps(plan, ensure_ascii=False),
+            user_messages=[question]+[part['text'] for item in (history or [])
+                if isinstance(item,dict) and item.get('role')=='user'
+                for part in item.get('parts',[])
+                if isinstance(part,dict) and isinstance(part.get('text'),str)])
         if diagnostics is not None:
             diagnostics.update(history_planner_provider=provider, history_search_status="не требуется",
                                history_statement_scope=plan["statement_scope"],
