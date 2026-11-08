@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 from tools import dialogue_lab as lab
@@ -40,6 +41,31 @@ class DialogueLabTests(unittest.TestCase):
             self.assertEqual(lab.main([]), 0)
             self.assertEqual(lab.main(['--live']), 2)
             run.assert_not_called()
+
+    def test_candidate_schema_reaches_native_groq_and_gemini_clients(self):
+        observation=self.observation(unresolved_reference=True, candidates=['topic','conversation'],
+            closure_act='inferred', evidence=[])
+        value=json.dumps(observation)
+        for provider in ('groq','gemini'):
+            body=({'choices':[{'message':{'content':value},'finish_reason':'stop'}]}
+                if provider=='groq' else {'candidates':[{'content':{'parts':[{'text':value}]}}]})
+            details={}
+            with self.subTest(provider=provider), patch.dict(os.environ,{'GROQ_API_KEY':'FAKE'}), \
+                    patch('urllib.request.urlopen',return_value=io.BytesIO(json.dumps(body).encode())) as fetch:
+                action=lab.run_case('candidate',lab.CASES[0],provider,'FAKE','test',details=details)
+            self.assertEqual(action,'clarify')
+            self.assertEqual(fetch.call_count,1)
+            self.assertTrue(details['unresolved_reference'])
+            self.assertEqual(details['candidates'],['topic','conversation'])
+            self.assertNotIn('evidence',details)
+
+    def test_native_groq_default_search_still_rejects_other_contract(self):
+        from memory.ai_providers import request_groq
+        body={'choices':[{'message':{'content':json.dumps(self.observation())},'finish_reason':'stop'}]}
+        with patch.dict(os.environ,{'GROQ_API_KEY':'FAKE'}),patch('urllib.request.urlopen',
+                return_value=io.BytesIO(json.dumps(body).encode())):
+            with self.assertRaises(ExtractionFormatError):
+                request_groq('synthetic',system_instruction='JSON',response_task='search')
 
     def test_report_keeps_baseline_candidate_and_errors_distinct(self):
         def fake(policy, case, *args):

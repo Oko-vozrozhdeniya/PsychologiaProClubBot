@@ -99,15 +99,19 @@ CASES = [
 ]
 
 
-def run_case(policy, case, provider, key, model):
+def run_case(policy, case, provider, key, model, *, details=None):
     _, question, recent, _ = case
     if policy == 'current':
         p, _ = request_memory_search(question, recent, '', provider,
                                      gemini_key=key, gemini_model=model)
         mode = p['reply_mode']
+        if details is not None:
+            details.update(initial_mode=mode)
         if mode == 'brief_close':
             target, _ = request_closure_review(question, recent, provider,
                                                gemini_key=key, gemini_model=model)
+            if details is not None:
+                details.update(review_target=target)
             mode = ('brief_close' if target == 'conversation' else
                     'brief_clarify' if target == 'unclear' else 'answer')
         return {'brief_close': 'close', 'brief_clarify': 'clarify'}.get(mode, 'answer')
@@ -116,6 +120,8 @@ def run_case(policy, case, provider, key, model):
         json.dumps({'question': question, 'recent': recent}, ensure_ascii=False), INSTRUCTION,
         provider, lambda text, finish=None: parse_observations(text, finish, messages=messages),
         gemini_key=key, gemini_model=model)
+    if details is not None:
+        details.update({k: result[k] for k in ("unresolved_reference", "candidates", "closure_act", "new_request")})
     return choose_action(result)
 
 

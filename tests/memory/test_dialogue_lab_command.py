@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import os
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -15,7 +16,7 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         selected = [n for n in tree.body if isinstance(n, ast.AsyncFunctionDef)
                     and n.name in ('dialogue_lab_command','run_dialogue_lab')]
         self.sent = AsyncMock()
-        self.ns = dict(asyncio=asyncio, os=os, Update=object,
+        self.ns = dict(asyncio=asyncio, os=os, json=json, Update=object,
             ContextTypes=SimpleNamespace(DEFAULT_TYPE=object), GEMINI_API_KEY='FAKE GEMINI',
             GEMINI_MODEL='test', is_owner=lambda u:u.effective_user.id==1,
             send_long_message=self.sent)
@@ -42,7 +43,7 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.jobs,[])
 
     async def test_background_run_is_bounded_rejects_duplicate_and_preserves_mode(self):
-        with patch.object(lab,'run_case',side_effect=lambda p,c,*a:c[3]) as run:
+        with patch.object(lab,'run_case',side_effect=lambda p,c,*a,**kw:c[3]) as run:
             await self.ns['dialogue_lab_command'](self.update,self.context)
             await self.ns['dialogue_lab_command'](self.update,self.context)
             self.assertEqual(len(self.jobs),1)
@@ -64,6 +65,14 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('RuntimeError',text)
         self.assertNotIn('SECRET RAW ERROR',text)
         self.assertNotIn('dialogue_lab_running',self.app.bot_data)
+
+    async def test_groq_short_run_makes_only_four_candidate_calls(self):
+        self.context.args=['groq']
+        with patch.object(lab,'run_case',side_effect=lambda p,c,*a,**kw:c[3]) as run:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        self.assertEqual(run.call_count,4)
+        self.assertTrue(all(c.args[0]=='candidate' and c.args[2]=='groq' for c in run.call_args_list))
 
     async def test_cancellation_clears_flag(self):
         async def cancelled(*a,**k):

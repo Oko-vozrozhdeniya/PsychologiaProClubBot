@@ -71,7 +71,7 @@ def _describe_groq_http_error(error):
 
 
 def request_groq(question, history=None, personal_memory_context=None, *,
-                 system_instruction=None, response_task="extraction", reply_mode="answer"):
+                 system_instruction=None, response_task="extraction", reply_mode="answer", structured_parser=None):
     """Make one explicit, bounded Groq chat request. No secret/body logging."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
     model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL).strip()
@@ -132,7 +132,9 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         result_choice = result["choices"][0]
         choice = result_choice["message"]["content"]
         if system_instruction is not None:
-            if response_task == "search":
+            if structured_parser is not None:
+                structured_parser(choice, result_choice.get("finish_reason"))
+            elif response_task == "search":
                 from memory.ai_contract import parse_search_plan
                 parse_search_plan(choice, result_choice.get("finish_reason"))
             elif response_task == "closure_review":
@@ -250,7 +252,7 @@ def _request_semantic_json(prompt,instruction,mode,parser,*,gemini_key,gemini_mo
     if mode not in ('auto','gemini','groq'):
         raise ValueError('Invalid AI mode')
     def groq():
-        text=request_groq(prompt,system_instruction=instruction,response_task=response_task)
+        text=request_groq(prompt,system_instruction=instruction,response_task=response_task,structured_parser=parser)
         return parser(text),'Groq'
     if mode=='groq':
         return groq()
