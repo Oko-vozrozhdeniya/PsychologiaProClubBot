@@ -175,10 +175,48 @@ class SearchContract(unittest.TestCase):
             with self.subTest(value=value),self.assertRaises(ai_contract.ExtractionFormatError):
                 parse_search_plan(json.dumps(dict(plan('план'),reply_mode=value)))
         for scope in ('question','historical_reference','ambiguous'):
-            result=parse_search_plan(json.dumps(dict(plan('план',scope=scope),reply_mode='brief_ack')))
-            self.assertEqual(result['reply_mode'],'answer')
+            for mode in ('brief_ack','brief_continue','brief_close'):
+                result=parse_search_plan(json.dumps(dict(plan('план',scope=scope),reply_mode=mode)))
+                self.assertEqual(result['reply_mode'],'answer')
         result=parse_search_plan(json.dumps(dict(plan(clarification=True,scope='current_assertion'),reply_mode='brief_ack')))
         self.assertEqual(result['reply_mode'],'answer')
+
+    def test_farewell_mode_needs_social_or_current_scope_and_no_history_request(self):
+        closing=dict(plan(search=False,scope='social'),reply_mode='brief_close')
+        self.assertEqual(parse_search_plan(json.dumps(closing))['reply_mode'],'brief_close')
+        for changed in (dict(closing,queries=['план']),dict(closing,needs_clarification=True),
+                        dict(closing,search_history=True,queries=['план'])):
+            self.assertEqual(parse_search_plan(json.dumps(changed))['reply_mode'],'answer')
+        self.assertEqual(parse_search_plan(json.dumps(dict(closing,reply_mode='brief_continue')))['reply_mode'],'answer')
+
+    def test_continuation_variants_rotate_with_one_question_and_bounded_length(self):
+        history=[];seen=[]
+        for _ in range(12):
+            reply=ai_contract.make_brief_reply('brief_continue',history)
+            self.assertLessEqual(len(reply),80)
+            self.assertEqual(reply.count('?'),1)
+            self.assertNotIn('\n',reply)
+            if seen:self.assertNotEqual(reply,seen[-1])
+            seen.append(reply)
+            history.extend([{'role':'model','parts':[{'text':reply}]},
+                            {'role':'model','parts':[{'text':'Другой содержательный ответ.'}]}])
+        self.assertGreaterEqual(len(set(seen)),4)
+
+    def test_farewell_variants_have_no_continuation_question_and_change(self):
+        history=[];seen=[]
+        for _ in range(8):
+            reply=ai_contract.make_brief_reply('brief_close',history)
+            self.assertNotIn('?',reply)
+            self.assertLessEqual(len(reply),80)
+            if seen:self.assertNotEqual(reply,seen[-1])
+            seen.append(reply)
+            history.append({'role':'model','parts':[{'text':reply}]})
+        self.assertGreaterEqual(len(set(seen)),4)
+
+    def test_user_text_does_not_count_as_previous_bot_variant(self):
+        first=ai_contract.make_brief_reply('brief_continue')
+        self.assertEqual(ai_contract.make_brief_reply('brief_continue',[
+            {'role':'user','parts':[{'text':first}]}]),first)
 
     def test_truncation_is_not_a_valid_plan(self):
         with self.assertRaises(ai_contract.ExtractionTruncatedError):
@@ -365,17 +403,17 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
             kind='preference',confidence=0.99)]
         provider='Groq' if mode=='groq' else 'Gemini'
-        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_continue')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,provider)):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
         self.assertEqual(self.calls,[])  # No free-form second response to grow an echo.
         delivered=self.ns['send_long_message'].await_args.args[1]
-        self.assertEqual(delivered,'Хорошо, понял.\n\n[Тест: краткая реакция приложения]')
+        self.assertEqual(delivered,'Хорошо, понял. О чём поговорим теперь?\n\n[Тест: краткая реакция приложения]')
         archive=list(cleanup_worker.live_dialog_records(self.path,self.clock))
-        self.assertEqual(archive[-1]['answer'],'Хорошо, понял.')
+        self.assertEqual(archive[-1]['answer'],'Хорошо, понял. О чём поговорим теперь?')
         self.assertEqual(self.f.records[-1]['answer_provider'],'приложение')
-        self.assertEqual(self.f.records[-1]['reply_mode'],'brief_ack')
+        self.assertEqual(self.f.records[-1]['reply_mode'],'brief_continue')
         self.assertEqual(self.f.records[-1]['saved_facts'],1)
         self.assertEqual(self.f.records[-1]['extraction_provider'],provider)
         self.assertTrue(any('жёлтые кактусы' in r['content'] for r in
@@ -398,7 +436,7 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.f.fixture.model_result=[dict(content=cancelled,kind='fact',confidence=0.99,
             replaces_memory_id=self.mid,replaces_content=active,revision_kind='change',
             revision_evidence_quote=self.f.message.text)]
-        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_ack')
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_continue')
         with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
             await self.f.invoke()
         self.ns['send_error_response'].assert_not_awaited()
@@ -421,6 +459,63 @@ class RealHandlerHistoryRecall(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls,[])
         self.assertEqual(self.path.read_bytes(),before)
         self.ns['send_long_message'].assert_not_awaited()
+
+    async def test_successive_corrections_vary_in_the_real_session(self):
+        self.f.fixture.model_result=[]
+        replies=[]
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_continue')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
+            for index,text in enumerate(('Поход отменяется.', 'Подготовку пока отложу.', 'Пока без поездок.')):
+                self.f.message.message_id=810+index
+                self.f.message.text=text
+                await self.f.invoke()
+                replies.append(self.ns['send_long_message'].await_args.args[1])
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.calls,[])
+        self.assertEqual(len(set(replies)),3)
+        for reply in replies:
+            self.assertEqual(reply.count('?'),1)
+            self.assertLessEqual(len(reply),80)
+
+    async def social_farewell(self,mode):
+        self.f.app.bot_data['test_ai_mode']=mode
+        self.f.message.text='На сегодня мне достаточно, спасибо.'
+        # A pure social turn cannot become a new goal even if extraction would
+        # otherwise offer one. Only an actual assertion keeps the write path.
+        decision=dict(plan(search=False,scope='social'),reply_mode='brief_close')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,
+                'Groq' if mode=='groq' else 'Gemini')):
+            await self.f.invoke()
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.calls,[])
+        reply=self.ns['send_long_message'].await_args.args[1]
+        self.assertEqual(reply,'Хорошо, до встречи!')
+        self.assertNotIn('?',reply)
+        self.assertEqual(self.f.records[-1]['reply_mode'],'brief_close')
+        self.assertEqual(self.f.records[-1]['answer_provider'],'приложение')
+        self.assertEqual(self.f.records[-1]['write_status'],'пропущено: завершение разговора без нового утверждения')
+        self.assertEqual(len(lifecycle.list_live_memories(101,self.clock,db_path=self.db)),1)
+        self.assertEqual(list(cleanup_worker.live_dialog_records(self.path,self.clock))[-1]['answer'],reply)
+
+    async def test_gemini_farewell_closes_without_question_or_new_memory(self):
+        await self.social_farewell('gemini')
+
+    async def test_groq_farewell_uses_the_same_closing_path(self):
+        await self.social_farewell('groq')
+
+    async def test_new_fact_before_farewell_is_still_saved(self):
+        self.f.message.text='Теперь мне нравятся жёлтые кактусы. На этом закончим, пока.'
+        self.f.fixture.model_result=[dict(content='Предпочитает выращивать жёлтые кактусы',
+            kind='preference',confidence=0.99)]
+        decision=dict(plan(search=False,scope='current_assertion'),reply_mode='brief_close')
+        with patch.object(ai_providers,'request_memory_search',return_value=(decision,'Gemini')):
+            await self.f.invoke()
+        self.ns['send_error_response'].assert_not_awaited()
+        self.assertEqual(self.calls,[])
+        self.assertNotIn('?',self.ns['send_long_message'].await_args.args[1])
+        self.assertEqual(self.f.records[-1]['saved_facts'],1)
+        self.assertTrue(any('жёлтые кактусы' in row['content'] for row in
+            lifecycle.list_live_memories(101,self.clock,db_path=self.db)))
 
     async def test_mixed_correction_and_question_still_receives_substantive_answer(self):
         self.f.message.text='Тренировки отложим. Лучше напомни разделы географии из старого плана.'

@@ -1380,16 +1380,17 @@ async def private_message(
             if not await asyncio.to_thread(personal_lifecycle.has_memory_consent, user_id):
                 await message.reply_text("Обработка приостановлена: согласие на личный диалог отозвано.")
                 return
-            controlled_ack = (
-                memory_check.get("reply_mode") == "brief_ack"
-                and memory_check.get("history_statement_scope") == "current_assertion"
+            controlled_brief = (
+                memory_check.get("reply_mode") in ("brief_ack", "brief_continue", "brief_close")
+                and memory_check.get("history_statement_scope") in ("current_assertion", "social")
                 and memory_check.get("history_planner_provider") in ("Gemini", "Groq")
                 and not memory_check.get("history_planner_error")
             )
-            if controlled_ack:
+            if controlled_brief:
                 # Semantic intent is interpreted by the shared planner. The app
-                # controls this narrow reaction; no generated echo or follow-up.
-                answer = "Хорошо, понял."
+                # controls length, one continuation question, or a closing reply.
+                from memory.ai_contract import make_brief_reply
+                answer = make_brief_reply(memory_check["reply_mode"], history)
                 provider = memory_check["history_planner_provider"]
             else:
                 answer, provider = await asyncio.to_thread(
@@ -1411,9 +1412,12 @@ async def private_message(
                 )
                 return
 
-            memory_check["answer_provider"] = "приложение" if controlled_ack else provider
+            memory_check["answer_provider"] = "приложение" if controlled_brief else provider
             try:
-                if memory_check.get('history_statement_scope') in ('historical_reference','question','ambiguous'):
+                if memory_check.get('history_statement_scope') == 'social':
+                    saved_facts = 0
+                    memory_check.update(write_status="пропущено: завершение разговора без нового утверждения")
+                elif memory_check.get('history_statement_scope') in ('historical_reference','question','ambiguous'):
                     saved_facts = 0
                     memory_check.update(write_status="пропущено: обращение к прошлому без нового утверждения")
                 else:
@@ -1451,7 +1455,7 @@ async def private_message(
             except Exception:
                 logger.exception("Cannot save memory diagnostic")
             if context.application.bot_data.get("test_show_provider"):
-                if controlled_ack:
+                if controlled_brief:
                     answer += "\n\n[Тест: краткая реакция приложения]"
                 else:
                     model = (GEMINI_MODEL if provider == "Gemini"
