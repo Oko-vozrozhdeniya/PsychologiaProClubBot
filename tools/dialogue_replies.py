@@ -48,17 +48,23 @@ def parse_reply(text, finish=None):
         raise ExtractionFormatError('Invalid reply envelope') from e
 
 
-def generate_reply(question, recent, mode):
+def generate_reply(question, recent, mode, *, minimal=False):
     # Same model, rules, JSON wrapper and generation settings for both arms.
     # The wrapper carries natural text only; there is no dialogue-action parser.
-    text=request_groq(question,recent,system_instruction=instructions_for('private',reply_mode=mode)+RULE+FORMAT,
+    if minimal and mode != 'answer':
+        raise ValueError('Minimal control cannot preassign a dialogue mode')
+    instruction=('Ты доброжелательный собеседник. Общайся на русском языке.' if minimal
+                 else instructions_for('private',reply_mode=mode))+RULE+FORMAT
+    text=request_groq(question,recent,system_instruction=instruction,
         structured_parser=parse_reply,response_schema=SCHEMA,model_override=MODEL,
         max_completion_tokens=4096,reasoning_effort='medium',response_task='search')
     return parse_reply(text)
 
 
-async def compare_replies(emit):
+async def compare_replies(emit, *, minimal=False):
     """Return a complete text report. No automatic semantic pass/fail judgement."""
+    if minimal:
+        return await compare_minimal(emit)
     calls=0
     last_end=None
     lines=[f'Natural replies / generator {MODEL}',
@@ -125,4 +131,43 @@ async def compare_replies(emit):
                   'Ветви продолжения проверяют именно уточнение только если предыдущий ответ действительно его содержал.',
                   'Рабочий диалог и модель не переключены.'])
     await emit(f'Сравнение завершено: {calls}/{MAX_CALLS} запросов. Полные ответы — в файле; автоматической оценки понимания нет.')
+    return '\n'.join(lines)
+
+
+async def compare_minimal(emit):
+    """Six calls only, same model/settings/history and ambiguity rule; short prefix.
+
+    Compare with the already collected full-instruction report; do not repeat
+    its 26 requests. No same-model judge or automatic production promotion.
+    """
+    cases=[('основные',c) for c in CASES[:4]]+[('повтор',c) for c in CASES[:2]]
+    limit=6
+    calls=0
+    lines=[f'Minimal instruction control / generator {MODEL}',
+           'Сокращён только набор системных инструкций. RULE, FORMAT, история, модель и параметры генерации сохранены.',
+           'Нет предварительного режима, поиска памяти, цитатного доказательства или классификатора ответа.',
+           'Это диагностический контроль, не готовая замена рабочих инструкций: правила приватности и памяти нельзя удалять из production.',
+           'Сопоставлять с ранее полученным dialogue-replies.txt; старый большой прогон повторять не нужно.']
+    for stage,case in cases:
+        ident,q,recent,expected=case
+        lines.extend(['',f'{stage} / {ident} / minimal',
+                      'Контекст: '+json.dumps(recent,ensure_ascii=False),
+                      'Пользователь: '+q,'Критерий проверки: '+EXPECTATIONS[expected]])
+        try:
+            if calls>=limit:
+                raise RuntimeError('Minimal request budget exhausted')
+            if calls:
+                await asyncio.sleep(15)
+            calls+=1
+            reply=await asyncio.to_thread(generate_reply,q,recent,'answer',minimal=True)
+            lines.append('Ответ модели: '+reply)
+            await emit(f'Короткая инструкция: {ident} / {stage}; {calls}/{limit} запросов.')
+        except Exception as error:
+            lines.append('ПРОГОН ОСТАНОВЛЕН: '+json.dumps(safe_error(error),ensure_ascii=False))
+            break
+    lines.extend(['',f'Завершено: {calls}/{limit} запросов.',
+                  'Нужна содержательная оценка ответов. Короткий контроль не доказывает устойчивость всех формулировок.',
+                  'При ограничении API полученные ответы сохранены; автоматических повторов нет.',
+                  'Рабочие инструкции, модель, личная память и диалог не изменены.'])
+    await emit(f'Короткий контроль завершён: {calls}/{limit} запросов. Ответы и возможная ошибка — в файле.')
     return '\n'.join(lines)

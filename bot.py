@@ -1480,13 +1480,14 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     app = context.application
     args = list(getattr(context, "args", []))
-    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"]):
-        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies")
+    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"], ["minimal"]):
+        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies, /dialogue_lab minimal")
         return
-    replies = args == ["replies"]
+    minimal = args == ["minimal"]
+    replies = args in (["replies"], ["minimal"])
     decomposed = args == ["context"]
     verify = args in (["verify"], ["context"])
-    quick = args in (["groq"], ["verify"], ["context"], ["replies"])
+    quick = args in (["groq"], ["verify"], ["context"], ["replies"], ["minimal"])
     if app.bot_data.get("dialogue_lab_running"):
         await update.effective_message.reply_text("Сравнение уже выполняется. Дождись отчёта.")
         return
@@ -1496,19 +1497,20 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Сравниваю реальные ответы с предварительным выбором режима и без него: до 28 последовательных запросов. Добавлю повторы и продолжение после уточнения. Полный отчёт пришлю файлом. "
+            ("Проверяю короткую инструкцию на тех же четырёх случаях и повторяю две неоднозначные реплики: до 6 запросов, с паузами. Полные ответы пришлю файлом. "
+             if minimal else "Сравниваю реальные ответы с предварительным выбором режима и без него: до 28 последовательных запросов. Добавлю повторы и продолжение после уточнения. Полный отчёт пришлю файлом. "
              if replies else "Проверяю раздельное восстановление предмета и намерения на GPT-OSS 120B: до 28 последовательных запросов, с повторными и дополнительными случаями. "
              if decomposed else "Проверяю строгий формат на GPT-OSS 20B и 120B: два повторных прогона и дополнительные случаи, не более 28 последовательных запросов. "
              if verify else "Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
              if quick else "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, не более 24 обращений к API. ")
             + "Личная память и переписка не используются. Результат пришлю сюда; настройки не изменятся.")
-        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies))
+        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies, minimal=minimal))
     except BaseException:
         app.bot_data.pop("dialogue_lab_running", None)
         raise
 
 
-async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False):
+async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False, minimal=False):
     """Background task: leave Telegram updates responsive during API requests."""
     actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
     titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
@@ -1521,9 +1523,9 @@ async def run_dialogue_lab(message, app, *, quick=False, verify=False, decompose
             import io
             async def emit(text):
                 await send_long_message(message,text)
-            report=await compare_replies(emit)
+            report=await compare_replies(emit,minimal=True) if minimal else await compare_replies(emit)
             await message.reply_document(document=io.BytesIO(report.encode('utf-8')),
-                                         filename='dialogue-replies.txt')
+                                         filename='dialogue-minimal.txt' if minimal else 'dialogue-replies.txt')
             return
         from tools.dialogue_lab import CASES, run_case, safe_error, verify_profiles
         if verify:

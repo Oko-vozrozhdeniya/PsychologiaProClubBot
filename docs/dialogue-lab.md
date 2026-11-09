@@ -200,3 +200,45 @@ After deployment the next acceptance command is `/dialogue_lab replies`, not a
 repeat of the unchanged action-classification commands. The owner can attach
 one text report instead of a sequence of screenshots. No live provider keys
 are available in this development workspace. Google Drive was not modified.
+
+## Minimal-instruction control after the real reply report
+
+The owner supplied the complete `dialogue-replies.txt` from PR 21. Eighteen
+responses were collected (four baseline, fourteen direct). Both ambiguous core
+inputs received endings in both direct rounds. Clear farewell and grounded
+context passed. Other problems included ending on "с меня хватит", no recovery
+from an assistant-initiated farewell, and an unnecessary question after an
+explicit pause. Thus removal of preclassification alone did not solve the issue.
+
+Call 26 failed with Groq HTTP 429, type tokens, code rate_limit_exceeded. Both
+follow-up branches have no result. This establishes a token rate-limit error
+for this request, not the cause of older HTTP 400 failures. Already collected
+responses remain evidence; repeating the 26-request run is unnecessary.
+
+A local audit found the full direct system instruction was 7615 characters and
+contained the uncertainty rule. No explicit instruction to end on fatigue was
+found. Length alone is not evidence of overload or causation.
+
+`/dialogue_lab minimal` now runs at most six calls: the same first four cases
+under a short general conversational prefix plus the exact existing RULE and
+FORMAT, then independent repeats of only the two ambiguous cases. Model 120B,
+native history, schema, token budget, temperature and reasoning settings are
+unchanged. No planner or reply-mode classification is called. The comparison
+changes the full BASE+PRIVATE instruction package, not merely its character
+count; do not attribute any difference to length alone. No evaluation examples
+or phrase catalogue were inserted into instructions.
+
+Calls are serial, 15 seconds apart after completion. Pacing and fewer inputs
+reduce load but cannot guarantee the account quota will permit the run. The
+first error stops without retry; any collected answers and safe error codes
+are returned in dialogue-minimal.txt. Semantic correctness is not auto-scored.
+Compare the six replies with the already collected full-instruction report.
+A successful short control is not a production policy: privacy and memory
+requirements must be preserved in any later integration, and broader acceptance
+remains necessary. The experiment does not alter ordinary instructions, active
+model, environment, history, consent, archive or memory. Google Drive unchanged.
+
+Next: after installing this diagnostic-only correction, run
+`/dialogue_lab minimal` once and provide its text report. No live results for
+this control are available in the development environment; keys remain only in
+the deployed container. Production conversation behavior is still unresolved.

@@ -70,3 +70,52 @@ class ReplyHarnessTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(r.asyncio,'to_thread',side_effect=asyncio.CancelledError):
             with self.assertRaises(asyncio.CancelledError):
                 await r.compare_replies(AsyncMock())
+
+class MinimalControlTests(unittest.TestCase):
+    def test_minimal_changes_instruction_package_only_in_native_payload(self):
+        payloads=[]
+        def fetch(req,**kwargs):
+            payloads.append(json.loads(req.data))
+            return io.BytesIO(json.dumps({'choices':[{'message':{'content':'{"reply":"Текст"}'},
+                                                     'finish_reason':'stop'}]}).encode())
+        with patch.dict(os.environ,{'GROQ_API_KEY':'FAKE'}),patch('urllib.request.urlopen',side_effect=fetch):
+            for minimal in (False,True):
+                r.generate_reply(r.CASES[3][1],r.CASES[3][2],'answer',minimal=minimal)
+        full,short=payloads
+        self.assertEqual(short['messages'][0]['content'],
+            'Ты доброжелательный собеседник. Общайся на русском языке.'+r.RULE+r.FORMAT)
+        self.assertLess(len(short['messages'][0]['content']),len(full['messages'][0]['content']))
+        for p in payloads:
+            p['messages'][0]['content']='SYSTEM_ONLY_DIFFERENCE'
+        self.assertEqual(full,short)
+        with self.assertRaises(ValueError):
+            r.generate_reply('text',[],'brief_close',minimal=True)
+
+class MinimalHarnessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_six_calls_repeat_ambiguity_only_without_planner_or_env_change(self):
+        with patch.object(r,'generate_reply',return_value='Сгенерированный ответ') as generate, \
+                patch.object(r,'request_memory_search') as planner, \
+                patch.object(r.asyncio,'sleep',new_callable=AsyncMock) as pause:
+            report=await r.compare_replies(AsyncMock(),minimal=True)
+        self.assertEqual(generate.call_count,6)
+        self.assertTrue(all(c.kwargs=={'minimal':True} and c.args[2]=='answer' for c in generate.call_args_list))
+        self.assertEqual([c.args[0] for c in generate.call_args_list],
+                         [c[1] for c in r.CASES[:4]]+[c[1] for c in r.CASES[:2]])
+        planner.assert_not_called()
+        self.assertEqual(pause.await_count,5)
+        self.assertTrue(all(c.args==(15,) for c in pause.await_args_list))
+        self.assertEqual(report.count('Ответ модели: Сгенерированный ответ'),6)
+        self.assertIn('6/6',report)
+        self.assertNotIn('4/4',report)
+
+    async def test_rate_limit_preserves_partial_report_and_does_not_retry(self):
+        from memory.ai_providers import GroqRequestError
+        with patch.object(r,'generate_reply',side_effect=['полученный ответ',
+                GroqRequestError(http_code=429,provider_type='tokens',provider_code='rate_limit_exceeded',reason='SECRET')]) as generate, \
+                patch.object(r.asyncio,'sleep',new_callable=AsyncMock):
+            report=await r.compare_replies(AsyncMock(),minimal=True)
+        self.assertEqual(generate.call_count,2)
+        self.assertIn('полученный ответ',report)
+        self.assertIn('2/6',report)
+        self.assertIn('rate_limit_exceeded',report)
+        self.assertNotIn('SECRET',report)

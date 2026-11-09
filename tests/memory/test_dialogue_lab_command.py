@@ -118,3 +118,15 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         kwargs=self.message.reply_document.await_args.kwargs
         self.assertEqual(kwargs['filename'],'dialogue-replies.txt')
         self.assertEqual(kwargs['document'].getvalue().decode(),'Полный отчёт')
+
+    async def test_minimal_control_is_owner_background_task_with_separate_report(self):
+        from tools import dialogue_replies as replies
+        self.context.args=['minimal']
+        self.ns['GEMINI_API_KEY']=''
+        self.message.reply_document=AsyncMock()
+        with patch.object(replies,'compare_replies',new_callable=AsyncMock,return_value='Короткий отчёт') as compare:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        self.assertTrue(compare.await_args.kwargs['minimal'])
+        self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-minimal.txt')
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
