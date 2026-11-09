@@ -82,3 +82,15 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.jobs.pop()
         self.assertNotIn('dialogue_lab_running',self.app.bot_data)
+
+
+    async def test_verification_runs_in_background_without_gemini_and_always_clears_flag(self):
+        self.context.args=['verify']
+        self.ns['GEMINI_API_KEY']=''
+        with patch.object(lab,'verify_profiles',new_callable=AsyncMock) as verify:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            self.assertEqual(len(self.jobs),1)
+            await self.jobs.pop()
+        verify.assert_awaited_once()
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+        self.assertIn('28',str(self.message.reply_text.await_args_list))

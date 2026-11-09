@@ -20,22 +20,24 @@ GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b"
 
 class GroqRequestError(Exception):
     def __init__(self, error_type="general", http_code=None, reason="Ошибка Groq",
-                 request_stats=None):
+                 request_stats=None, *, provider_type=None, provider_code=None):
         super().__init__(error_type)
         self.error_type = error_type
         self.http_code = http_code
         self.reason = reason
         self.request_stats = request_stats or {}
+        self.provider_type = provider_type
+        self.provider_code = provider_code
 
 
-def _describe_groq_http_error(error):
+def _describe_groq_http_error(error, *, details=None):
     """Safely classify provider failure without exposing raw bodies or secrets.
 
     Only allowlisted-shaped machine codes and semantic classifications are
     reported. Never forward remote error messages into Telegram or log files.
     """
     try:
-        raw = error.read(4096)
+        raw = error.read(65536)
         parsed = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError, UnicodeError, TypeError, AttributeError):
         return "Ответ об ошибке не является JSON; возможна блокировка на сетевом уровне"
@@ -51,6 +53,9 @@ def _describe_groq_http_error(error):
     safe_code = (err_code if isinstance(err_code, str) and
                  re.fullmatch(r"[a-z0-9_]{1,80}", err_code)
                  else "не указан")
+    if details is not None:
+        details.update(provider_type=None if safe_type == "не указан" else safe_type,
+                       provider_code=None if safe_code == "не указан" else safe_code)
     description = "Причина требует дополнительной проверки"
     raw_msg = message.lower() if isinstance(message, str) else ""
     if safe_code == "model_permission_blocked_org":
@@ -71,10 +76,16 @@ def _describe_groq_http_error(error):
 
 
 def request_groq(question, history=None, personal_memory_context=None, *,
-                 system_instruction=None, response_task="extraction", reply_mode="answer", structured_parser=None):
+                 system_instruction=None, response_task="extraction", reply_mode="answer", structured_parser=None,
+                 model_override=None, response_schema=None, max_completion_tokens=None,
+                 reasoning_effort=None):
     """Make one explicit, bounded Groq chat request. No secret/body logging."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
-    model = os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL).strip()
+    model = (model_override if model_override is not None else
+             os.environ.get("GROQ_MODEL", GROQ_DEFAULT_MODEL))
+    if not isinstance(model, str):
+        raise GroqRequestError(reason="Некорректная модель Groq")
+    model = model.strip()
     if not key:
         raise GroqRequestError(reason="Отсутствует GROQ_API_KEY")
     if not model or len(model) > 80 or any(
@@ -87,6 +98,17 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         not isinstance(system_instruction, str) or not system_instruction.strip()
     ):
         raise GroqRequestError(reason="Некорректная инструкция запроса")
+    overrides = any(v is not None for v in
+                    (model_override, response_schema, max_completion_tokens, reasoning_effort))
+    if overrides and (system_instruction is None or structured_parser is None):
+        raise ValueError("Structured overrides require an explicit instruction and parser")
+    if response_schema is not None and not isinstance(response_schema, dict):
+        raise ValueError("Invalid response schema")
+    if max_completion_tokens is not None and (type(max_completion_tokens) is not int
+                                              or not 1 <= max_completion_tokens <= 4096):
+        raise ValueError("Invalid structured token budget")
+    if reasoning_effort is not None and reasoning_effort not in ("low", "medium", "high"):
+        raise ValueError("Invalid reasoning effort")
     if personal_memory_context:
         question = append_private_memory(question, personal_memory_context)
     instructions = system_instruction if system_instruction is not None else instructions_for("private", reply_mode=reply_mode)
@@ -105,13 +127,21 @@ def request_groq(question, history=None, personal_memory_context=None, *,
             messages.append({"role": ("assistant" if item["role"] == "model" else "user"),
                              "content": text})
     messages.append({"role": "user", "content": question})
-    payload = json.dumps({
+    payload_options = {
         "model": model, "messages": messages, "max_completion_tokens": 1200,
         "stream": False,
         **((search_settings("Groq")
             if response_task in ("search","closure_review") else extraction_settings("Groq"))
            if system_instruction is not None else {}),
-    }, ensure_ascii=False).encode("utf-8")
+    }
+    if response_schema is not None:
+        payload_options["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "semantic_observations", "strict": True, "schema": response_schema}}
+    if max_completion_tokens is not None:
+        payload_options["max_completion_tokens"] = max_completion_tokens
+    if reasoning_effort is not None:
+        payload_options.update(reasoning_effort=reasoning_effort, include_reasoning=False)
+    payload = json.dumps(payload_options, ensure_ascii=False).encode("utf-8")
     stats = {
         "request_bytes": len(payload),
         "history_messages": len(messages) - 2,
@@ -152,10 +182,11 @@ def request_groq(question, history=None, personal_memory_context=None, *,
         category = ("rate_limit" if code == 429 else
                     "unavailable" if code in (500, 502, 503, 504) else
                     "general")
-        reason = f"Groq HTTP {code}; {_describe_groq_http_error(error)}"
+        details = {}
+        reason = f"Groq HTTP {code}; {_describe_groq_http_error(error, details=details)}"
         raise GroqRequestError(
             category, http_code=code, reason=reason,
-            request_stats=stats
+            request_stats=stats, **details
         ) from error
     except (socket.timeout, TimeoutError) as error:
         raise GroqRequestError(

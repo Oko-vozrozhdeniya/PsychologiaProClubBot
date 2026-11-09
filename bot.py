@@ -1480,10 +1480,11 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     app = context.application
     args = list(getattr(context, "args", []))
-    if args not in ([], ["groq"]):
-        await update.effective_message.reply_text("Формат: /dialogue_lab или /dialogue_lab groq")
+    if args not in ([], ["groq"], ["verify"]):
+        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify")
         return
-    quick = args == ["groq"]
+    verify = args == ["verify"]
+    quick = args in (["groq"], ["verify"])
     if app.bot_data.get("dialogue_lab_running"):
         await update.effective_message.reply_text("Сравнение уже выполняется. Дождись отчёта.")
         return
@@ -1493,16 +1494,17 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
+            ("Проверяю строгий формат на GPT-OSS 20B и 120B: два повторных прогона и дополнительные случаи, не более 28 последовательных запросов. "
+             if verify else "Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
              if quick else "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, не более 24 обращений к API. ")
             + "Личная память и переписка не используются. Результат пришлю сюда; настройки не изменятся.")
-        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick))
+        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify))
     except BaseException:
         app.bot_data.pop("dialogue_lab_running", None)
         raise
 
 
-async def run_dialogue_lab(message, app, *, quick=False):
+async def run_dialogue_lab(message, app, *, quick=False, verify=False):
     """Background task: leave Telegram updates responsive during API requests."""
     actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
     titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
@@ -1510,7 +1512,12 @@ async def run_dialogue_lab(message, app, *, quick=False):
     providers = ("groq",) if quick else ("gemini", "groq")
     policies = (("candidate", "новый"),) if quick else (("current", "текущий"), ("candidate", "новый"))
     try:
-        from tools.dialogue_lab import CASES, run_case
+        from tools.dialogue_lab import CASES, run_case, safe_error, verify_profiles
+        if verify:
+            async def emit(text):
+                await send_long_message(message, text)
+            await verify_profiles(emit)
+            return
         for provider in providers:
             rows = []
             for index, case in enumerate(CASES[:4]):
@@ -1520,10 +1527,7 @@ async def run_dialogue_lab(message, app, *, quick=False):
                         actual = await asyncio.to_thread(run_case, policy, case, provider, GEMINI_API_KEY, GEMINI_MODEL, details=details)
                         error = None
                     except Exception as error_value:
-                        actual, error = "error", type(error_value).__name__
-                        code = getattr(error_value, "http_code", None)
-                        if isinstance(code, int):
-                            error += f" HTTP {code}"
+                        actual, error = "error", json.dumps(safe_error(error_value), ensure_ascii=False)
                     ok = actual == case[3]
                     results.append((provider, policy, ok, actual == "error"))
                     rows.append(f"{titles[index]} / {label}: {actions.get(actual, 'неизвестно')}; "
