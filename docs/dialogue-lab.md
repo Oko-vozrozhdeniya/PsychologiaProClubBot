@@ -300,3 +300,61 @@ Primary protocol references consulted:
 - https://console.groq.com/docs/api-reference
 - https://console.groq.com/docs/reasoning
 - https://ai.google.dev/api/generate-content
+
+## Owner-proposed post-draft review
+
+The owner proposed changing the control point: first let the agent write an
+answer, withhold it from the user, then ask whether its attempt to finish the
+conversation was justified. Review must also allow an explicitly justified
+farewell to pass. This differs from the previous pre-response intent labels,
+reference resolution, and direct-generation controls.
+
+Implemented memory/reply_review.py: one explicit same-provider plaintext call
+with original recent history, original user message, the unsent assistant draft,
+and a neutral service check in a separately marked final turn. The system task
+states that the service check is not a new user intention, the draft is not
+evidence of user intent, and the review may preserve a correct response. It
+requests only the final conversational reply, without internal review narration.
+Unjustified ending should be replaced by a context-relevant clarification;
+known continuation and clear farewell should be preserved. No phrase matching,
+response catalogue, preliminary action label, or automatic semantic judge is
+used. These desired outcomes remain unconfirmed until a live review result.
+
+The reusable function validates bounds (60 recent messages, 30000 history
+characters, 6000 characters each for user input and draft), copies inputs,
+and performs no sending, history append, memory write, session transition,
+retry or fallback. Its return is a candidate final text, not proof of correctness.
+Native plaintext transport was extracted from tools/dialogue_plain.py into
+memory/ai_providers.py without changing its request protocol; the existing
+plaintext control keeps its public wrapper and regression tests.
+
+First test reuses exact synthetic drafts from the already supplied
+`dialogue-plain.txt`: two unjustified endings, one clear farewell and one grounded
+continuation. Expected criteria are printed only in the report, not sent as
+model verdicts. All four drafts are reviewed, avoiding an unproven preliminary
+ending detector. No new primary answers are generated. The source provider's
+own four drafts are used for each profile:
+
+- `/dialogue_lab review`: configured Gemini, at most four additional requests;
+  only the existing Gemini key is needed.
+- `/dialogue_lab review groq`: Groq 120B, at most four additional requests;
+  only the existing Groq key is needed.
+
+The command runs owner/private/background with the existing duplicate-run guard,
+15-second request pacing, first-error stop, safe machine error identifiers, and
+provider-specific before/after text files. No success score is assigned by a
+model. Cancellation propagates; the command clears its running flag even when
+report delivery fails. Drafts and service checks never enter ordinary chat or
+DB history. This is a first test on known drafts, not generalization acceptance.
+
+This post-draft mechanism is NOT connected to ordinary replies yet. Before
+integration, live results must demonstrate both correction and preservation,
+then repeated/unseen formulations and follow-up behavior must be checked.
+Production delivery must withhold the draft, recheck current consent/session
+at the relevant boundaries, and keep only the actual final reply in history.
+The existing pre-response close classification must not commit a closure or
+skip legitimate fact processing merely because the first draft ended.
+
+Next bounded acceptance: install this change and invoke `/dialogue_lab review`
+once; return `dialogue-review-gemini.txt`. No provider keys or live test access
+exist in development. Google Drive was not changed.

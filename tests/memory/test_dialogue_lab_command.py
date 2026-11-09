@@ -146,3 +146,17 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compare.await_args.kwargs['gemini_key'],'FAKE GEMINI')
         self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-plain.txt')
         self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+
+    async def test_review_requires_only_selected_key_and_returns_provider_specific_file(self):
+        from tools import dialogue_review as review
+        for args,provider in ((['review'],'gemini'),(['review','groq'],'groq')):
+            self.context.args=args
+            self.ns['GEMINI_API_KEY']='KEY' if provider=='gemini' else ''
+            self.message.reply_document=AsyncMock()
+            with patch.dict(os.environ,{'GROQ_API_KEY':'' if provider=='gemini' else 'KEY'}), \
+                    patch.object(review,'compare_reviews',new_callable=AsyncMock,return_value='До и после') as compare:
+                await self.ns['dialogue_lab_command'](self.update,self.context)
+                await self.jobs.pop()
+            self.assertEqual(compare.await_args.kwargs['provider'],provider)
+            self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-review-'+provider+'.txt')
+            self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})

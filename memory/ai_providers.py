@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 
 from memory.gemini_prompt_adapter import append_private_memory
-from memory.ai_contract import instructions_for, parse_extraction, ExtractionFormatError
+from memory.ai_contract import instructions_for, parse_extraction, ExtractionFormatError, ExtractionTruncatedError
 from memory.ai_adapters import extraction_settings, search_settings
 
 GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b"
@@ -310,3 +310,37 @@ def _request_semantic_json(prompt,instruction,mode,parser,*,gemini_key,gemini_mo
         if mode!='auto':
             raise
         return groq()
+
+
+def validate_plain_text(text, finish=None):
+    if finish in ('length','MAX_TOKENS'):
+        raise ExtractionTruncatedError('Text reply truncated')
+    if not isinstance(text,str) or not text.strip() or len(text)>6000:
+        raise ExtractionFormatError('Invalid text reply')
+    return text.strip()
+
+
+def request_plain_text(provider, question, recent, *, instruction, gemini_key, gemini_model, groq_model):
+    if provider=='groq':
+        return request_groq(question,recent,system_instruction=instruction,
+            response_task='plain',structured_parser=validate_plain_text,model_override=groq_model,
+            max_completion_tokens=4096,reasoning_effort='medium')
+    if provider!='gemini':
+        raise ValueError('Unknown text provider')
+    if not gemini_key or not isinstance(gemini_model,str) or not re.fullmatch(r'[A-Za-z0-9._-]{1,100}',gemini_model):
+        raise ValueError('Gemini text control unavailable')
+    payload=dict(system_instruction=dict(parts=[dict(text=instruction)]),
+                 contents=[*recent,dict(role='user',parts=[dict(text=question)])],
+                 generationConfig=dict(temperature=0,maxOutputTokens=4096))
+    request=urllib.request.Request(
+        'https://generativelanguage.googleapis.com/v1beta/models/'+gemini_model+':generateContent',
+        data=json.dumps(payload,ensure_ascii=False).encode(),
+        headers={'x-goog-api-key':gemini_key,'Content-Type':'application/json'},method='POST')
+    with urllib.request.urlopen(request,timeout=30) as response:
+        result=json.loads(response.read(131072).decode())
+    candidate=result['candidates'][0]
+    # Thought parts are not conversational replies and must not enter the report.
+    text=''.join(p.get('text','') for p in candidate['content']['parts']
+                 if isinstance(p,dict) and not p.get('thought',False))
+    return validate_plain_text(text,candidate.get('finishReason'))
+
