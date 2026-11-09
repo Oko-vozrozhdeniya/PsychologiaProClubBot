@@ -1325,6 +1325,8 @@ async def private_message(
             if not await asyncio.to_thread(
                 personal_lifecycle.has_memory_consent, user_id
             ):
+                if context.application.bot_data.get('explicit_live') and is_owner(update):
+                    context.application.bot_data.pop('explicit_live',None)
                 await message.reply_text(
                     "Для личного диалога с ИИ требуется согласие на обработку "
                     "информации. Его можно дать командой /memory_on."
@@ -1341,6 +1343,13 @@ async def private_message(
                     "Срок обработки этого сообщения истёк. Отправьте его заново."
                 )
                 return
+            if context.application.bot_data.get('explicit_live') and is_owner(update):
+                from tools.dialogue_live import handle
+                async def live_consent():
+                    return await asyncio.to_thread(personal_lifecycle.has_memory_consent,user_id)
+                if await handle(message,context.application,user_id,question,consent=live_consent,
+                                gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL):
+                    return
             memory_check = {
                 "record_type": "memory", "timestamp": datetime.now(timezone.utc).isoformat(),
                 "user_id": user_id, "message_id": message.message_id,
@@ -1474,6 +1483,17 @@ async def private_message(
             )
 
 
+async def dialogue_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update) or update.effective_chat.type != 'private':
+        return
+    async with dialog_lock:
+        from tools.dialogue_live import command
+        async def live_consent():
+            return await asyncio.to_thread(personal_lifecycle.has_memory_consent,update.effective_user.id)
+        await command(update.effective_message,context.application,list(context.args),update.effective_user.id,
+                      consent=live_consent,gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL)
+
+
 async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Owner-only bounded live evaluation on synthetic cases, no chat or DB reads."""
     if not is_owner(update) or update.effective_chat.type != "private":
@@ -1506,7 +1526,7 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Проверяю новую схему explicit-end-v3-continue: прямое завершение или косвенная реплика, затем ответ. До 8 запросов. "
+            ("Проверяю новую схему explicit-end-v4-context: прямое завершение или косвенная реплика, затем ответ. До 8 запросов. "
              if explicit_provider else "Сначала передаю правила и оцениваю намерение без черновика, затем проверяю черновик и запрашиваю итоговую реплику. Протокол blind-intent-v2: четыре прежних случая, до 8 вызовов. Оба этапа будут в файле. "
              if challenge else "Проверяю основания уже написанных ответов: четыре готовых черновика, до 4 дополнительных запросов на выбранном провайдере. Правильное прощание тоже проходит проверку. Отчёт пришлю файлом. "
              if review_provider else "Проверяю обычные текстовые ответы Gemini и Groq без JSON: четыре одинаковых случая, до 8 запросов с паузами. Отчёт пришлю файлом. "
@@ -2483,6 +2503,10 @@ def main():
     app.add_handler(
         CommandHandler("testai", testai)
     )
+    app.add_handler(CommandHandler(
+        "dialogue_live", dialogue_live_command,
+        filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID),
+    ))
     app.add_handler(CommandHandler(
         "dialogue_lab", dialogue_lab_command,
         filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID),
