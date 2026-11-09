@@ -157,6 +157,9 @@ REVIEW_CASES = [
 
 def run_case(policy, case, provider, key, model, *, details=None):
     _, question, recent, _ = case
+    if policy == 'context_120b':
+        from tools.dialogue_context import run_context_case
+        return run_context_case(case, details=details if details is not None else {})
     if policy == 'current':
         p, _ = request_memory_search(question, recent, '', provider,
                                      gemini_key=key, gemini_model=model)
@@ -193,7 +196,7 @@ def run_case(policy, case, provider, key, model, *, details=None):
     return choose_action(result)
 
 
-async def verify_profiles(emit):
+async def verify_profiles(emit, *, decomposed=False):
     """Serial, bounded model comparison; no retries, promotion, DB or env writes.
 
     A profile needs two perfect smoke rounds before six held-out cases. An API
@@ -203,7 +206,8 @@ async def verify_profiles(emit):
     results = []
     last_start = None
     calls = 0
-    for profile, model in STRICT_PROFILES.items():
+    profiles = {"context_120b": "openai/gpt-oss-120b / раздельный разбор"} if decomposed else STRICT_PROFILES
+    for profile, model in profiles.items():
         rows = []
         stages_passed = True
         for stage, cases in (("основные 1", CASES[:4]),
@@ -211,18 +215,19 @@ async def verify_profiles(emit):
                              ("дополнительные", CASES[4:])):
             stage_ok = True
             for case in cases:
-                if calls >= VERIFY_MAX_CALLS:
+                if calls + (2 if decomposed else 1) > VERIFY_MAX_CALLS:
                     raise RuntimeError('Verification call budget exhausted')
                 if last_start is not None:
                     await asyncio.sleep(max(0, VERIFY_INTERVAL_SECONDS - (time.monotonic() - last_start)))
                 last_start = time.monotonic()
-                calls += 1
                 details = {}
                 try:
                     actual = await asyncio.to_thread(run_case, profile, case, 'groq', '', '', details=details)
                     failure = {}
                 except Exception as error:
                     actual, failure = 'error', safe_error(error)
+                calls += details.get('http_calls', 1)
+                last_start = time.monotonic()  # pace after the final stage, too
                 ok = actual == case[3]
                 rows.append(dict(stage=stage, case=case[0], expected=case[3], actual=actual,
                                  ok=ok, observations=details, **failure))

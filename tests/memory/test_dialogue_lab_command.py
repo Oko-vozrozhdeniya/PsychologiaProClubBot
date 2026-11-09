@@ -94,3 +94,12 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         verify.assert_awaited_once()
         self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
         self.assertIn('28',str(self.message.reply_text.await_args_list))
+
+    async def test_context_command_is_owner_background_task_with_only_groq_key(self):
+        self.context.args=['context']
+        self.ns['GEMINI_API_KEY']=''
+        with patch.object(lab,'verify_profiles',new_callable=AsyncMock) as verify:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        self.assertTrue(verify.await_args.kwargs['decomposed'])
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})

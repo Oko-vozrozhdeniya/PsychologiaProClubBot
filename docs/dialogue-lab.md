@@ -111,3 +111,42 @@ score directly with old totals as if the evaluation inputs were identical.
 Next: after installing this correction, run the same verification command once.
 No live result for the corrected suite exists yet. Passing synthetic action
 selection still does not establish natural dialogue or full memory acceptance.
+
+## Two-stage native-message experiment after corrected-suite failure
+
+On the corrected PR 19 suite the owner observed 3/4 for each model, with no API
+or format errors in eight requests. 20B still closed on sufficiency without
+context; 120B still marked the now-grounded topic as unresolved. Neither
+profile advanced to repetitions. Do not reinterpret these as a combined 4/4.
+
+`/dialogue_lab context` now evaluates a different pipeline on 120B only:
+
+- First reconstruct referents from native, chronologically ordered user and
+  assistant messages. The current message is the last actual user message,
+  rather than a field alongside nested Gemini `parts` in a JSON prompt string.
+- Then independently decide answer/clarify/close from the original native
+  dialogue and the separately marked reference observations. The second task
+  is not given a preliminary reply-mode verdict or an enumeration of scopes.
+- Validate both contracts and exact evidence quotes locally. Stage one may use
+  assistant questions to bind referents; closure evidence must come from users.
+  A stage-one unresolved referent blocks a stage-two farewell. These checks
+  verify quote origin and envelope consistency, not semantic truth.
+- Each case uses at most two sequential calls, six seconds apart. Reuse the
+  existing two smoke rounds plus six additional cases for a single profile,
+  at most 28 API requests; failures stop progression and there are no retries.
+  Pacing also applies after a case's final stage. Errors count actual attempted
+  calls, including a failure before stage two.
+
+Native message presentation is a confirmed difference in implementation, not a
+proven cause of historical semantic errors. The two-stage split is a hypothesis
+until tested live. No phrase catalogue, fixed replies, case-specific routing,
+production model switch, consent or memory-path change was introduced. The
+previous experiments remain available for comparison. The new pipeline is
+synthetic-only; no ordinary chat invokes it. Full integration is still blocked
+on live action selection and then generated-answer/context-path acceptance.
+
+Next bounded acceptance command after installing this change:
+`/dialogue_lab context`. It replaces repeating `/dialogue_lab verify` unchanged.
+No live result for this pipeline is available in the development workspace;
+provider keys are only configured in the deployed container. Google Drive was
+not changed by this work.

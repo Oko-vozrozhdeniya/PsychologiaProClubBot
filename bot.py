@@ -1480,31 +1480,33 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     app = context.application
     args = list(getattr(context, "args", []))
-    if args not in ([], ["groq"], ["verify"]):
-        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify")
+    if args not in ([], ["groq"], ["verify"], ["context"]):
+        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context")
         return
-    verify = args == ["verify"]
-    quick = args in (["groq"], ["verify"])
+    decomposed = args == ["context"]
+    verify = args in (["verify"], ["context"])
+    quick = args in (["groq"], ["verify"], ["context"])
     if app.bot_data.get("dialogue_lab_running"):
         await update.effective_message.reply_text("Сравнение уже выполняется. Дождись отчёта.")
         return
     if (not quick and not GEMINI_API_KEY) or not os.environ.get("GROQ_API_KEY", "").strip():
-        await update.effective_message.reply_text("Для сравнения нужны настроенные ключи Gemini и Groq.")
+        await update.effective_message.reply_text("Нужен настроенный ключ Groq." if quick else "Для сравнения нужны настроенные ключи Gemini и Groq.")
         return
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Проверяю строгий формат на GPT-OSS 20B и 120B: два повторных прогона и дополнительные случаи, не более 28 последовательных запросов. "
+            ("Проверяю раздельное восстановление предмета и намерения на GPT-OSS 120B: до 28 последовательных запросов, с повторными и дополнительными случаями. "
+             if decomposed else "Проверяю строгий формат на GPT-OSS 20B и 120B: два повторных прогона и дополнительные случаи, не более 28 последовательных запросов. "
              if verify else "Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
              if quick else "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, не более 24 обращений к API. ")
             + "Личная память и переписка не используются. Результат пришлю сюда; настройки не изменятся.")
-        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify))
+        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed))
     except BaseException:
         app.bot_data.pop("dialogue_lab_running", None)
         raise
 
 
-async def run_dialogue_lab(message, app, *, quick=False, verify=False):
+async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False):
     """Background task: leave Telegram updates responsive during API requests."""
     actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
     titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
@@ -1516,7 +1518,10 @@ async def run_dialogue_lab(message, app, *, quick=False, verify=False):
         if verify:
             async def emit(text):
                 await send_long_message(message, text)
-            await verify_profiles(emit)
+            if decomposed:
+                await verify_profiles(emit, decomposed=True)
+            else:
+                await verify_profiles(emit)
             return
         for provider in providers:
             rows = []
