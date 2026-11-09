@@ -358,3 +358,44 @@ skip legitimate fact processing merely because the first draft ended.
 Next bounded acceptance: install this change and invoke `/dialogue_lab review`
 once; return `dialogue-review-gemini.txt`. No provider keys or live test access
 exist in development. Google Drive was not changed.
+
+## Separate grounds question before revision
+
+Both owner-provided one-call reviews failed to correct the ambiguous endings.
+Gemini expanded the fatigue farewell into an unsupported rest claim; Groq
+preserved all four drafts verbatim. Clear farewell and grounded continuation
+were preserved, but that does not make the correction mechanism successful.
+Neither reviewer is connected to ordinary replies.
+
+The owner's example first obtained an answer explaining the basis for the
+agent's decision, then established the corrected conversational behavior. Our
+one-call task requested only a final rewritten reply; it did not collect that
+separate answer about grounds. This is a methodological difference, not proof
+that an extra stage will solve the problem.
+
+`/dialogue_lab challenge` now evaluates four existing Gemini drafts using two
+separate calls per case, maximum eight. First, a neutral grounds question asks
+for a brief, checkable justification (two or three sentences, no step-by-step
+reasoning), distinguishing what the user's text establishes from assumptions.
+It does not request a conversational rewrite. Second, that actual brief answer
+is appended as its own assistant turn before a separate final-reply request.
+The first assessment is data, not unquestionable authority. Both stages and
+original inputs are retained in dialogue-challenge-gemini.txt for inspection.
+`/dialogue_lab challenge groq` provides the equivalent optional Groq profile.
+
+Service questions remain explicitly separated from real user statements.
+No claim that the user rejected an ending is fabricated. The same provider is
+used across the pair, with no fallback or automatic retry. There is no automatic
+semantic score, forced verdict, phrase catalogue, or new primary generation.
+All four controls remain, including valid farewell and continuation. Each call
+is paced, the hard cap is eight, and the first failure stops. If the second call
+fails, the already received brief assessment is preserved in the partial file.
+No draft, assessment or service turn is inserted into real user/DB history.
+
+Shared history validation was extracted without changing the old one-call path.
+The new pure audit/revision functions validate inputs and perform no send or
+memory mutation. Production integration remains blocked pending observed
+correction, preservation, repeated/unseen cases and consent/session/memory-path
+acceptance. The previous one-call review command remains available unchanged.
+Google Drive was not updated. No live keys or live result for the paired control
+are available in development.

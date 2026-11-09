@@ -82,3 +82,54 @@ class ReviewHarnessTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(lab.asyncio,'to_thread',side_effect=asyncio.CancelledError):
             with self.assertRaises(asyncio.CancelledError):
                 await lab.compare_reviews(AsyncMock(),provider='gemini',gemini_key='KEY',gemini_model='test')
+
+class GroundsThenReplyTests(unittest.TestCase):
+    def test_assessment_is_a_separate_assistant_turn_before_final_request(self):
+        from memory.reply_review import audit_reply,reply_after_audit,AUDIT_CHECK,AFTER_AUDIT_CHECK
+        q='Исходная реплика';draft='Неотправленный ответ';summary='Краткое обоснование'
+        with patch('memory.reply_review.request_plain_text',side_effect=[summary,'Итоговая реплика']) as request:
+            got=audit_reply(q,[],draft,provider='gemini',gemini_key='KEY',gemini_model='test')
+            final=reply_after_audit(q,[],draft,got,provider='gemini',gemini_key='KEY',gemini_model='test')
+        self.assertEqual(final,'Итоговая реплика')
+        first,second=request.call_args_list
+        self.assertEqual(first.args[1],AUDIT_CHECK)
+        self.assertEqual([m['parts'][0]['text'] for m in first.args[2]],[q,draft])
+        self.assertEqual(second.args[1],AFTER_AUDIT_CHECK)
+        self.assertEqual([m['role'] for m in second.args[2]],['user','model','user','model'])
+        self.assertEqual([m['parts'][0]['text'] for m in second.args[2]],[q,draft,AUDIT_CHECK,summary])
+        self.assertNotIn(summary,second.kwargs['instruction'])
+        self.assertEqual(first.kwargs['gemini_key'],second.kwargs['gemini_key'])
+
+    def test_empty_assessment_cannot_trigger_revision(self):
+        from memory.reply_review import reply_after_audit
+        with patch('memory.reply_review.request_plain_text') as request:
+            with self.assertRaises(ValueError):
+                reply_after_audit('q',[],'draft','',provider='gemini',gemini_key='KEY',gemini_model='test')
+            request.assert_not_called()
+
+class ChallengeHarnessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_eight_calls_keep_every_assessment_before_its_final_reply(self):
+        with patch.object(lab,'audit_reply',return_value='Обоснование') as audit, \
+                patch.object(lab,'reply_after_audit',return_value='Итог') as revise, \
+                patch.object(lab,'review_reply') as old, \
+                patch.object(lab.asyncio,'sleep',new_callable=AsyncMock):
+            report=await lab.compare_reviews(AsyncMock(),provider='gemini',gemini_key='SECRET',gemini_model='test',challenge=True)
+        self.assertEqual(audit.call_count,4)
+        self.assertEqual(revise.call_count,4)
+        self.assertEqual([c.args[3] for c in revise.call_args_list],['Обоснование']*4)
+        old.assert_not_called()
+        self.assertEqual(report.count('Краткое обоснование агента: Обоснование'),4)
+        self.assertEqual(report.count('Итоговая реплика после обоснования: Итог'),4)
+        self.assertIn('8/8 запросов',report)
+        self.assertNotIn('SECRET',report)
+
+    async def test_second_stage_failure_preserves_the_assessment_and_stops_without_retry(self):
+        with patch.object(lab,'audit_reply',return_value='Полученное обоснование') as audit, \
+                patch.object(lab,'reply_after_audit',side_effect=GroqRequestError(http_code=429,reason='SECRET')) as revise, \
+                patch.object(lab.asyncio,'sleep',new_callable=AsyncMock):
+            report=await lab.compare_reviews(AsyncMock(),provider='groq',gemini_key='',gemini_model='test',challenge=True)
+        self.assertEqual(audit.call_count,1)
+        self.assertEqual(revise.call_count,1)
+        self.assertIn('Полученное обоснование',report)
+        self.assertIn('2/8 запросов',report)
+        self.assertNotIn('SECRET',report)

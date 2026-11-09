@@ -160,3 +160,17 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(compare.await_args.kwargs['provider'],provider)
             self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-review-'+provider+'.txt')
             self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+
+    async def test_challenge_returns_separate_file_with_selected_provider_only(self):
+        from tools import dialogue_review as review
+        self.context.args=['challenge']
+        self.ns['GEMINI_API_KEY']='KEY'
+        self.message.reply_document=AsyncMock()
+        with patch.dict(os.environ,{'GROQ_API_KEY':''}), \
+                patch.object(review,'compare_reviews',new_callable=AsyncMock,return_value='Основание и итог') as compare:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        self.assertTrue(compare.await_args.kwargs['challenge'])
+        self.assertEqual(compare.await_args.kwargs['provider'],'gemini')
+        self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-challenge-gemini.txt')
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})

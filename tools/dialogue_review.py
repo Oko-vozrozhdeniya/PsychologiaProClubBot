@@ -2,7 +2,7 @@
 import asyncio
 import json
 import time
-from memory.reply_review import review_reply
+from memory.reply_review import review_reply, audit_reply, reply_after_audit
 from tools.dialogue_lab import CASES,safe_error
 from tools.dialogue_replies import MODEL,EXPECTATIONS
 
@@ -24,7 +24,9 @@ DRAFTS = {
 }
 
 
-async def compare_reviews(emit, *, provider, gemini_key, gemini_model):
+async def compare_reviews(emit, *, provider, gemini_key, gemini_model, challenge=False):
+    if challenge:
+        return await compare_challenges(emit,provider=provider,gemini_key=gemini_key,gemini_model=gemini_model)
     if provider not in DRAFTS:
         raise ValueError('Invalid review profile')
     calls=0
@@ -60,4 +62,48 @@ async def compare_reviews(emit, *, provider, gemini_key, gemini_model):
                   'Это первый контроль на известных черновиках, не проверка устойчивости новых формулировок.',
                   'В рабочий диалог проверка ещё не включена. История, память и настройки не изменены.'])
     await emit(f'Проверка черновиков завершена: {calls}/4 запросов. До и после — в файле.')
+    return '\n'.join(lines)
+
+
+async def compare_challenges(emit,*,provider,gemini_key,gemini_model):
+    if provider not in DRAFTS:
+        raise ValueError('Invalid challenge profile')
+    calls=0
+    last_end=None
+    lines=[f'Grounds question then revision / {provider}',
+           'Четыре прежних черновика; до двух вызовов на каждый: краткое обоснование, затем отдельная итоговая реплика.',
+           'Обоснование сохраняется отдельно, не подменяет исходные слова пользователя и не считается автоматически верным.',
+           'Ни новая первичная генерация, ни семантический судья не вызываются.']
+    async def call(fn,*args,**kwargs):
+        nonlocal calls,last_end
+        if calls>=8:
+            raise RuntimeError('Challenge budget exhausted')
+        if last_end is not None:
+            await asyncio.sleep(max(0,15-(time.monotonic()-last_end)))
+        calls+=1
+        try:
+            return await asyncio.to_thread(fn,*args,**kwargs)
+        finally:
+            last_end=time.monotonic()
+    for case,draft in zip(CASES[:4],DRAFTS[provider]):
+        ident,q,recent,expected=case
+        lines.extend(['',ident,'Контекст: '+json.dumps(recent,ensure_ascii=False),
+                      'Пользователь: '+q,'Неотправленный черновик: '+draft,
+                      'Критерий разбора: '+EXPECTATIONS[expected]])
+        options=dict(provider=provider,gemini_key=gemini_key,gemini_model=gemini_model,groq_model=MODEL)
+        try:
+            assessment=await call(audit_reply,q,recent,draft,**options)
+            lines.append('Краткое обоснование агента: '+assessment)
+            await emit(f'Обоснование получено: {ident}; {calls}/8 запросов.')
+            reply=await call(reply_after_audit,q,recent,draft,assessment,**options)
+            lines.append('Итоговая реплика после обоснования: '+reply)
+            await emit(f'Итоговая реплика получена: {ident}; {calls}/8 запросов.')
+        except Exception as error:
+            lines.append('ПРОГОН ОСТАНОВЛЕН: '+json.dumps(safe_error(error),ensure_ascii=False))
+            break
+    lines.extend(['',f'Завершено: {calls}/8 запросов.',
+                  'Оценивать отдельно обоснование и итоговую реплику; завершённые запросы не означают успешную проверку.',
+                  'Одноэтапный пересмотр не исправил оба неоднозначных окончания на Gemini и Groq.',
+                  'Новый двухэтапный контроль не подключён к обычному диалогу; память и настройки не изменены.'])
+    await emit(f'Контроль обоснования и итоговой реплики завершён: {calls}/8 запросов. Полный результат — в файле.')
     return '\n'.join(lines)

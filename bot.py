@@ -1480,10 +1480,11 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     app = context.application
     args = list(getattr(context, "args", []))
-    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"], ["minimal"], ["plain"], ["review"], ["review", "groq"]):
-        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies, /dialogue_lab minimal, /dialogue_lab plain, /dialogue_lab review [groq]")
+    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"], ["minimal"], ["plain"], ["review"], ["review", "groq"], ["challenge"], ["challenge", "groq"]):
+        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies, /dialogue_lab minimal, /dialogue_lab plain, /dialogue_lab review [groq], /dialogue_lab challenge [groq]")
         return
-    review_provider = ("groq" if args == ["review", "groq"] else "gemini") if args in (["review"], ["review", "groq"]) else None
+    challenge = args in (["challenge"], ["challenge", "groq"])
+    review_provider = ("groq" if len(args)==2 else "gemini") if args in (["review"], ["review", "groq"], ["challenge"], ["challenge", "groq"]) else None
     plain = args == ["plain"]
     minimal = args == ["minimal"]
     replies = args in (["replies"], ["minimal"])
@@ -1502,7 +1503,8 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Проверяю основания уже написанных ответов: четыре готовых черновика, до 4 дополнительных запросов на выбранном провайдере. Правильное прощание тоже проходит проверку. Отчёт пришлю файлом. "
+            ("Задаю отдельный вопрос об основаниях черновика, затем запрашиваю итоговую реплику: четыре прежних случая, до 8 вызовов. Оба этапа будут в файле. "
+             if challenge else "Проверяю основания уже написанных ответов: четыре готовых черновика, до 4 дополнительных запросов на выбранном провайдере. Правильное прощание тоже проходит проверку. Отчёт пришлю файлом. "
              if review_provider else "Проверяю обычные текстовые ответы Gemini и Groq без JSON: четыре одинаковых случая, до 8 запросов с паузами. Отчёт пришлю файлом. "
              if plain else "Проверяю короткую инструкцию на тех же четырёх случаях и повторяю две неоднозначные реплики: до 6 запросов, с паузами. Полные ответы пришлю файлом. "
              if minimal else "Сравниваю реальные ответы с предварительным выбором режима и без него: до 28 последовательных запросов. Добавлю повторы и продолжение после уточнения. Полный отчёт пришлю файлом. "
@@ -1511,13 +1513,13 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
              if verify else "Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
              if quick else "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, не более 24 обращений к API. ")
             + "Личная память и переписка не используются. Результат пришлю сюда; настройки не изменятся.")
-        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies, minimal=minimal, plain=plain, review_provider=review_provider))
+        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies, minimal=minimal, plain=plain, review_provider=review_provider, challenge=challenge))
     except BaseException:
         app.bot_data.pop("dialogue_lab_running", None)
         raise
 
 
-async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False, minimal=False, plain=False, review_provider=None):
+async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False, minimal=False, plain=False, review_provider=None, challenge=False):
     """Background task: leave Telegram updates responsive during API requests."""
     actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
     titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
@@ -1530,10 +1532,10 @@ async def run_dialogue_lab(message, app, *, quick=False, verify=False, decompose
             import io
             async def emit(text):
                 await send_long_message(message,text)
-            report=await compare_reviews(emit,provider=review_provider,
-                gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL)
+            options=dict(provider=review_provider,gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL)
+            report=await compare_reviews(emit,challenge=True,**options) if challenge else await compare_reviews(emit,**options)
             await message.reply_document(document=io.BytesIO(report.encode('utf-8')),
-                filename='dialogue-review-'+review_provider+'.txt')
+                filename=('dialogue-challenge-' if challenge else 'dialogue-review-')+review_provider+'.txt')
             return
         if plain:
             from tools.dialogue_plain import compare_plain

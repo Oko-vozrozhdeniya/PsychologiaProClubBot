@@ -40,6 +40,12 @@ def review_reply(question, recent, draft, *, provider, gemini_key, gemini_model,
     """
     if provider not in ('gemini','groq'):
         raise ValueError('Explicit review provider required')
+    copied=_review_history(question,recent,draft)
+    return request_plain_text(provider,REVIEW_CHECK,copied,instruction=REVIEW_INSTRUCTION,
+        gemini_key=gemini_key,gemini_model=gemini_model,groq_model=groq_model)
+
+
+def _review_history(question,recent,draft):
     for value in (question,draft):
         if not isinstance(value,str) or not value.strip() or len(value)>6000:
             raise ValueError('Invalid review input')
@@ -60,5 +66,64 @@ def review_reply(question, recent, draft, *, provider, gemini_key, gemini_model,
         copied.append(dict(role=item['role'],parts=[dict(text=text)]))
     copied.extend([dict(role='user',parts=[dict(text=question)]),
                    dict(role='model',parts=[dict(text=draft)])])
-    return request_plain_text(provider,REVIEW_CHECK,copied,instruction=REVIEW_INSTRUCTION,
+    return copied
+
+
+AUDIT_INSTRUCTION = (
+    'Ты отвечаешь на служебный вопрос об основаниях собственного неотправленного '
+    'черновика. Перед запросом находятся исходная реплика пользователя и черновик '
+    'помощника. Запрос не является новой репликой пользователя о его намерениях. '
+    'Сейчас не переписывай ответ и не составляй реплику собеседнику. Дай только '
+    'краткое проверяемое обоснование в двух-трёх предложениях: какие слова '
+    'пользователя или какой контекст поддерживают выбранное действие, что является '
+    'предположением и остаётся ли неопределённость. Не излагай пошаговые рассуждения. '
+    'Необходимость проверки не означает, что ответ ошибочен. Слова помощника '
+    'не доказывают намерение пользователя. Различай прекращение действия, темы, '
+    'паузу и завершение всего общения. Не придумывай отсутствующее намерение.'
+)
+AUDIT_CHECK = (
+    'СЛУЖЕБНЫЙ ВОПРОС ОБ ОСНОВАНИЯХ. С чего ты решил, что выбранное в черновике '
+    'завершение или продолжение разговора обосновано? Где в словах пользователя '
+    'или контексте основание именно для этого действия? Если черновик завершает '
+    'общение, можно ли из исходного текста также понять, что человек хочет '
+    'остановить только тему или действие? Отдели установленное от предположенного. '
+    'Кратко ответь на этот вопрос, пока не переписывая черновик.'
+)
+AFTER_AUDIT_INSTRUCTION = (
+    'В истории находятся исходный разговор, неотправленный черновик помощника, '
+    'служебный вопрос об основаниях и краткий ответ помощника на него. Последний '
+    'запрос тоже служебный; это не новые слова пользователя. Теперь составь '
+    'итоговый ответ собеседнику. Краткая самооценка — данные для проверки, а не '
+    'неоспоримая истина и не сообщение пользователя. Учитывай исходный текст. '
+    'Если окончание всего общения ясно установлено, сохрани уместное прощание. '
+    'Если завершение было предположением, а между окончанием темы и общения '
+    'остаётся неопределённость, замени преждевременное окончание одним коротким '
+    'естественным уточняющим вопросом. Не назначай отдых или паузу за пользователя. '
+    'Если продолжение уже ясно, продолжи без лишнего уточнения. Уместный ответ '
+    'без завершения сохрани. Верни только итоговую реплику, тепло и по существу, '
+    'без служебного обоснования и без извинения за неотправленный черновик.'
+)
+AFTER_AUDIT_CHECK = (
+    'СЛУЖЕБНЫЙ ЗАПРОС ИТОГОВОЙ РЕПЛИКИ. С учётом исходного разговора и проверки '
+    'оснований верни только ответ, который следует отправить пользователю.'
+)
+
+
+def audit_reply(question,recent,draft,*,provider,gemini_key,gemini_model,groq_model=None):
+    if provider not in ('gemini','groq'):
+        raise ValueError('Explicit audit provider required')
+    copied=_review_history(question,recent,draft)
+    return request_plain_text(provider,AUDIT_CHECK,copied,instruction=AUDIT_INSTRUCTION,
+        gemini_key=gemini_key,gemini_model=gemini_model,groq_model=groq_model)
+
+
+def reply_after_audit(question,recent,draft,assessment,*,provider,gemini_key,gemini_model,groq_model=None):
+    if provider not in ('gemini','groq'):
+        raise ValueError('Explicit revision provider required')
+    if not isinstance(assessment,str) or not assessment.strip() or len(assessment)>6000:
+        raise ValueError('Invalid audit summary')
+    copied=_review_history(question,recent,draft)
+    copied.extend([dict(role='user',parts=[dict(text=AUDIT_CHECK)]),
+                   dict(role='model',parts=[dict(text=assessment)])])
+    return request_plain_text(provider,AFTER_AUDIT_CHECK,copied,instruction=AFTER_AUDIT_INSTRUCTION,
         gemini_key=gemini_key,gemini_model=gemini_model,groq_model=groq_model)
