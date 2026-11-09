@@ -242,3 +242,13 @@ Next: after installing this diagnostic-only correction, run
 `/dialogue_lab minimal` once and provide its text report. No live results for
 this control are available in the development environment; keys remain only in
 the deployed container. Production conversation behavior is still unresolved.
+
+
+Control validity: the short profile also retains, verbatim, the existing private
+instruction paragraph distinguishing clear farewell, topic ending, uncertainty,
+fatigue and pause. A test asserts this paragraph is still a substring of the
+full private policy. Thus the minimal run does not silently remove the key
+fatigue/ambiguity rule while retaining only a weaker generic statement. The
+short prefix plus this paragraph, RULE and FORMAT replace the unrelated full
+instruction package. Native payload tests still require every other field and
+all conversation messages to remain identical.

@@ -82,8 +82,10 @@ class MinimalControlTests(unittest.TestCase):
             for minimal in (False,True):
                 r.generate_reply(r.CASES[3][1],r.CASES[3][2],'answer',minimal=minimal)
         full,short=payloads
+        from memory.ai_contract import PRIVATE_INSTRUCTIONS
+        self.assertIn(r.SHORT_POLICY,PRIVATE_INSTRUCTIONS)
         self.assertEqual(short['messages'][0]['content'],
-            'Ты доброжелательный собеседник. Общайся на русском языке.'+r.RULE+r.FORMAT)
+            'Ты доброжелательный собеседник. Общайся на русском языке.'+r.SHORT_POLICY+r.RULE+r.FORMAT)
         self.assertLess(len(short['messages'][0]['content']),len(full['messages'][0]['content']))
         for p in payloads:
             p['messages'][0]['content']='SYSTEM_ONLY_DIFFERENCE'
