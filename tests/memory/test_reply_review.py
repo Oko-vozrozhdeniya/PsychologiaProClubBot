@@ -93,10 +93,10 @@ class GroundsThenReplyTests(unittest.TestCase):
         self.assertEqual(final,'Итоговая реплика')
         first,second=request.call_args_list
         self.assertEqual(first.args[1],AUDIT_CHECK)
-        self.assertEqual([m['parts'][0]['text'] for m in first.args[2]],[q,draft])
+        self.assertEqual([m['parts'][0]['text'] for m in first.args[2]],[q])
         self.assertEqual(second.args[1],AFTER_AUDIT_CHECK)
-        self.assertEqual([m['role'] for m in second.args[2]],['user','model','user','model'])
-        self.assertEqual([m['parts'][0]['text'] for m in second.args[2]],[q,draft,AUDIT_CHECK,summary])
+        self.assertEqual([m['role'] for m in second.args[2]],['user','user','model','user'])
+        self.assertEqual([m['parts'][0]['text'] for m in second.args[2]],[q,AUDIT_CHECK,summary,'ОБЪЕКТ ПРОВЕРКИ: неотправленный черновик помощника, не слова пользователя.\n'+draft])
         self.assertNotIn(summary,second.kwargs['instruction'])
         self.assertEqual(first.kwargs['gemini_key'],second.kwargs['gemini_key'])
 

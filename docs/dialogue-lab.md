@@ -437,3 +437,7 @@ Next: deploy this revision, verify the start message says rules-first-v1, then
 run /dialogue_lab challenge once. Assess actual correction and preservation
 before considering ordinary-dialogue integration. No live provider keys exist
 in development.
+
+## Blind original-intent assessment (blind-intent-v2)
+Live rules-first-v1 Gemini completed 8 calls. Fatigue farewell was removed but invented a busy day and failed to clarify scope; sufficiency farewell was defended as conventional. Clear farewell and grounded continuation were preserved. This is not acceptance.
+The first challenge call now receives only original conversation and rules, never the draft. The second receives that independent assessment and the draft clearly marked as review data. Same cases, providers, eight-call cap and pacing; ordinary dialogue unchanged. Clarify current conversation versus permanent departure and prohibit invented day circumstances. No live success claimed. Google Drive unchanged.

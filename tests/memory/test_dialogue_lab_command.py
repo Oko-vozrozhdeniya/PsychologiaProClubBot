@@ -182,7 +182,7 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(review,'compare_reviews',new_callable=AsyncMock,return_value='Отчёт'):
             await self.ns['dialogue_lab_command'](self.update,self.context)
             start=self.message.reply_text.await_args.args[0]
-            self.assertIn('rules-first-v1',start)
+            self.assertIn('blind-intent-v2',start)
             self.assertIn('Сначала передаю правила',start)
             await self.jobs.pop()
         self.assertNotIn('dialogue_lab_running',self.app.bot_data)
