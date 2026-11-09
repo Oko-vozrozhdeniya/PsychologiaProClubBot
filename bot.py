@@ -1480,9 +1480,10 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     app = context.application
     args = list(getattr(context, "args", []))
-    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"], ["minimal"], ["plain"], ["review"], ["review", "groq"], ["challenge"], ["challenge", "groq"]):
-        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies, /dialogue_lab minimal, /dialogue_lab plain, /dialogue_lab review [groq], /dialogue_lab challenge [groq]")
+    if args not in ([], ["groq"], ["verify"], ["context"], ["replies"], ["minimal"], ["plain"], ["review"], ["review", "groq"], ["challenge"], ["challenge", "groq"], ["explicit"], ["explicit", "groq"]):
+        await update.effective_message.reply_text("Формат: /dialogue_lab, /dialogue_lab groq или /dialogue_lab verify, /dialogue_lab context, /dialogue_lab replies, /dialogue_lab minimal, /dialogue_lab plain, /dialogue_lab review [groq], /dialogue_lab challenge [groq], /dialogue_lab explicit [groq]")
         return
+    explicit_provider = ("groq" if len(args)==2 else "gemini") if args and args[0]=="explicit" else None
     challenge = args in (["challenge"], ["challenge", "groq"])
     review_provider = ("groq" if len(args)==2 else "gemini") if args in (["review"], ["review", "groq"], ["challenge"], ["challenge", "groq"]) else None
     plain = args == ["plain"]
@@ -1495,6 +1496,8 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("Сравнение уже выполняется. Дождись отчёта.")
         return
     missing_keys = (not quick and not GEMINI_API_KEY) or not os.environ.get("GROQ_API_KEY", "").strip()
+    if explicit_provider:
+        missing_keys = not (GEMINI_API_KEY if explicit_provider == "gemini" else os.environ.get("GROQ_API_KEY", "").strip())
     if review_provider:
         missing_keys = not (GEMINI_API_KEY if review_provider == "gemini" else os.environ.get("GROQ_API_KEY", "").strip())
     if missing_keys:
@@ -1503,7 +1506,8 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
     app.bot_data["dialogue_lab_running"] = True
     try:
         await update.effective_message.reply_text(
-            ("Сначала передаю правила и оцениваю намерение без черновика, затем проверяю черновик и запрашиваю итоговую реплику. Протокол blind-intent-v2: четыре прежних случая, до 8 вызовов. Оба этапа будут в файле. "
+            ("Проверяю новую схему explicit-end-v1: прямое завершение или косвенная реплика, затем ответ. До 8 запросов. "
+             if explicit_provider else "Сначала передаю правила и оцениваю намерение без черновика, затем проверяю черновик и запрашиваю итоговую реплику. Протокол blind-intent-v2: четыре прежних случая, до 8 вызовов. Оба этапа будут в файле. "
              if challenge else "Проверяю основания уже написанных ответов: четыре готовых черновика, до 4 дополнительных запросов на выбранном провайдере. Правильное прощание тоже проходит проверку. Отчёт пришлю файлом. "
              if review_provider else "Проверяю обычные текстовые ответы Gemini и Groq без JSON: четыре одинаковых случая, до 8 запросов с паузами. Отчёт пришлю файлом. "
              if plain else "Проверяю короткую инструкцию на тех же четырёх случаях и повторяю две неоднозначные реплики: до 6 запросов, с паузами. Полные ответы пришлю файлом. "
@@ -1513,13 +1517,13 @@ async def dialogue_lab_command(update: Update, context: ContextTypes.DEFAULT_TYP
              if verify else "Проверяю новый подход на Groq: четыре вымышленных случая, четыре запроса к API. "
              if quick else "Запускаю сравнение двух подходов на Gemini и Groq: четыре вымышленных случая, не более 24 обращений к API. ")
             + "Личная память и переписка не используются. Результат пришлю сюда; настройки не изменятся.")
-        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies, minimal=minimal, plain=plain, review_provider=review_provider, challenge=challenge))
+        app.create_task(run_dialogue_lab(update.effective_message, app, quick=quick, verify=verify, decomposed=decomposed, replies=replies, minimal=minimal, plain=plain, review_provider=review_provider, challenge=challenge, explicit_provider=explicit_provider))
     except BaseException:
         app.bot_data.pop("dialogue_lab_running", None)
         raise
 
 
-async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False, minimal=False, plain=False, review_provider=None, challenge=False):
+async def run_dialogue_lab(message, app, *, quick=False, verify=False, decomposed=False, replies=False, minimal=False, plain=False, review_provider=None, challenge=False, explicit_provider=None):
     """Background task: leave Telegram updates responsive during API requests."""
     actions = {"answer": "ответ", "clarify": "уточнение", "close": "прощание", "error": "ошибка"}
     titles = ("усталость без контекста", "достаточно без контекста", "явное прощание", "понятная тема")
@@ -1527,6 +1531,14 @@ async def run_dialogue_lab(message, app, *, quick=False, verify=False, decompose
     providers = ("groq",) if quick else ("gemini", "groq")
     policies = (("candidate", "новый"),) if quick else (("current", "текущий"), ("candidate", "новый"))
     try:
+        if explicit_provider:
+            from tools.dialogue_explicit import compare_explicit
+            import io
+            async def emit(text):
+                await send_long_message(message,text)
+            report=await compare_explicit(emit,provider=explicit_provider,gemini_key=GEMINI_API_KEY,gemini_model=GEMINI_MODEL)
+            await message.reply_document(document=io.BytesIO(report.encode('utf-8')),filename='dialogue-explicit-'+explicit_provider+'.txt')
+            return
         if review_provider:
             from tools.dialogue_review import compare_reviews
             import io

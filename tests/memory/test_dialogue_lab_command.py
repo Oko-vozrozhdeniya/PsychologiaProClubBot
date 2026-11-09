@@ -186,3 +186,15 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Сначала передаю правила',start)
             await self.jobs.pop()
         self.assertNotIn('dialogue_lab_running',self.app.bot_data)
+
+    async def test_explicit_route_uses_selected_provider_and_returns_file(self):
+        from tools import dialogue_explicit
+        self.context.args=['explicit','groq']
+        self.message.reply_document=AsyncMock()
+        with patch.object(dialogue_explicit,'compare_explicit',new_callable=AsyncMock,return_value='Report') as run:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            self.assertIn('explicit-end-v1',self.message.reply_text.await_args.args[0])
+            await self.jobs.pop()
+        self.assertEqual(run.await_args.kwargs['provider'],'groq')
+        self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-explicit-groq.txt')
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
