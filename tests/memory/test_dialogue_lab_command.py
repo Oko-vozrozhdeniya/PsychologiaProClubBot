@@ -130,3 +130,19 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(compare.await_args.kwargs['minimal'])
         self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-minimal.txt')
         self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+
+    async def test_plain_requires_both_keys_and_returns_native_text_report(self):
+        from tools import dialogue_plain as plain
+        self.context.args=['plain']
+        self.ns['GEMINI_API_KEY']=''
+        await self.ns['dialogue_lab_command'](self.update,self.context)
+        self.assertEqual(self.jobs,[])
+        self.ns['GEMINI_API_KEY']='FAKE GEMINI'
+        self.message.reply_document=AsyncMock()
+        with patch.object(plain,'compare_plain',new_callable=AsyncMock,return_value='Полный текст') as compare:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            await self.jobs.pop()
+        compare.assert_awaited_once()
+        self.assertEqual(compare.await_args.kwargs['gemini_key'],'FAKE GEMINI')
+        self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-plain.txt')
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})

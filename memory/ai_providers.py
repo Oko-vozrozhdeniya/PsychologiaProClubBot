@@ -102,6 +102,9 @@ def request_groq(question, history=None, personal_memory_context=None, *,
                     (model_override, response_schema, max_completion_tokens, reasoning_effort))
     if overrides and (system_instruction is None or structured_parser is None):
         raise ValueError("Structured overrides require an explicit instruction and parser")
+    if response_task == "plain" and (system_instruction is None or structured_parser is None
+                                     or response_schema is not None):
+        raise ValueError("Plain control requires an instruction, text parser and no schema")
     if response_schema is not None and not isinstance(response_schema, dict):
         raise ValueError("Invalid response schema")
     if max_completion_tokens is not None and (type(max_completion_tokens) is not int
@@ -130,8 +133,9 @@ def request_groq(question, history=None, personal_memory_context=None, *,
     payload_options = {
         "model": model, "messages": messages, "max_completion_tokens": 1200,
         "stream": False,
-        **((search_settings("Groq")
-            if response_task in ("search","closure_review") else extraction_settings("Groq"))
+        **(({"temperature": 0} if response_task == "plain" else
+            search_settings("Groq") if response_task in ("search","closure_review")
+            else extraction_settings("Groq"))
            if system_instruction is not None else {}),
     }
     if response_schema is not None:

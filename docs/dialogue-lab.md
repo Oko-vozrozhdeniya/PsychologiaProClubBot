@@ -252,3 +252,51 @@ fatigue/ambiguity rule while retaining only a weaker generic statement. The
 short prefix plus this paragraph, RULE and FORMAT replace the unrelated full
 instruction package. Native payload tests still require every other field and
 all conversation messages to remain identical.
+
+## Native plaintext provider control
+
+The owner supplied dialogue-minimal.txt from PR 22: all six calls completed.
+Both ambiguous inputs received farewells in both rounds. Explicit farewell was
+handled correctly; the grounded-topic answer continued but began with the
+insensitive "Отлично!". Shrinking the instruction package did not solve the
+core failure under this JSON response protocol. Do not generalize this into
+proof that the model can never follow a different instruction or protocol.
+
+A remaining methodological constraint was the strict JSON reply envelope in
+all recent natural-response controls. The next diagnostic separates native
+text generation from that envelope and obtains an independent provider result.
+Groq docs confirm include_reasoning=false suppresses returned reasoning, not a
+claim that reasoning was disabled. JSON causation has not been established.
+
+`/dialogue_lab plain` sends the same four core cases to configured Gemini and
+Groq 120B using the same short policy, with FORMAT removed, no response schema,
+no JSON response format or responseMimeType, and no action classification or
+memory planner. Native message roles, temperature 0 and output budget 4096 are
+preserved. Groq keeps medium reasoning; Gemini uses its model-native reasoning
+configuration. This is a bounded protocol/provider control, not a strict model
+ranking with identical reasoning implementations. Removing the JSON request
+instruction and constrained decoding together does not isolate those two
+subfactors individually.
+
+The common Groq adapter adds explicit response_task=plain, gated by an explicit
+instruction and text parser and rejecting response_schema. Default ordinary
+and structured callers retain their previous paths. Native text is checked
+only for presence, bounds and truncation; there is no semantic validator or
+same-model judge. Gemini thought parts are omitted from the report. Keys are
+sent in headers, never model prompts, URLs or reports.
+
+Maximum eight native calls, serial with 15-second pauses after completion.
+Any API/format error stops that provider without retries or model substitution;
+the other configured provider can still run. Partial replies and safe error
+codes are preserved in dialogue-plain.txt. Ordinary AI mode, instructions,
+model, DB, archive, consent and memory remain unchanged. No paid model account
+or new external service is added; existing configured keys are used. No live
+result for this control exists in development. Google Drive unchanged.
+
+After installing this change, next bounded live command: /dialogue_lab plain.
+Do not repeat the full or minimal JSON controls unchanged.
+
+Primary protocol references consulted:
+- https://console.groq.com/docs/api-reference
+- https://console.groq.com/docs/reasoning
+- https://ai.google.dev/api/generate-content
