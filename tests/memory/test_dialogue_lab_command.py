@@ -103,3 +103,18 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
             await self.jobs.pop()
         self.assertTrue(verify.await_args.kwargs['decomposed'])
         self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+
+    async def test_replies_command_returns_complete_file_and_clears_flag_on_upload_failure(self):
+        from tools import dialogue_replies as replies
+        self.context.args=['replies']
+        self.ns['GEMINI_API_KEY']=''
+        self.message.reply_document=AsyncMock(side_effect=RuntimeError('upload failure'))
+        with patch.object(replies,'compare_replies',new_callable=AsyncMock,return_value='Полный отчёт') as compare:
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            with self.assertRaises(RuntimeError):
+                await self.jobs.pop()
+        compare.assert_awaited_once()
+        self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+        kwargs=self.message.reply_document.await_args.kwargs
+        self.assertEqual(kwargs['filename'],'dialogue-replies.txt')
+        self.assertEqual(kwargs['document'].getvalue().decode(),'Полный отчёт')

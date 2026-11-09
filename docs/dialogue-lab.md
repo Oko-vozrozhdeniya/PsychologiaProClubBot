@@ -150,3 +150,53 @@ Next bounded acceptance command after installing this change:
 No live result for this pipeline is available in the development workspace;
 provider keys are only configured in the deployed container. Google Drive was
 not changed by this work.
+
+## Natural-reply comparison after the two-stage failure
+
+The owner's live `/dialogue_lab context` report on PR 20 showed 3/4, eight API
+calls, no format/API errors. Fatigue was clarified only because the unresolved
+reference guard overrode stage-two close. Sufficiency was marked resolved and
+closed. Clear farewell and grounded topic passed. Repetitions were not reached.
+A local parser check also showed that an exact source quote could accompany an
+invented referent; quote provenance is not semantic proof. The report did not
+expose the actual referent, so its precise content in the live failure is unknown.
+
+The owner supplied a separate ChatGPT conversation showing successful
+clarification after an explicit correction, then approved checking direct
+natural replies without a preassigned farewell mode. This is a new hypothesis,
+not evidence that changing the instructions alone solves it.
+
+`/dialogue_lab replies` now produces actual natural responses, not an action
+score. Both arms use native role history, the same private rules plus a concise
+ambiguity/wait-for-answer rule, the same 120B generator, temperature 0, medium
+reasoning, 4096-token budget and strict JSON containing only `reply`. No
+semantic action field or expected answer is passed to the direct generator.
+The wrapper validates text structure, not correctness of dialogue.
+
+The baseline arm reproduces the memory planner's reply-mode selection and
+closure review on the configured Groq model, then uses that mode in the same
+120B response generator. The direct arm skips both preliminary tasks and uses
+private reply_mode=answer. Since both receive the additional short rule and a
+controlled generator, this is not an exact replay of every production setting
+or the entire memory path. No active memory, archive, consent or DB is accessed.
+
+Budget: four cases in both arms (baseline at most three calls, direct one),
+independent repetitions of the four direct cases, six other direct cases, then
+two independent follow-up branches after the actual first direct fatigue reply:
+continue only another topic, or explicitly finish the conversation. At most
+28 serial native calls; six seconds between requests; first API/format failure
+stops the run and preserves a partial report. Follow-ups test an answer to a
+clarification only if the preceding generated response really asked one.
+
+The complete synthetic input contexts, response texts, expected evaluation
+criteria, baseline mode trace, partial failure if any, and request count are
+returned as `dialogue-replies.txt` in Telegram. Progress messages contain no
+semantic pass scores. There is no same-model automated judge hiding or grading
+mistakes: generated texts must be reviewed substantively, including repeated
+cases and follow-ups. The report does not change the ordinary model, AI mode,
+chat history or memory; production integration remains unapproved by evidence.
+
+After deployment the next acceptance command is `/dialogue_lab replies`, not a
+repeat of the unchanged action-classification commands. The owner can attach
+one text report instead of a sequence of screenshots. No live provider keys
+are available in this development workspace. Google Drive was not modified.
