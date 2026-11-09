@@ -37,3 +37,27 @@ class ExplicitHarnessTests(unittest.IsolatedAsyncioTestCase):
         compose.assert_not_called()
         self.assertIn('1/8',report)
         self.assertNotIn('KEY',report)
+
+class JsonTransportTests(unittest.TestCase):
+    def test_classifier_enables_json_on_actual_native_payload_but_reply_remains_plain(self):
+        import io
+        import os
+        decision='{"kind":"indirect_stop","evidence":""}'
+        for provider in ('gemini','groq'):
+            def response(text):
+                obj=({'candidates':[{'content':{'parts':[{'text':text}]},'finishReason':'STOP'}]}
+                     if provider=='gemini' else {'choices':[{'message':{'content':text},'finish_reason':'stop'}]})
+                return io.BytesIO(json.dumps(obj).encode())
+            with self.subTest(provider=provider),patch.dict(os.environ,{'GROQ_API_KEY':'KEY'}), \
+                 patch('urllib.request.urlopen',side_effect=[response(decision),response('Что обсудим?')]) as fetch:
+                options=dict(provider=provider,gemini_key='KEY',gemini_model='test',groq_model='openai/gpt-oss-120b')
+                got=gate.classify('Вход',[],**options)
+                gate.compose('Вход',[],got,**options)
+                a,b=[json.loads(call.args[0].data) for call in fetch.call_args_list]
+                if provider=='gemini':
+                    self.assertEqual(a['generationConfig']['responseMimeType'],'application/json')
+                    self.assertNotIn('responseMimeType',b['generationConfig'])
+                else:
+                    self.assertEqual(a['response_format'],{'type':'json_object'})
+                    self.assertNotIn('response_format',b)
+                    self.assertEqual(a['model'],b['model'])

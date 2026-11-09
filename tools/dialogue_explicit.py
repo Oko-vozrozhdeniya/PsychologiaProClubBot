@@ -5,7 +5,7 @@ from memory.ai_providers import request_plain_text
 from tools.dialogue_lab import CASES, safe_error
 from tools.dialogue_replies import MODEL
 
-PROTOCOL = 'explicit-end-v1'
+PROTOCOL = 'explicit-end-v2-json'
 CLASSIFY = '''Определи только вид высказывания пользователя по исходной истории.
 Верни JSON с двумя полями: kind (direct_end, indirect_stop, continue) и evidence (дословная цитата текущего сообщения для direct_end, иначе пустая строка).
 direct_end: пользователь прямо просит закончить именно текущий разговор с помощником или прямо объявляет его окончание/прощается. Это может быть утверждение, не только повелительная форма. Не требуется уход навсегда. Цитата, отрицание, условие, вопрос о значении прощания и слова другого лица не являются собственным актом завершения.
@@ -43,7 +43,7 @@ def parse_decision(raw, question):
 
 def classify(question, recent, **options):
     raw = request_plain_text(options['provider'], question, recent,
-                             instruction=CLASSIFY, **{k:v for k,v in options.items() if k!='provider'})
+                             instruction=CLASSIFY, json_mode=True, **{k:v for k,v in options.items() if k!='provider'})
     return parse_decision(raw, question)
 
 

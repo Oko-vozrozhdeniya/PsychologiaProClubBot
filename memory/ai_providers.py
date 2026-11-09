@@ -320,10 +320,13 @@ def validate_plain_text(text, finish=None):
     return text.strip()
 
 
-def request_plain_text(provider, question, recent, *, instruction, gemini_key, gemini_model, groq_model):
+def request_plain_text(provider, question, recent, *, instruction, gemini_key, gemini_model, groq_model, json_mode=False):
+    """Native text transport; explicit classifier opt-in enables provider JSON mode."""
+    if not isinstance(json_mode, bool):
+        raise ValueError("Invalid JSON mode")
     if provider=='groq':
         return request_groq(question,recent,system_instruction=instruction,
-            response_task='plain',structured_parser=validate_plain_text,model_override=groq_model,
+            response_task='search' if json_mode else 'plain',structured_parser=validate_plain_text,model_override=groq_model,
             max_completion_tokens=4096,reasoning_effort='medium')
     if provider!='gemini':
         raise ValueError('Unknown text provider')
@@ -331,7 +334,8 @@ def request_plain_text(provider, question, recent, *, instruction, gemini_key, g
         raise ValueError('Gemini text control unavailable')
     payload=dict(system_instruction=dict(parts=[dict(text=instruction)]),
                  contents=[*recent,dict(role='user',parts=[dict(text=question)])],
-                 generationConfig=dict(temperature=0,maxOutputTokens=4096))
+                 generationConfig=dict(temperature=0,maxOutputTokens=4096,
+                     **({'responseMimeType':'application/json'} if json_mode else {})))
     request=urllib.request.Request(
         'https://generativelanguage.googleapis.com/v1beta/models/'+gemini_model+':generateContent',
         data=json.dumps(payload,ensure_ascii=False).encode(),
