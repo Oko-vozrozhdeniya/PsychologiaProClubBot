@@ -2,7 +2,8 @@
 import asyncio
 import json
 import time
-from memory.reply_review import review_reply, audit_reply, reply_after_audit
+from memory.reply_review import (review_reply, audit_reply, reply_after_audit,
+                                 REVIEW_PROTOCOL, REVIEW_POLICY_ID)
 from tools.dialogue_lab import CASES,safe_error
 from tools.dialogue_replies import MODEL,EXPECTATIONS
 
@@ -32,6 +33,7 @@ async def compare_reviews(emit, *, provider, gemini_key, gemini_model, challenge
     calls=0
     last_end=None
     lines=[f'Unsent draft review / {provider} / '+(gemini_model if provider=='gemini' else MODEL),
+           f'Правила перед оценкой: {REVIEW_PROTOCOL}; версия правил: {REVIEW_POLICY_ID}.',
            'Черновики взяты из уже полученного dialogue-plain.txt. Новые первичные ответы не генерировались.',
            'Один дополнительный вызов на черновик: исходный разговор, собственный черновик, нейтральный служебный запрос.',
            'Проверяются все четыре черновика, включая обоснованное прощание и продолжение темы.',
@@ -71,6 +73,7 @@ async def compare_challenges(emit,*,provider,gemini_key,gemini_model):
     calls=0
     last_end=None
     lines=[f'Grounds question then revision / {provider}',
+           f'Правила перед оценкой: {REVIEW_PROTOCOL}; версия правил: {REVIEW_POLICY_ID}.',
            'Четыре прежних черновика; до двух вызовов на каждый: краткое обоснование, затем отдельная итоговая реплика.',
            'Обоснование сохраняется отдельно, не подменяет исходные слова пользователя и не считается автоматически верным.',
            'Ни новая первичная генерация, ни семантический судья не вызываются.']

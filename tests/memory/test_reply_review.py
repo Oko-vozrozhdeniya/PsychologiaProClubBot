@@ -133,3 +133,23 @@ class ChallengeHarnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Полученное обоснование',report)
         self.assertIn('2/8 запросов',report)
         self.assertNotIn('SECRET',report)
+
+class RulesBeforeAssessmentTests(unittest.TestCase):
+    def test_same_policy_is_sent_before_each_review_task_separate_from_user_data(self):
+        from memory.reply_review import (review_reply,audit_reply,reply_after_audit,
+                                        REVIEW_POLICY,POLICY_PREFIX)
+        case=lab.CASES[0]
+        with patch('memory.reply_review.request_plain_text',return_value='Ответ') as request:
+            options=dict(provider='gemini',gemini_key='KEY',gemini_model='test')
+            review_reply(case[1],case[2],lab.DRAFTS['gemini'][0],**options)
+            audit_reply(case[1],case[2],lab.DRAFTS['gemini'][0],**options)
+            reply_after_audit(case[1],case[2],lab.DRAFTS['gemini'][0],'Краткая оценка',**options)
+        self.assertEqual(request.call_count,3)
+        for call in request.call_args_list:
+            instruction=call.kwargs['instruction']
+            self.assertTrue(instruction.startswith(POLICY_PREFIX))
+            self.assertEqual(instruction.count(REVIEW_POLICY),1)
+            self.assertLess(instruction.index(REVIEW_POLICY),instruction.index('ЗАДАЧА ПРОВЕРКИ.'))
+            self.assertFalse(any(REVIEW_POLICY in p['text'] for m in call.args[2] for p in m['parts']))
+        for evaluated_case in lab.CASES:
+            self.assertNotIn(evaluated_case[1],REVIEW_POLICY)

@@ -174,3 +174,15 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(compare.await_args.kwargs['provider'],'gemini')
         self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-challenge-gemini.txt')
         self.assertEqual(self.app.bot_data,{'test_ai_mode':'auto'})
+
+    async def test_challenge_announces_rule_first_protocol_before_start(self):
+        from tools import dialogue_review as review
+        self.context.args=['challenge']
+        self.message.reply_document=AsyncMock()
+        with patch.object(review,'compare_reviews',new_callable=AsyncMock,return_value='Отчёт'):
+            await self.ns['dialogue_lab_command'](self.update,self.context)
+            start=self.message.reply_text.await_args.args[0]
+            self.assertIn('rules-first-v1',start)
+            self.assertIn('Сначала передаю правила',start)
+            await self.jobs.pop()
+        self.assertNotIn('dialogue_lab_running',self.app.bot_data)

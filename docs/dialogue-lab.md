@@ -399,3 +399,41 @@ correction, preservation, repeated/unseen cases and consent/session/memory-path
 acceptance. The previous one-call review command remains available unchanged.
 Google Drive was not updated. No live keys or live result for the paired control
 are available in development.
+
+## Explicit rules-first review protocol
+
+Before running the paired challenge, the owner clarified that review must not
+merely invite the agent to defend an already made decision. The agent must first
+receive and apply the actual rules for distinguishing a stop to an action, a
+topic ending, a pause and the end of all communication, then compare its draft
+with those rules. Earlier instructions contained general distinctions, but this
+normative order was not explicit enough.
+
+Protocol `rules-first-v1` now prepends a single shared REVIEW_POLICY to all
+review instructions (one-call review, separate grounds assessment, final
+revision). The policy is normative guidance, not a catalogue of user phrases or
+assistant replies: it separates scope, treats affect/gratitude/sufficiency/time
+as insufficient by themselves, preserves unresolved scope when context does
+not bind it, requires a relevant clarification in that situation, preserves
+clear farewells without holding questions, respects pause and clear continuation,
+and rejects the draft or prior assistant statements as authority for user intent.
+
+The grounds question now explicitly starts with rules applied to original user
+text/history and only then compares the draft. It requests a brief checkable
+summary naming the applicable rule and textual basis, not a defence of the
+previous answer or step-by-step reasoning. Final revision receives the same
+policy first and must not use a conflicting self-assessment as justification.
+
+Command `/dialogue_lab challenge` is unchanged. Its start message announces
+rules-first-v1; both review report types include that protocol and a SHA256
+fingerprint of the shared policy. This distinguishes the new deployed protocol
+from an earlier challenge release. Input cases, drafts, model/provider settings,
+request pacing, caps (eight for challenge), absence of automatic grading and
+production/history/memory boundaries remain unchanged. The old two-call
+protocol had no live result before this owner-requested correction; no success
+is inferred for the new policy ordering. Google Drive unchanged.
+
+Next: deploy this revision, verify the start message says rules-first-v1, then
+run /dialogue_lab challenge once. Assess actual correction and preservation
+before considering ordinary-dialogue integration. No live provider keys exist
+in development.
