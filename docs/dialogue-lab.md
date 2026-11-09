@@ -76,3 +76,38 @@ Offline tests validate transport payloads, schema parsing, decision boundaries,
 repetition gates, request limits, early stops and private owner access. They do
 not establish that a real model understands any test utterance. No live provider
 keys are available in the development workspace.
+
+
+## Fixture review after the owner's 05:41 report
+
+Release `3c0dbd52a8caaec017a67a91660057de7a32e3b1` (PR 18) received a live
+`/dialogue_lab verify` report: eight requests, no API/format errors. 20B scored
+2/4; 120B scored 3/4. 120B chose clarification for both original ambiguous
+utterances and farewell for the explicit ending. Both profiles stopped in round
+one; repeatability and the additional cases were not tested. The absence of 400
+in this run does not establish the cause of historical 400 errors.
+
+Review found that the old grounded-topic fixture was not a sufficiently clear
+single-answer gate: after the assistant asks which topic to choose, "Я устал от
+этого" could refer to the prior topic or the exchange itself. Its clarification
+must not be treated as conclusive model failure. The historical scores remain
+unchanged; they are not relabelled as 4/4 successes.
+
+The scored grounded case now explicitly preserves the user's wish to continue
+and uses an immediate question naming the subject: the user wants to postpone
+accounting and discuss travel, the assistant asks whether discussing accounting
+was tiring, and the user confirms with "Да, я устал от этого." The referent and
+wish to continue are supported by the conversation. This tests context binding,
+rather than requiring a guess about an isolated pronoun.
+
+The exact original fixture is retained in `REVIEW_CASES`, outside pass/fail
+scoring and paid requests; a relevant clarification or continuation may be
+acceptable, while farewell is unsupported. Definite ambiguity remains scored
+in the original context-free fatigue and sufficiency cases. No semantic prompt,
+action policy, parser, provider settings, production route, request budget or
+promotion rules changed in this fixture-only correction. Do not compare the new
+score directly with old totals as if the evaluation inputs were identical.
+
+Next: after installing this correction, run the same verification command once.
+No live result for the corrected suite exists yet. Passing synthetic action
+selection still does not establish natural dialogue or full memory acceptance.

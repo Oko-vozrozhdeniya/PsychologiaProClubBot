@@ -131,9 +131,9 @@ CASES = [
     ('fatigue_without_context', 'Благодарю, на сегодня я устал от этого.', [], 'clarify'),
     ('sufficient_without_context', 'На сегодня мне достаточно, спасибо.', [], 'clarify'),
     ('explicit_farewell', 'Спасибо за помощь. Заканчиваю разговор, до свидания.', [], 'close'),
-    ('fatigue_grounded_in_topic', 'Я устал от этого.', history(
-        ('Сегодня слишком много обсуждал бухгалтерию. Давай сменим тему.',
-         'Конечно, какую тему выберем?')), 'answer'),
+    ('fatigue_grounded_in_topic', 'Да, я устал от этого.', history(
+        ('Разговор заканчивать не хочу. Хочу отложить бухгалтерию и поговорить о путешествиях.',
+         'Ты устал от обсуждения бухгалтерии?')), 'answer'),
     ('insufficient_referent', 'Всё, с меня хватит.', [], 'clarify'),
     ('indirect_clear_departure', 'Так и сделаю. До завтра!', history(
         ('Мне пора уходить, на сегодня закончим нашу беседу.', 'Хорошо.')), 'close'),
@@ -142,6 +142,16 @@ CASES = [
     ('new_question_wins', 'С тренировками закончили. Как приготовить чечевицу?', [], 'answer'),
     ('quoted_farewell_is_not_act', 'Почему слова «до свидания» могут звучать холодно?', [], 'answer'),
     ('explicit_pause', 'Подожди минуту, я скоро вернусь и продолжим.', [], 'answer'),
+]
+
+
+# Preserve the original disputed fixture for review, not as a pass/fail gate.
+# Its referent could be the subject or the exchange itself. Both continuation
+# and a relevant clarification may be defensible; farewell is unsupported.
+REVIEW_CASES = [
+    ('fatigue_after_topic_switch_question', 'Я устал от этого.', history(
+        ('Сегодня слишком много обсуждал бухгалтерию. Давай сменим тему.',
+         'Конечно, какую тему выберем?')), ('answer', 'clarify')),
 ]
 
 

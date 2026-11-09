@@ -173,3 +173,19 @@ class DialogueVerificationTests(unittest.IsolatedAsyncioTestCase):
                 results=await lab.verify_profiles(AsyncMock())
             self.assertEqual(run.call_count,expected_calls)
             self.assertTrue(all(not r['passed'] and r['errors']==1 for r in results))
+
+
+class DialogueFixtureBoundaryTests(unittest.TestCase):
+    def test_grounded_case_and_disputed_case_are_separate_without_altering_rules(self):
+        grounded=next(c for c in lab.CASES if c[0]=='fatigue_grounded_in_topic')
+        disputed=lab.REVIEW_CASES[0]
+        self.assertEqual(grounded[3],'answer')
+        self.assertEqual(grounded[1],'Да, я устал от этого.')
+        self.assertIn('Разговор заканчивать не хочу',grounded[2][0]['parts'][0]['text'])
+        self.assertEqual(grounded[2][-1]['parts'][0]['text'],'Ты устал от обсуждения бухгалтерии?')
+        self.assertEqual(disputed[1],'Я устал от этого.')
+        self.assertEqual(disputed[2][-1]['parts'][0]['text'],'Конечно, какую тему выберем?')
+        self.assertEqual(disputed[3],('answer','clarify'))
+        self.assertNotIn(disputed[0],[c[0] for c in lab.CASES])
+        for case in (grounded,disputed):
+            self.assertNotIn(case[1],lab.INSTRUCTION)
