@@ -193,7 +193,7 @@ class DialogueLabCommandTests(unittest.IsolatedAsyncioTestCase):
         self.message.reply_document=AsyncMock()
         with patch.object(dialogue_explicit,'compare_explicit',new_callable=AsyncMock,return_value='Report') as run:
             await self.ns['dialogue_lab_command'](self.update,self.context)
-            self.assertIn('explicit-end-v2-json',self.message.reply_text.await_args.args[0])
+            self.assertIn('explicit-end-v3-continue',self.message.reply_text.await_args.args[0])
             await self.jobs.pop()
         self.assertEqual(run.await_args.kwargs['provider'],'groq')
         self.assertEqual(self.message.reply_document.await_args.kwargs['filename'],'dialogue-explicit-groq.txt')
